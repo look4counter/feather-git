@@ -1,0 +1,19 @@
+[package]
+name = "feather-git"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+gpui = "=0.2.2"
+gix = "=0.87.1"
+similar = "2.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

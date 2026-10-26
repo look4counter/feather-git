@@ -1,0 +1,8 @@
+/target/
+/.build/
+*.rs.bk
+*.log
+.env*
+.idea/
+.DS_Store
+Thumbs.db

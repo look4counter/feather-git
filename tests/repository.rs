@@ -64,6 +64,38 @@ fn init() -> TempDir {
     dir
 }
 
+#[test]
+fn lightweight_annotated_and_multiple_tags_decorate_initial_and_later_pages() {
+    let dir = imported_history(feather_git::paging::PAGE_SIZE + 3);
+    let first = run(dir.path(), &["rev-parse", "HEAD"]);
+    let later = run(dir.path(), &["rev-parse", "HEAD~201"]);
+    run(dir.path(), &["tag", "light", &first]);
+    run(
+        dir.path(),
+        &["tag", "-a", "annotated", "-m", "annotated tag", &first],
+    );
+    run(dir.path(), &["tag", "later-light", &later]);
+    run(
+        dir.path(),
+        &["tag", "-a", "later-annotated", "-m", "later tag", &later],
+    );
+    let snapshot = git::load_initial(dir.path(), None).unwrap();
+    let commit = snapshot
+        .commits
+        .iter()
+        .find(|commit| commit.id == first)
+        .unwrap();
+    assert_eq!(commit.tags, vec!["annotated", "light"]);
+    assert!(!commit.branches.is_empty());
+    let page = snapshot.session.as_ref().unwrap().next_page().unwrap();
+    let commit = page
+        .commits
+        .iter()
+        .find(|commit| commit.id == later)
+        .unwrap();
+    assert_eq!(commit.tags, vec!["later-annotated", "later-light"]);
+}
+
 fn write(path: &Path, name: &str, value: impl AsRef<[u8]>) {
     fs::write(path.join(name), value).unwrap();
 }
@@ -305,7 +337,12 @@ fn commit_details_keep_full_message_signatures_timezones_and_selection() {
         String::from_utf8_lossy(&output.stderr)
     );
     let first = run(path, &["rev-parse", "HEAD"]);
-    let detail = git::load(path, None, None).unwrap().commit_detail.unwrap();
+    let snapshot = git::load(path, None, None).unwrap();
+    assert_eq!(
+        snapshot.commits[0].author_label(),
+        "작성자 <author@example.invalid>"
+    );
+    let detail = snapshot.commit_detail.unwrap();
     assert_eq!(detail.id, first);
     assert!(detail.parent_ids.is_empty());
     assert_eq!(detail.author, "작성자");
@@ -423,12 +460,23 @@ fn initial_and_incremental_pages_are_bounded_and_complete() {
     for count in [0, 200, 400, 450] {
         let dir = imported_history(count);
         let mut snapshot = git::load_initial(dir.path(), None).unwrap();
+        assert!(
+            snapshot
+                .commits
+                .iter()
+                .all(|commit| commit.author_label() == "Test <test@example.invalid>")
+        );
         assert_eq!(snapshot.commits.len(), count.min(200));
         assert_eq!(snapshot.has_more, count > 200);
         assert_eq!(snapshot.current_branch.as_deref(), Some("refs/heads/main"));
         let session = snapshot.session.clone().unwrap();
         while snapshot.has_more {
             let page = session.next_page().unwrap();
+            assert!(
+                page.commits
+                    .iter()
+                    .all(|commit| commit.author_label() == "Test <test@example.invalid>")
+            );
             assert!(page.commits.len() <= 200);
             assert!(!page.commits.is_empty());
             snapshot.commits.extend(page.commits);
@@ -448,6 +496,182 @@ fn initial_and_incremental_pages_are_bounded_and_complete() {
             assert_eq!(rows[0].output_edges[0].color, rows[1].input_edges[0].color);
         }
     }
+}
+
+#[test]
+fn branch_targets_load_whole_pages_and_preserve_history_on_retry() {
+    let dir = imported_history(651);
+    run(dir.path(), &["branch", "oldest", "main~650"]);
+    for depth in [199, 200, 399, 400, 650] {
+        let target = run(dir.path(), &["rev-parse", &format!("main~{depth}")]);
+        let mut project = Project::new(0, dir.path().to_path_buf());
+        project.snapshot = git::load_initial(dir.path(), None).unwrap();
+        let original: Vec<_> = project
+            .snapshot
+            .commits
+            .iter()
+            .map(|commit| commit.id.clone())
+            .collect();
+        let session = project.snapshot.session.clone().unwrap();
+        project.commit = Some(target.clone());
+        project.history_target = Some(target.clone());
+        let mut sizes = vec![project.snapshot.commits.len()];
+        let index = loop {
+            if let Some(index) = project.resolve_history_target() {
+                break index;
+            }
+            assert!(project.snapshot.has_more);
+            if depth == 650 && project.snapshot.commits.len() == 400 {
+                project.page_error = Some("일시적 조회 오류".into());
+                assert_eq!(project.resolve_history_target(), None);
+                assert_eq!(project.history_target.as_deref(), Some(target.as_str()));
+                assert_eq!(project.snapshot.commits.len(), 400);
+                project.page_error = None;
+            }
+            let page = session.next_page().unwrap();
+            assert!(page.commits.len() <= 200);
+            project.snapshot.commits.extend(page.commits);
+            project.snapshot.has_more = page.has_more;
+            sizes.push(project.snapshot.commits.len());
+        };
+        assert_eq!(index, depth);
+        assert_eq!(project.snapshot.commits[index].id, target);
+        assert_eq!(project.commit.as_deref(), Some(target.as_str()));
+        assert!(project.history_target.is_none());
+        let expected: Vec<_> = (200..=((depth / 200 + 1) * 200))
+            .step_by(200)
+            .map(|count| count.min(651))
+            .collect();
+        assert_eq!(sizes, expected);
+        assert_eq!(
+            project
+                .snapshot
+                .commits
+                .iter()
+                .take(200)
+                .map(|commit| commit.id.clone())
+                .collect::<Vec<_>>(),
+            original
+        );
+        if depth == 650 {
+            let reference = project
+                .snapshot
+                .references
+                .iter()
+                .find(|reference| reference.revision == "refs/heads/oldest")
+                .unwrap();
+            assert_eq!(reference.target, target);
+            project.history_target = Some("missing-target".into());
+            assert_eq!(project.resolve_history_target(), None);
+            assert!(project.history_target.is_none());
+            assert!(
+                project
+                    .page_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("찾지 못했습니다")
+            );
+        }
+    }
+}
+
+#[test]
+fn symbolic_remote_head_keeps_its_own_name_in_refs_and_commit_badges() {
+    let dir = init();
+    write(dir.path(), "file.txt", "content\n");
+    commit(dir.path(), "initial");
+    run(dir.path(), &["tag", "-a", "release", "-m", "release"]);
+    let head = run(dir.path(), &["rev-parse", "HEAD"]);
+    run(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/main", &head],
+    );
+    run(
+        dir.path(),
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    for packed in [false, true] {
+        if packed {
+            run(dir.path(), &["pack-refs", "--all"]);
+        }
+        let snapshot = git::load_initial(dir.path(), None).unwrap();
+        for name in ["origin/HEAD", "origin/main"] {
+            let matches: Vec<_> = snapshot
+                .references
+                .iter()
+                .filter(|reference| reference.name == name)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].revision, format!("refs/remotes/{name}"));
+            assert_eq!(matches[0].target, head);
+            assert_eq!(
+                snapshot.commits[0]
+                    .branches
+                    .iter()
+                    .filter(|branch| *branch == name)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            snapshot
+                .references
+                .iter()
+                .any(|reference| reference.name == "release" && reference.target == head)
+        );
+    }
+}
+
+#[test]
+fn stage_order_is_path_first_even_when_index_state_changes() {
+    let dir = init();
+    for name in ["a.txt", "m.txt", "z.txt"] {
+        write(dir.path(), name, "base");
+    }
+    commit(dir.path(), "base");
+    for name in ["a.txt", "m.txt", "z.txt"] {
+        write(dir.path(), name, "changed");
+    }
+    let names =
+        |files: Vec<FileChange>| files.into_iter().map(|file| file.label).collect::<Vec<_>>();
+    assert_eq!(
+        names(git::load_stage(dir.path()).unwrap()),
+        ["a.txt", "m.txt", "z.txt"]
+    );
+    run(dir.path(), &["add", "z.txt"]);
+    assert_eq!(
+        names(git::load_stage(dir.path()).unwrap()),
+        ["a.txt", "m.txt", "z.txt"]
+    );
+    run(dir.path(), &["add", "a.txt"]);
+    assert_eq!(
+        names(git::load_stage(dir.path()).unwrap()),
+        ["a.txt", "m.txt", "z.txt"]
+    );
+    run(dir.path(), &["reset", "HEAD", "--", "z.txt"]);
+    assert_eq!(
+        names(git::load_stage(dir.path()).unwrap()),
+        ["a.txt", "m.txt", "z.txt"]
+    );
+}
+
+#[test]
+fn only_history_loading_requires_modal_progress() {
+    let mut project = Project::new(0, "repo".into());
+    project.loading = true;
+    project.diff_loading = true;
+    assert!(!project.history_in_progress());
+    project.history_loading = true;
+    assert!(project.history_in_progress());
+    project.history_loading = false;
+    project.page_loading = true;
+    assert!(project.history_in_progress());
+    project.page_loading = false;
+    assert!(!project.history_in_progress());
 }
 
 #[test]
@@ -471,12 +695,7 @@ fn checkout_markers_and_stage_virtual_indices_preserve_identity() {
     assert_eq!(current[0].name, "main");
     assert_eq!(
         file_rows(&snapshot.stage, true),
-        [
-            FileRow::Group(true),
-            FileRow::File(0),
-            FileRow::Group(false),
-            FileRow::File(1)
-        ]
+        [FileRow::Group(true), FileRow::File(0), FileRow::File(1)]
     );
     assert_eq!(
         file_rows(&snapshot.stage, false),

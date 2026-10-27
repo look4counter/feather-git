@@ -1,5 +1,11 @@
+use crate::commit_editor::CommitEditor;
 use crate::history_view::{self, ColumnLayout, RowGraph};
 use crate::layout::{SplitAxis, SplitLayout};
+use crate::settings::SettingsPanel;
+use crate::{
+    session::{self, Session},
+    text_selection::{self, Position, Selection},
+};
 use feather_git::{git, model::*};
 use gpui::{prelude::*, *};
 use std::collections::{HashMap, HashSet};
@@ -12,6 +18,36 @@ struct StartPage {
     busy: bool,
     error: Option<String>,
     select_all: bool,
+    recent_scroll: UniformListScrollHandle,
+}
+
+struct CommitDialog {
+    project_id: u64,
+    editor: Entity<CommitEditor>,
+    busy: bool,
+    push_after: bool,
+    error: Option<String>,
+}
+
+struct DiscardDialog {
+    project_id: u64,
+    paths: Vec<Vec<u8>>,
+    busy: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+enum BranchAction {
+    Create { commit: String },
+    Track(crate::branches::CheckoutTarget),
+}
+
+struct BranchDialog {
+    project_id: u64,
+    path: PathBuf,
+    action: BranchAction,
+    editor: Option<Entity<CommitEditor>>,
+    error: Option<String>,
 }
 
 const BG: u32 = 0x10151d;
@@ -21,9 +57,28 @@ const TEXT: u32 = 0xd9e2ed;
 const MUTED: u32 = 0x8290a6;
 const ACCENT: u32 = 0x5edac1;
 const SELECT: u32 = 0x203d42;
+const SELECT_INACTIVE: u32 = 0x303844;
 const TAB_BAR_HEIGHT: f32 = 44.;
 const SCROLLBAR: f32 = 12.;
+const RECENT_ROW_HEIGHT: f32 = 40.;
+
+fn branch_click_interval() -> std::time::Duration {
+    #[cfg(windows)]
+    let millis =
+        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as u64;
+    #[cfg(not(windows))]
+    let millis = 500;
+    std::time::Duration::from_millis(millis + 30)
+}
 type ListKey = (u64, u8);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListFocus {
+    Branches(u64),
+    Files(u64),
+    History(u64),
+    Text(ListKey),
+}
 
 #[derive(Clone)]
 struct ScrollDrag {
@@ -39,6 +94,24 @@ enum WorkspaceTab {
 }
 
 impl WorkspaceTab {
+    fn open_in_place(tabs: &mut Vec<Self>, source: u64, path: PathBuf) -> Option<u64> {
+        let index = tabs
+            .iter()
+            .position(|tab| matches!(tab, Self::Empty(id) if *id == source))?;
+        if let Some(id) = tabs
+            .iter()
+            .filter_map(Self::project)
+            .find(|project| project.path == path)
+            .map(|project| project.id)
+        {
+            tabs.remove(index);
+            Some(id)
+        } else {
+            tabs[index] = Self::Repository(Box::new(Project::new(source, path)));
+            Some(source)
+        }
+    }
+
     fn id(&self) -> u64 {
         match self {
             Self::Empty(id) => *id,
@@ -62,12 +135,32 @@ impl WorkspaceTab {
 }
 
 pub struct Workspace {
+    state_path: Option<PathBuf>,
+    recent: Vec<PathBuf>,
+    pending: usize,
+    staging: HashSet<u64>,
+    remote_status: Option<(u64, &'static str)>,
+    help: bool,
+    settings: Option<Entity<SettingsPanel>>,
+    branch_dialog: Option<BranchDialog>,
+    branch_busy: bool,
+    commit_dialog: Option<CommitDialog>,
+    discard_dialog: Option<DiscardDialog>,
+    delete_target: Option<PathBuf>,
+    delete_confirm: bool,
+    focus: FocusHandle,
+    list_focus: Option<ListFocus>,
+    text_selection: Option<(ListKey, Selection)>,
+    text_drag: bool,
     tabs: Vec<WorkspaceTab>,
     tabs_scroll: ScrollHandle,
     active: Option<u64>,
     next_id: u64,
     error: Option<String>,
     layout: SplitLayout,
+    observed_status_error: (Option<String>, Option<(u64, String)>),
+    status_error: Option<String>,
+    status_error_generation: u64,
     body_bounds: Bounds<Pixels>,
     resize_drag: Option<(SplitAxis, Pixels)>,
     start_pages: HashMap<u64, StartPage>,
@@ -121,15 +214,150 @@ fn empty(message: &str) -> Div {
         .child(message.to_owned())
 }
 
+fn trash_icon() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let origin = bounds.origin;
+            let mut path = PathBuilder::stroke(px(1.5));
+            for points in [
+                &[(3., 5.), (15., 5.)][..],
+                &[(6., 5.), (6., 2.), (12., 2.), (12., 5.)][..],
+                &[(4., 5.), (5., 16.), (13., 16.), (14., 5.)][..],
+                &[(7., 8.), (7., 13.)][..],
+                &[(11., 8.), (11., 13.)][..],
+            ] {
+                path.move_to(origin + point(px(points[0].0), px(points[0].1)));
+                for &(x, y) in &points[1..] {
+                    path.line_to(origin + point(px(x), px(y)));
+                }
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(MUTED));
+            }
+        },
+    )
+    .size(px(18.))
+}
+
+fn shortcut_help(window: &Window) -> Stateful<Div> {
+    let sections: &[(&str, &[&str])] = &[
+        (
+            "공통",
+            &[
+                "f - 패치",
+                "f5 - 새로고침",
+                "ctrl + r - 새로고침",
+                "c - 커밋",
+                "p - 풀",
+                "shift + p - 푸시",
+                "? - 도움말",
+                "f12 - 세팅",
+                "esc - 도움말 닫기",
+            ],
+        ),
+        ("브랜치", &[]),
+        ("커밋히스토리", &["b - 선택 커밋에 브랜치 만들기"]),
+        (
+            "파일목록",
+            &[
+                "shift + ↑ - 위로 범위 선택",
+                "shift + ↓ - 아래로 범위 선택",
+                "ctrl + a - 전체 선택",
+                "space - 선택 파일 stage / unstage",
+                "d - 선택 파일 변경사항 폐기 확인",
+            ],
+        ),
+        (
+            "텍스트뷰어",
+            &[
+                "방향키 - 커서 이동",
+                "home - 줄 처음으로 이동",
+                "end - 줄 끝으로 이동",
+                "shift + 방향키 - 선택 확장",
+                "shift + home - 줄 처음까지 선택",
+                "shift + end - 줄 끝까지 선택",
+                "ctrl + a - 전체 선택",
+                "ctrl + c - 복사",
+            ],
+        ),
+    ];
+    let mut help = div()
+        .id("shortcut-help")
+        .flex()
+        .flex_col()
+        .gap_3()
+        .max_h(window.viewport_size().height - px(120.))
+        .overflow_y_scroll();
+    for &(title, shortcuts) in sections {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .gap_1()
+            .child(div().text_color(rgb(ACCENT)).child(title));
+        if title == "공통" {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("입력창과 확인창에서는 제외"),
+            );
+        } else if title == "파일목록" {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("stage 파일목록 포커스 필요"),
+            );
+        } else if title == "텍스트뷰어" {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("텍스트뷰어 포커스 필요"),
+            );
+        }
+        if shortcuts.is_empty() {
+            section = section.child(div().text_color(rgb(MUTED)).child("표시할 단축키 없음"));
+        }
+        for &shortcut in shortcuts {
+            section = section.child(shortcut);
+        }
+        help = help.child(section);
+    }
+    help
+}
+
 impl Workspace {
     pub fn new(paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
+            state_path: session::state_path().ok(),
+            recent: Vec::new(),
+            pending: 0,
+            staging: HashSet::new(),
+            remote_status: None,
+            help: false,
+            settings: None,
+            branch_dialog: None,
+            branch_busy: false,
+            commit_dialog: None,
+            discard_dialog: None,
+            delete_target: None,
+            delete_confirm: false,
+            focus: cx.focus_handle(),
+            list_focus: None,
+            text_selection: None,
+            text_drag: false,
             tabs: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
             active: None,
             next_id: 0,
             error: None,
             layout: SplitLayout::default(),
+            observed_status_error: (None, None),
+            status_error: None,
+            status_error_generation: 0,
             body_bounds: Bounds::default(),
             resize_drag: None,
             start_pages: HashMap::new(),
@@ -149,13 +377,903 @@ impl Workspace {
             diff_width_row: HashMap::new(),
             diff_content_width: HashMap::new(),
         };
-        if paths.is_empty() {
-            this.add_empty_tab();
-        }
-        for path in paths {
-            this.open(path, cx);
-        }
+        this.restore(paths, cx);
         this
+    }
+
+    fn restore(&mut self, arguments: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.pending += 1;
+        let state_path = self.state_path.clone();
+        let task = cx.background_executor().spawn(async move {
+            let loaded = state_path
+                .as_deref()
+                .map(session::load)
+                .unwrap_or_else(|| Err(anyhow::anyhow!("작업 공간 저장 경로가 없습니다.")));
+            let can_save = loaded.is_ok();
+            let mut errors = Vec::new();
+            let mut state = loaded.unwrap_or_else(|error| {
+                errors.push(format!("{error:#}"));
+                Session::default()
+            });
+            errors.extend(session::restore_paths(&mut state, arguments));
+            (state, errors, can_save)
+        });
+        cx.spawn(async move |this, cx| {
+            let (state, errors, can_save) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                if !can_save {
+                    this.state_path = None;
+                }
+                this.recent = state.recent;
+                for path in state.tabs {
+                    let id = this.next_id;
+                    this.next_id += 1;
+                    if let Some(path) = path {
+                        this.tabs
+                            .push(WorkspaceTab::Repository(Box::new(Project::new(id, path))));
+                    } else {
+                        this.tabs.push(WorkspaceTab::Empty(id));
+                        this.start_pages.insert(id, StartPage::default());
+                    }
+                }
+                this.active = this.tabs.get(state.active).map(WorkspaceTab::id);
+                let active = this.active;
+                this.ensure_active_loaded(cx);
+                this.persist();
+                if !errors.is_empty() {
+                    this.error = Some(errors.join("\n"));
+                }
+                if let Some(index) = this.tabs.iter().position(|tab| Some(tab.id()) == active) {
+                    this.tabs_scroll.scroll_to_item(index);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn persist(&mut self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let state = Session {
+            version: 1,
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| tab.project().map(|p| p.path.clone()))
+                .collect(),
+            active: self
+                .tabs
+                .iter()
+                .position(|tab| Some(tab.id()) == self.active)
+                .unwrap_or(0),
+            recent: self.recent.clone(),
+        };
+        if let Err(error) = session::save(path, &state) {
+            self.error = Some(format!("{error:#}"));
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.pending > 0
+            || self.start_pages.values().any(|p| p.busy)
+            || self
+                .tabs
+                .iter()
+                .filter_map(WorkspaceTab::project)
+                .any(|p| p.loading || p.diff_loading || p.page_loading)
+    }
+
+    fn history_in_progress(&self) -> bool {
+        self.tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .any(Project::history_in_progress)
+    }
+
+    fn update_status_error(&mut self, cx: &mut Context<Self>) {
+        let current = (
+            self.error.clone(),
+            self.project()
+                .and_then(|project| project.error.clone().map(|error| (project.id, error))),
+        );
+        if current == self.observed_status_error {
+            return;
+        }
+        let new_error = if current.0 != self.observed_status_error.0 {
+            current.0.clone()
+        } else {
+            None
+        }
+        .or_else(|| {
+            if current.1 != self.observed_status_error.1 {
+                current.1.as_ref().map(|(_, error)| error.clone())
+            } else {
+                None
+            }
+        });
+        self.observed_status_error = current;
+        let Some(error) = new_error else {
+            return;
+        };
+        self.status_error = Some(error);
+        self.status_error_generation += 1;
+        let generation = self.status_error_generation;
+        let timer = cx
+            .background_executor()
+            .timer(std::time::Duration::from_secs(3));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.status_error_generation == generation {
+                    this.status_error = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn text_lines(&self, key: ListKey) -> Vec<String> {
+        if key.1 == 31 {
+            self.detail_items
+                .get(&key.0)
+                .map(|r| r.lines.clone())
+                .unwrap_or_default()
+        } else {
+            self.tabs
+                .iter()
+                .filter_map(WorkspaceTab::project)
+                .find(|p| p.id == key.0)
+                .map(|p| p.diff.lines.iter().map(|line| line.text.clone()).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    fn selection_color(&self, section: ListFocus, window: &Window) -> u32 {
+        if self.list_focus == Some(section)
+            && self.focus.is_focused(window)
+            && !self.history_in_progress()
+            && !self.help
+            && self.settings.is_none()
+            && self.branch_dialog.is_none()
+            && !self.branch_busy
+            && self.delete_target.is_none()
+            && self.commit_dialog.is_none()
+            && self.discard_dialog.is_none()
+            && self.active
+                == Some(match section {
+                    ListFocus::Branches(id) | ListFocus::Files(id) | ListFocus::History(id) => id,
+                    ListFocus::Text(key) => key.0,
+                })
+        {
+            SELECT
+        } else {
+            SELECT_INACTIVE
+        }
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_in_progress() || self.branch_busy {
+            cx.stop_propagation();
+            return;
+        }
+        let key = &event.keystroke;
+        if let Some(dialog) = &self.discard_dialog {
+            if !dialog.busy && key.modifiers.control && key.key == "s" {
+                self.discard_selected(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if !dialog.busy && key.key == "escape" {
+                self.discard_dialog = None;
+                self.focus.focus(window);
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(dialog) = &self.commit_dialog {
+            if dialog.busy {
+                cx.stop_propagation();
+                return;
+            }
+            if key.modifiers.control && (key.key == "s" || key.key == "p") {
+                self.submit_commit(key.key == "p", cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "escape" {
+                if dialog.editor.read(cx).is_composing() {
+                    return;
+                }
+                self.commit_dialog = None;
+                self.focus.focus(window);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        if let Some(settings) = self.settings.clone() {
+            if key.key == "escape" && !settings.read(cx).is_composing(cx) {
+                self.close_settings(window, cx);
+                cx.stop_propagation();
+            } else if key.modifiers.control && key.key == "s" {
+                settings.update(cx, |settings, cx| settings.save(cx));
+                cx.stop_propagation();
+            } else if key.key == "tab" && !key.modifiers.control && !key.modifiers.alt {
+                settings
+                    .read(cx)
+                    .focus_next(key.modifiers.shift, window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if let Some(dialog) = &self.branch_dialog {
+            let composing = dialog
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).is_composing());
+            if key.key == "escape" && !composing {
+                self.close_branch_dialog(window, cx);
+                cx.stop_propagation();
+            } else if !composing
+                && (key.key == "enter" || (key.modifiers.control && key.key == "s"))
+            {
+                self.submit_branch(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if self.help || self.delete_target.is_some() {
+            if key.key == "escape" {
+                self.help = false;
+                self.delete_target = None;
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "f12"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            self.open_settings(window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.url_focus.is_focused(window) {
+            return;
+        }
+        if !key.modifiers.alt
+            && !key.modifiers.platform
+            && !key.modifiers.shift
+            && ((!key.modifiers.control && key.key == "f5")
+                || (key.modifiers.control && key.key == "r"))
+        {
+            if self.pending == 0 {
+                self.reload(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
+            if key.key == "b" && !key.modifiers.shift {
+                self.open_branch_create(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "?" || key.key_char.as_deref() == Some("?") {
+                self.help = true;
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.key == "f" {
+                self.remote_operation(crate::setup::RemoteOperation::Fetch, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "c" {
+                self.open_commit(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "d" {
+                self.open_discard(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key.eq_ignore_ascii_case("p") {
+                let operation = if key.modifiers.shift {
+                    crate::setup::RemoteOperation::Push
+                } else {
+                    crate::setup::RemoteOperation::Pull
+                };
+                self.remote_operation(operation, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if let Some(ListFocus::Text(text_key)) = self.list_focus {
+            if Some(text_key.0) != self.active {
+                return;
+            }
+            let lines = self.text_lines(text_key);
+            if let Some((selection_key, selection)) = &mut self.text_selection
+                && *selection_key == text_key
+            {
+                if key.modifiers.control && key.key == "c" {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selection.text(&lines)));
+                } else if key.modifiers.control && key.key == "a" {
+                    selection.anchor = Position::default();
+                    selection.cursor = Position {
+                        row: lines.len().saturating_sub(1),
+                        column: lines.last().map_or(0, |line| line.chars().count()),
+                    };
+                } else if ["up", "down", "left", "right", "home", "end"].contains(&key.key.as_str())
+                {
+                    selection.move_cursor(&lines, &key.key, key.modifiers.shift);
+                    if let Some(scroll) = self.list_scroll.get(&text_key) {
+                        scroll.scroll_to_item(selection.cursor.row, ScrollStrategy::Center);
+                    }
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+        if key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform && key.key == "a"
+        {
+            if let Some(ListFocus::Files(id)) = self.list_focus
+                && self.active == Some(id)
+                && let Some(project) = self.project_mut()
+                && project.file_tab == FileTab::Stage
+            {
+                project.stage_selection.select_all(&project.snapshot.stage);
+                if project.selected_file.is_none() && !project.snapshot.stage.is_empty() {
+                    self.select_file(0, cx);
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+        if !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && !key.modifiers.shift
+            && (key.key == "space" || key.key_char.as_deref() == Some(" "))
+        {
+            self.stage_selected(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if !key.modifiers.control
+            && !key.modifiers.alt
+            && ["up", "down"].contains(&key.key.as_str())
+        {
+            self.navigate(key.key == "down", key.modifiers.shift, cx);
+            cx.stop_propagation();
+        }
+    }
+
+    fn navigate(&mut self, down: bool, extend: bool, cx: &mut Context<Self>) {
+        let Some(focus) = self.list_focus else {
+            return;
+        };
+        let Some(p) = self.project() else {
+            return;
+        };
+        let id = p.id;
+        match focus {
+            ListFocus::Branches(project) if project == id => {
+                let kind = p.ref_tab.index();
+                let rows = &p.snapshot.reference_rows[kind];
+                let current = rows.iter().position(|index| {
+                    let revision = &p.snapshot.references[*index].revision;
+                    p.revision.as_ref().or(p.snapshot.current_branch.as_ref()) == Some(revision)
+                });
+                if let Some(index) = text_selection::adjacent(current, rows.len(), down) {
+                    let reference = p.snapshot.references[rows[index]].clone();
+                    if current == Some(index) {
+                        return;
+                    }
+                    if let Some(scroll) = self.list_scroll.get(&(id, 10 + kind as u8)) {
+                        scroll.scroll_to_item(index, ScrollStrategy::Center);
+                    }
+                    self.select_reference(reference.revision, reference.target, None, cx);
+                }
+            }
+            ListFocus::History(project) if project == id => {
+                let current = p
+                    .snapshot
+                    .commits
+                    .iter()
+                    .position(|c| Some(&c.id) == p.commit.as_ref());
+                if let Some(index) =
+                    text_selection::adjacent(current, p.snapshot.commits.len(), down)
+                {
+                    if current == Some(index) {
+                        return;
+                    }
+                    let commit = p.snapshot.commits[index].id.clone();
+                    if let Some(scroll) = self.history_scroll.get(&id) {
+                        scroll.scroll_to_item(index, ScrollStrategy::Center);
+                    }
+                    self.select_commit(commit, cx);
+                }
+            }
+            ListFocus::Files(project) if project == id => {
+                let history = p.file_tab == FileTab::History;
+                let offset = usize::from(history);
+                let current = if history && p.show_commit_detail {
+                    Some(0)
+                } else {
+                    p.selected_file.map(|index| index + offset)
+                };
+                let key = (
+                    id,
+                    if p.file_tab == FileTab::History {
+                        21
+                    } else {
+                        20
+                    },
+                );
+                if let Some(index) =
+                    text_selection::adjacent(current, p.files().len() + offset, down)
+                {
+                    if current == Some(index) {
+                        return;
+                    }
+                    if history && index == 0 {
+                        self.show_detail();
+                        cx.notify();
+                        return;
+                    }
+                    let index = index - offset;
+                    if let Some(row) = self
+                        .file_items
+                        .get(&key)
+                        .and_then(|rows| rows.iter().position(|row| *row == FileRow::File(index)))
+                        && let Some(scroll) = self.list_scroll.get(&key)
+                    {
+                        scroll.scroll_to_item(row, ScrollStrategy::Center);
+                    }
+                    if !history && let Some(project) = self.project_mut() {
+                        project.stage_selection.click(
+                            &project.snapshot.stage,
+                            index,
+                            extend,
+                            false,
+                        );
+                    }
+                    self.select_file(index, cx);
+                }
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn remote_operation(
+        &mut self,
+        operation: crate::setup::RemoteOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() {
+            return;
+        }
+        let Some(p) = self.project() else {
+            return;
+        };
+        let (id, path) = (p.id, p.path.clone());
+        self.error = None;
+        self.pending += 1;
+        self.remote_status = Some((id, operation.label()));
+        let task = cx
+            .background_executor()
+            .spawn(async move { operation.run(&path) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.remote_status = None;
+                match result {
+                    Ok(()) if this.tabs.iter().any(|tab| tab.id() == id) => {
+                        let active = this.active;
+                        this.active = Some(id);
+                        this.reload(cx);
+                        this.active = active;
+                    }
+                    Ok(()) => {}
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending > 0 {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        if project.loading || !project.snapshot.stage.iter().any(|file| file.staged) {
+            return;
+        }
+        let project_id = project.id;
+        let editor = cx.new(CommitEditor::new);
+        editor.read(cx).focus.focus(window);
+        self.commit_dialog = Some(CommitDialog {
+            project_id,
+            editor,
+            busy: false,
+            push_after: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_commit(&mut self, push_after: bool, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.commit_dialog else {
+            return;
+        };
+        if dialog.busy {
+            return;
+        }
+        let message = dialog.editor.read(cx).message().to_owned();
+        if message.trim().is_empty() {
+            dialog.error = Some("커밋 메시지를 입력하세요.".into());
+            cx.notify();
+            return;
+        }
+        let id = dialog.project_id;
+        if !self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .find(|project| project.id == id)
+            .is_some_and(|project| project.snapshot.stage.iter().any(|file| file.staged))
+        {
+            dialog.error = Some("staged 변경사항이 없습니다.".into());
+            cx.notify();
+            return;
+        }
+        let Some(path) = self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .find(|project| project.id == id)
+            .map(|project| project.path.clone())
+        else {
+            return;
+        };
+        dialog.busy = true;
+        dialog.push_after = push_after;
+        dialog.error = None;
+        dialog.editor.update(cx, |editor, cx| {
+            editor.enabled = false;
+            cx.notify();
+        });
+        self.pending += 1;
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::setup::commit_then_push(&path, &message, push_after) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                match result {
+                    Ok(push_error) => {
+                        this.commit_dialog = None;
+                        this.error = push_error;
+                        let active = this.active;
+                        this.active = Some(id);
+                        if let Some(project) = this.project_mut() {
+                            project.commit = None;
+                        }
+                        this.reload(cx);
+                        this.active = active;
+                    }
+                    Err(error) => {
+                        if let Some(dialog) = &mut this.commit_dialog
+                            && dialog.project_id == id
+                        {
+                            dialog.busy = false;
+                            dialog.error = Some(format!("{error:#}"));
+                            dialog.editor.update(cx, |editor, cx| {
+                                editor.enabled = true;
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stage_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.project() else {
+            return;
+        };
+        if p.file_tab != FileTab::Stage
+            || p.loading
+            || self.pending > 0
+            || !matches!(self.list_focus, Some(ListFocus::Files(id)) if id == p.id)
+            || self.staging.contains(&p.id)
+        {
+            return;
+        }
+        let changes = p.stage_selection.changes(&p.snapshot.stage);
+        if changes.is_empty() {
+            return;
+        }
+        let (id, root) = (p.id, p.path.clone());
+        self.staging.insert(id);
+        self.pending += 1;
+        self.error = None;
+        let targets = changes.clone();
+        let task = cx.background_executor().spawn(async move {
+            let operation = crate::setup::toggle_files(&root, &changes);
+            let refreshed = git::load_stage(&root);
+            (operation, refreshed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (operation, refreshed) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.staging.remove(&id);
+                if !this.tabs.iter().any(|tab| tab.id() == id) {
+                    return;
+                }
+                match refreshed {
+                    Ok(files) => this.apply_stage_files(id, files, &targets, cx),
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                if let Err(error) = operation {
+                    this.error = Some(format!("{error:#}"));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_stage_files(
+        &mut self,
+        id: u64,
+        files: Vec<FileChange>,
+        targets: &std::collections::BTreeMap<Vec<u8>, bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self
+            .tabs
+            .iter_mut()
+            .filter_map(WorkspaceTab::project_mut)
+            .find(|p| p.id == id)
+        else {
+            return;
+        };
+        let primary = if p.file_tab == FileTab::Stage {
+            p.selected_file
+                .and_then(|index| p.snapshot.stage.get(index))
+                .map(|file| (file.path.clone(), file.staged))
+        } else {
+            None
+        };
+        p.snapshot.stage = files;
+        p.error = None;
+        p.stage_selection.restore(&p.snapshot.stage, targets);
+        let selected = primary
+            .and_then(|(path, staged)| {
+                let staged = targets.get(&path).copied().unwrap_or(staged);
+                p.snapshot.stage.iter().position(|file| {
+                    file.path == path && file.staged == staged && p.stage_selection.contains(file)
+                })
+            })
+            .or_else(|| {
+                p.snapshot
+                    .stage
+                    .iter()
+                    .position(|file| p.stage_selection.contains(file))
+            });
+        let show_stage = p.file_tab == FileTab::Stage;
+        if show_stage {
+            p.selected_file = selected;
+        }
+        self.file_items
+            .insert((id, 20), file_rows(&p.snapshot.stage, false));
+        if show_stage {
+            if let Some(index) = selected {
+                if let Some(scroll) = self.list_scroll.get(&(id, 20)) {
+                    scroll.scroll_to_item(index, ScrollStrategy::Center);
+                }
+                self.select_project_file(id, index, cx);
+            } else if let Some(p) = self
+                .tabs
+                .iter_mut()
+                .filter_map(WorkspaceTab::project_mut)
+                .find(|p| p.id == id)
+            {
+                p.diff_generation += 1;
+                p.diff_loading = false;
+                p.diff = Diff::default();
+                if self.active == Some(id) {
+                    self.text_selection = None;
+                }
+            }
+        }
+    }
+
+    fn open_discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(p) = self.project() else {
+            return;
+        };
+        if self.pending > 0
+            || p.loading
+            || p.file_tab != FileTab::Stage
+            || !matches!(self.list_focus, Some(ListFocus::Files(id)) if id == p.id)
+        {
+            return;
+        }
+        let paths: Vec<_> = p
+            .stage_selection
+            .changes(&p.snapshot.stage)
+            .into_keys()
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.discard_dialog = Some(DiscardDialog {
+            project_id: p.id,
+            paths,
+            busy: false,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn discard_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.discard_dialog else {
+            return;
+        };
+        if dialog.busy || self.pending > 0 {
+            return;
+        }
+        let id = dialog.project_id;
+        let Some(root) = self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .find(|p| p.id == id)
+            .map(|p| p.path.clone())
+        else {
+            return;
+        };
+        let paths = dialog.paths.clone();
+        dialog.busy = true;
+        dialog.error = None;
+        self.pending += 1;
+        let task = cx.background_executor().spawn(async move {
+            let operation = crate::setup::discard_files(&root, &paths);
+            let refreshed = git::load_stage(&root);
+            (operation, refreshed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (operation, refreshed) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                if !this.tabs.iter().any(|tab| tab.id() == id) {
+                    this.discard_dialog = None;
+                    return;
+                }
+                let mut error = operation.err().map(|error| format!("{error:#}"));
+                match refreshed {
+                    Ok(files) => this.apply_stage_files(id, files, &Default::default(), cx),
+                    Err(failure) => {
+                        error.get_or_insert_with(|| format!("{failure:#}"));
+                    }
+                }
+                if let Some(error) = error {
+                    if let Some(dialog) = &mut this.discard_dialog {
+                        dialog.busy = false;
+                        dialog.error = Some(error);
+                    }
+                } else {
+                    this.discard_dialog = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn delete_repository(&mut self, cx: &mut Context<Self>) {
+        if self.busy() || !self.delete_confirm {
+            return;
+        }
+        let Some(path) = self.delete_target.take() else {
+            return;
+        };
+        self.pending += 1;
+        let mut sessions = Vec::new();
+        for project in self.tabs.iter_mut().filter_map(WorkspaceTab::project_mut) {
+            if project.path == path
+                && let Some(session) = project.snapshot.session.take()
+            {
+                sessions.push(session);
+            }
+        }
+        let target = path.clone();
+        let task = cx.background_executor().spawn(async move {
+            for session in sessions {
+                let _ = session.close();
+            }
+            crate::setup::recycle_repository(&target)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                match result {
+                    Ok(()) => {
+                        let ids: Vec<_> = this
+                            .tabs
+                            .iter()
+                            .filter_map(WorkspaceTab::project)
+                            .filter(|p| p.path == path)
+                            .map(|p| p.id)
+                            .collect();
+                        for id in ids {
+                            this.close_tab(id, cx);
+                        }
+                        this.recent.retain(|item| *item != path);
+                        this.error = None;
+                        this.persist();
+                    }
+                    Err(error) => {
+                        let ids: Vec<_> = this
+                            .tabs
+                            .iter()
+                            .filter_map(WorkspaceTab::project)
+                            .filter(|p| p.path == path)
+                            .map(|p| p.id)
+                            .collect();
+                        let active = this.active;
+                        for id in ids {
+                            this.active = Some(id);
+                            this.reload(cx);
+                        }
+                        this.active = active;
+                        this.error = Some(format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn scroll_handle(&mut self, key: ListKey) -> UniformListScrollHandle {
@@ -409,6 +1527,11 @@ impl Workspace {
             return;
         }
         let Some(session) = p.snapshot.session.clone() else {
+            if p.history_target.take().is_some() {
+                p.page_error =
+                    Some("히스토리 조회 세션이 없습니다. 저장소를 다시 조회해 주세요.".into());
+                cx.notify();
+            }
             return;
         };
         p.page_loading = true;
@@ -428,14 +1551,28 @@ impl Workspace {
                     return;
                 };
                 p.page_loading = false;
+                let mut target_index = None;
                 match result {
                     Ok(page) => {
                         p.snapshot.commits.extend(page.commits);
                         p.snapshot.has_more = page.has_more;
+                        target_index = p.resolve_history_target();
                     }
                     Err(error) => {
                         p.page_error = Some(format!("{error:#}"));
                     }
+                }
+                let continue_loading = p.history_target.is_some() && p.page_error.is_none();
+                if let Some(index) = target_index
+                    && this.active == Some(id)
+                {
+                    this.history_scroll
+                        .entry(id)
+                        .or_default()
+                        .scroll_to_item(index, ScrollStrategy::Center);
+                }
+                if continue_loading {
+                    this.load_more(id, cx);
                 }
                 cx.notify();
             })
@@ -451,6 +1588,232 @@ impl Workspace {
             .and_then(WorkspaceTab::project)
     }
 
+    fn open_branch_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project() else {
+            return;
+        };
+        if self.pending > 0
+            || self.branch_dialog.is_some()
+            || self.list_focus != Some(ListFocus::History(project.id))
+        {
+            return;
+        }
+        let Some(commit) = project.commit.clone() else {
+            return;
+        };
+        let (project_id, path) = (project.id, project.path.clone());
+        let editor = cx.new(|cx| CommitEditor::single_line("", cx));
+        editor.read(cx).focus.focus(window);
+        self.branch_dialog = Some(BranchDialog {
+            project_id,
+            path,
+            action: BranchAction::Create { commit },
+            editor: Some(editor),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn close_branch_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.branch_busy {
+            return;
+        }
+        self.branch_dialog = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn refresh_after_branch(
+        &mut self,
+        id: u64,
+        switched: bool,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.tabs.iter().any(|tab| tab.id() == id) {
+            return;
+        }
+        let active = self.active;
+        self.active = Some(id);
+        if switched && let Some(project) = self.project_mut() {
+            project.revision = None;
+            project.commit = None;
+            project.ref_tab = RefTab::Local;
+            project.file_tab = FileTab::Stage;
+            project.show_commit_detail = false;
+            self.list_focus = Some(ListFocus::Branches(id));
+        }
+        self.reload(cx);
+        self.active = active;
+        self.error = error;
+    }
+
+    fn submit_branch(&mut self, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.branch_busy {
+            return;
+        }
+        let Some(dialog) = &mut self.branch_dialog else {
+            return;
+        };
+        if dialog
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).is_composing())
+        {
+            return;
+        }
+        let name = dialog
+            .editor
+            .as_ref()
+            .map(|editor| editor.read(cx).message().trim().to_owned());
+        let (id, path, action) = (
+            dialog.project_id,
+            dialog.path.clone(),
+            dialog.action.clone(),
+        );
+        if let Some(editor) = &dialog.editor {
+            editor.update(cx, |editor, cx| {
+                editor.enabled = false;
+                cx.notify();
+            });
+        }
+        dialog.error = None;
+        self.pending += 1;
+        self.branch_busy = true;
+        self.remote_status = Some((id, "브랜치 작업 중…"));
+        let switched = matches!(action, BranchAction::Track(_));
+        let task = cx.background_executor().spawn(async move {
+            match action {
+                BranchAction::Create { commit } => {
+                    crate::branches::create(&path, name.as_deref().unwrap_or_default(), &commit)
+                }
+                BranchAction::Track(target) => crate::branches::checkout(&path, &target, true),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.branch_busy = false;
+                this.remote_status = None;
+                match result {
+                    Ok(()) => {
+                        this.branch_dialog = None;
+                        this.refresh_after_branch(id, switched, None, cx);
+                    }
+                    Err(error) => {
+                        this.refresh_after_branch(id, false, Some(error.to_string()), cx);
+                        if let Some(dialog) = &mut this.branch_dialog {
+                            dialog.error = Some(error.to_string());
+                            if let Some(editor) = &dialog.editor {
+                                editor.update(cx, |editor, cx| {
+                                    editor.enabled = true;
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn checkout_reference(&mut self, id: u64, reference: String, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project().filter(|project| project.id == id) else {
+            return;
+        };
+        let path = project.path.clone();
+        if let Some(project) = self.project_mut() {
+            project.history_target = None;
+        }
+        let worker_path = path.clone();
+        self.pending += 1;
+        self.branch_busy = true;
+        self.remote_status = Some((id, "브랜치 전환 중…"));
+        let task = cx.background_executor().spawn(async move {
+            let target = crate::branches::prepare_checkout(&worker_path, &reference)?;
+            if target.needs_creation {
+                Ok(Some(target))
+            } else {
+                crate::branches::checkout(&worker_path, &target, false)?;
+                Ok::<_, anyhow::Error>(None)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.branch_busy = false;
+                this.remote_status = None;
+                match result {
+                    Ok(Some(target)) => {
+                        this.branch_dialog = Some(BranchDialog {
+                            project_id: id,
+                            path,
+                            action: BranchAction::Track(target),
+                            editor: None,
+                            error: None,
+                        })
+                    }
+                    Ok(None) => this.refresh_after_branch(id, true, None, cx),
+                    Err(error) => this.refresh_after_branch(id, false, Some(error.to_string()), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_in_progress()
+            || self.commit_dialog.is_some()
+            || self.discard_dialog.is_some()
+            || self.delete_target.is_some()
+            || self.settings.is_some()
+            || self.branch_dialog.is_some()
+            || self.branch_busy
+        {
+            return;
+        }
+        let path = self.project().map(|project| project.path.clone());
+        self.help = false;
+        self.settings = Some(cx.new(|cx| SettingsPanel::new(path, cx)));
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = &self.settings {
+            if !settings.read(cx).can_close() {
+                return;
+            }
+            settings.read(cx).cancel();
+        }
+        self.settings = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn settings_link(&self, cx: &Context<Self>) -> Stateful<Div> {
+        div()
+            .id("show-settings")
+            .ml_3()
+            .text_xs()
+            .text_color(rgb(ACCENT))
+            .cursor_pointer()
+            .child("f12 - 세팅")
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+    }
+
     fn add_empty_tab(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
@@ -459,9 +1822,10 @@ impl Workspace {
         self.active = Some(id);
         self.error = None;
         self.tabs_scroll.scroll_to_item(self.tabs.len() - 1);
+        self.persist();
     }
 
-    fn close_tab(&mut self, id: u64) {
+    fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
         self.list_scroll.retain(|(project, _), _| *project != id);
         self.tracks.retain(|((project, _), _), _| *project != id);
         self.file_items.retain(|(project, _), _| *project != id);
@@ -488,6 +1852,16 @@ impl Workspace {
         {
             self.tabs_scroll.scroll_to_item(index);
         }
+        self.list_focus = None;
+        self.text_selection = None;
+        self.persist();
+        self.ensure_active_loaded(cx);
+    }
+
+    fn ensure_active_loaded(&mut self, cx: &mut Context<Self>) {
+        if self.project().is_some_and(|project| !project.initialized) {
+            self.reload(cx);
+        }
     }
 
     fn start_resize(&mut self, axis: SplitAxis, event: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -503,6 +1877,20 @@ impl Workspace {
     }
 
     fn resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_in_progress()
+            || self.help
+            || self.settings.is_some()
+            || self.branch_dialog.is_some()
+            || self.branch_busy
+            || self.delete_target.is_some()
+            || self.commit_dialog.is_some()
+            || self.discard_dialog.is_some()
+        {
+            self.resize_drag = None;
+            self.column_drag = None;
+            self.scroll_drag = None;
+            return;
+        }
         if let Some(drag) = self.scroll_drag.clone() {
             if event.dragging() {
                 self.drag_scroll(&drag, event.position);
@@ -612,6 +2000,16 @@ impl Workspace {
     }
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(source) = self.active else { return };
+        let Some(page) = self.start_pages.get_mut(&source) else {
+            return;
+        };
+        if page.busy {
+            return;
+        }
+        page.busy = true;
+        page.error = None;
+        self.pending += 1;
         // 정규화도 저장소 탐색과 함께 백그라운드에서 수행한다.
         let task = cx
             .background_executor()
@@ -619,44 +2017,62 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                let Some(page) = this.start_pages.get_mut(&source) else {
+                    cx.notify();
+                    return;
+                };
+                page.busy = false;
                 match result {
                     Ok(path) => {
-                        if let Some(project) = this
-                            .tabs
-                            .iter()
-                            .filter_map(WorkspaceTab::project)
-                            .find(|p| p.path == path)
-                        {
-                            this.active = Some(project.id);
-                        } else {
-                            let id = this.next_id;
-                            this.next_id += 1;
-                            this.tabs
-                                .push(WorkspaceTab::Repository(Box::new(Project::new(id, path))));
-                            this.active = Some(id);
-                            this.reload(cx);
-                        }
-                        this.error = None;
-                        if let Some(index) = this
-                            .tabs
-                            .iter()
-                            .position(|tab| Some(tab.id()) == this.active)
-                        {
-                            this.tabs_scroll.scroll_to_item(index);
-                        }
+                        this.finish_open(source, path, cx);
                     }
-                    Err(err) => {
-                        if this.tabs.is_empty() {
-                            this.add_empty_tab();
-                        }
-                        this.error = Some(format!("{err:#}"));
-                    }
+                    Err(err) => page.error = Some(format!("{err:#}")),
                 }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+        cx.notify();
+    }
+
+    fn finish_open(&mut self, source: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(target) = WorkspaceTab::open_in_place(&mut self.tabs, source, path.clone()) else {
+            return;
+        };
+        self.start_pages.remove(&source);
+        self.viewports.remove(&(source, 40));
+        self.tracks
+            .retain(|((id, kind), _), _| *id != source || *kind != 40);
+        if self
+            .scroll_drag
+            .as_ref()
+            .is_some_and(|drag| drag.key == (source, 40))
+        {
+            self.scroll_drag = None;
+        }
+        let active = if self.active == Some(source) {
+            self.list_focus = None;
+            self.text_selection = None;
+            Some(target)
+        } else {
+            self.active
+        };
+        session::remember(&mut self.recent, path);
+        self.error = None;
+        // 대상 탭의 조회를 시작하되 작업 중 바뀐 사용자 선택은 보존한다.
+        self.active = Some(target);
+        self.ensure_active_loaded(cx);
+        self.active = active;
+        self.persist();
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| Some(tab.id()) == self.active)
+        {
+            self.tabs_scroll.scroll_to_item(index);
+        }
     }
 
     fn start_repository(&mut self, id: u64, mode: u8, cx: &mut Context<Self>) {
@@ -731,15 +2147,7 @@ impl Workspace {
                 page.busy = false;
                 match result {
                     Some(Ok(path)) => {
-                        if let Some(tab) = this.tabs.iter_mut().find(|t| t.id() == id) {
-                            *tab = WorkspaceTab::Repository(Box::new(Project::new(id, path)));
-                        }
-                        this.start_pages.remove(&id);
-                        // 조회 시작 시에만 활성 ID를 바꾸고 사용자의 선택은 유지한다.
-                        let active = this.active;
-                        this.active = Some(id);
-                        this.reload(cx);
-                        this.active = active;
+                        this.finish_open(id, path, cx);
                     }
                     Some(Err(error)) => page.error = Some(format!("{error:#}")),
                     None => {}
@@ -752,18 +2160,25 @@ impl Workspace {
         cx.notify();
     }
 
-    fn start_page(&self, cx: &Context<Self>) -> Div {
-        let Some(id) = self.active else { return div() };
+    fn start_page(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let Some(id) = self.active else {
+            return div().id("start-page");
+        };
         let Some(page) = self.start_pages.get(&id) else {
-            return div();
+            return div().id("start-page");
         };
         let mut content = div()
+            .id("start-actions")
             .flex()
             .flex_col()
             .gap_3()
-            .w(px(420.))
-            .max_w_full()
-            .child(div().text_xl().child("저장소 시작"));
+            .w(px(300.))
+            .max_w(relative(0.4))
+            .min_w_0()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex_shrink_0()
+            .child(div().text_lg().child("신규 저장소"));
         for (mode, label) in [(0, "신규 저장소"), (1, "저장소 열기"), (2, "Clone")] {
             content = content.child(button(("start", mode as usize), label, false).on_click(
                 cx.listener(move |this, _, window, cx| {
@@ -859,22 +2274,132 @@ impl Workspace {
                     .child(error.clone()),
             );
         }
+        let key = (id, 40);
+        let scroll = page.recent_scroll.clone();
+        let count = self.recent.len();
+        let list = uniform_list(
+            ("recent-list", id as usize),
+            count,
+            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|index| this.recent_row(index, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(scroll.clone())
+        .flex_1()
+        .min_w_0()
+        .w_full();
+        let recent = div()
+            .id("recent-repositories")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .gap_3()
+            .pl_5()
+            .border_l_1()
+            .border_color(rgb(LINE))
+            .child(div().text_lg().child("최근 저장소"))
+            .when(count == 0, |panel| {
+                panel.child(empty("아직 열었던 저장소가 없습니다."))
+            })
+            .child(self.scroll_frame(
+                key,
+                scroll,
+                list,
+                size(0., count as f32 * RECENT_ROW_HEIGHT),
+                false,
+                cx,
+            ));
         div()
+            .id("start-page")
             .flex()
             .flex_1()
+            .min_w_0()
             .min_h_0()
-            .items_center()
-            .justify_center()
+            .overflow_hidden()
+            .gap_5()
             .p_5()
             .child(content)
+            .child(recent)
+    }
+
+    fn recent_row(&self, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+        let row = div()
+            .id(("recent-row", index))
+            .h(px(RECENT_ROW_HEIGHT))
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .min_w_0()
+            .overflow_hidden()
+            .border_b_1()
+            .border_color(rgb(LINE));
+        let Some(path) = self.recent.get(index) else {
+            return row;
+        };
+        let open_path = path.clone();
+        let delete_path = path.clone();
+        row.cursor_pointer()
+            .hover(|row| row.bg(rgb(0x263443)))
+            .child(
+                div()
+                    .text_sm()
+                    .max_w(relative(0.4))
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .text_ellipsis()
+                    .child(session::display_path(path)),
+            )
+            .child(
+                div()
+                    .id(("recent-delete", index))
+                    .size(px(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .hover(|icon| icon.bg(rgb(0x54313a)))
+                    .child(trash_icon())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.delete_target = Some(delete_path.clone());
+                        this.delete_confirm = false;
+                        this.focus.focus(window);
+                        cx.notify();
+                    })),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.open(open_path.clone(), cx)))
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
+        self.text_selection = None;
         let Some(p) = self.project_mut() else { return };
+        p.initialized = true;
         p.generation += 1;
         p.page_generation += 1;
         p.page_loading = false;
         p.page_error = None;
+        p.history_target = None;
+        p.history_loading = true;
         p.diff_generation += 1;
         p.diff_loading = false;
         let (id, generation) = (p.id, p.generation);
@@ -882,6 +2407,7 @@ impl Workspace {
         p.loading = true;
         p.error = None;
         p.selected_file = None;
+        p.stage_selection.clear();
         p.diff = Diff::default();
         let task = cx
             .background_executor()
@@ -898,12 +2424,17 @@ impl Workspace {
                     return;
                 };
                 p.loading = false;
+                p.history_loading = false;
                 match result {
                     Ok(snapshot) => {
                         if !snapshot
-                            .commits
-                            .iter()
-                            .any(|c| Some(&c.id) == p.commit.as_ref())
+                            .commit_detail
+                            .as_ref()
+                            .is_some_and(|detail| Some(&detail.id) == p.commit.as_ref())
+                            && !snapshot
+                                .commits
+                                .iter()
+                                .any(|c| Some(&c.id) == p.commit.as_ref())
                         {
                             p.commit = snapshot.commits.first().map(|c| c.id.clone());
                         }
@@ -914,7 +2445,7 @@ impl Workspace {
                         {
                             p.revision = None;
                         }
-                        let stage = file_rows(&snapshot.stage, true);
+                        let stage = file_rows(&snapshot.stage, false);
                         let history = file_rows(&snapshot.history, false);
                         let details = snapshot
                             .commit_detail
@@ -947,7 +2478,9 @@ impl Workspace {
     }
 
     fn select_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        self.text_selection = None;
         let Some(p) = self.project_mut() else { return };
+        p.history_target = None;
         p.commit = Some(commit.clone());
         p.file_tab = FileTab::History;
         p.show_commit_detail = true;
@@ -1004,8 +2537,80 @@ impl Workspace {
         cx.notify();
     }
 
+    fn select_reference(
+        &mut self,
+        revision: String,
+        target: String,
+        paging_delay: Option<std::time::Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = self.project_mut() else {
+            return;
+        };
+        let id = p.id;
+        p.revision = Some(revision);
+        self.select_commit(target.clone(), cx);
+        let Some(p) = self.project_mut() else {
+            return;
+        };
+        p.history_target = Some(target.clone());
+        p.page_error = None;
+        let index = p.resolve_history_target();
+        let needs_page = p.history_target.is_some();
+        if let Some(index) = index {
+            self.history_scroll
+                .entry(id)
+                .or_default()
+                .scroll_to_item(index, ScrollStrategy::Center);
+        } else if needs_page {
+            if let Some(delay) = paging_delay {
+                let generation = p.page_generation;
+                // 추가 페이지 모달이 두 번째 클릭을 가로막지 않게 시스템 더블클릭 시간만 기다린다.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    this.update(cx, |this, cx| {
+                        let still_selected = this.project().is_some_and(|project| {
+                            project.id == id
+                                && project.page_generation == generation
+                                && project.history_target.as_ref() == Some(&target)
+                        });
+                        if still_selected
+                            && this.list_focus == Some(ListFocus::Branches(id))
+                            && !this.branch_busy
+                            && this.branch_dialog.is_none()
+                        {
+                            this.load_more(id, cx);
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            } else {
+                self.load_more(id, cx);
+            }
+        }
+        cx.notify();
+    }
+
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(p) = self.project_mut() else { return };
+        let Some(id) = self.active else {
+            return;
+        };
+        self.select_project_file(id, index, cx);
+    }
+
+    fn select_project_file(&mut self, project_id: u64, index: usize, cx: &mut Context<Self>) {
+        if self.active == Some(project_id) {
+            self.text_selection = None;
+        }
+        let Some(p) = self
+            .tabs
+            .iter_mut()
+            .filter_map(WorkspaceTab::project_mut)
+            .find(|p| p.id == project_id)
+        else {
+            return;
+        };
         if p.loading {
             return;
         }
@@ -1073,6 +2678,20 @@ impl Workspace {
         cx.notify();
     }
 
+    fn show_detail(&mut self) {
+        self.text_selection = None;
+        if let Some(p) = self.project_mut() {
+            p.show_commit_detail = true;
+            if p.snapshot.commit_detail.is_some() {
+                p.error = None;
+            }
+            p.selected_file = None;
+            p.diff_generation += 1;
+            p.diff_loading = false;
+            p.diff = Diff::default();
+        }
+    }
+
     fn branch_panel(&mut self, cx: &Context<Self>) -> Div {
         let mut tabs = div()
             .id("reference-tabs")
@@ -1113,9 +2732,9 @@ impl Workspace {
         let list = uniform_list(
             ("branches", kind),
             count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                 range
-                    .map(|index| this.branch_row(id, kind, index, cx))
+                    .map(|index| this.branch_row(id, kind, index, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1137,7 +2756,14 @@ impl Workspace {
             ))
     }
 
-    fn branch_row(&self, id: u64, kind: usize, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+    fn branch_row(
+        &self,
+        id: u64,
+        kind: usize,
+        index: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let mut row = div()
             .id(("reference", index))
             .h(px(history_view::ROW_HEIGHT))
@@ -1168,29 +2794,35 @@ impl Workspace {
         let revision = reference.revision.clone();
         let target = reference.target.clone();
         row = row
-            .bg(rgb(if active { SELECT } else { PANEL }))
+            .bg(rgb(if active {
+                self.selection_color(ListFocus::Branches(id), window)
+            } else {
+                PANEL
+            }))
             .text_color(rgb(if current { ACCENT } else { TEXT }))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x263443)))
+            .when(!active, |row| row.hover(|s| s.bg(rgb(0x263443))))
             .child(div().min_w_0().text_ellipsis().child(format!(
                 "{}{}",
                 if current { "● " } else { "⑂ " },
                 reference.name
             )));
-        row.on_click(cx.listener(move |this, _, _, cx| {
+        row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if this.active != Some(id) {
                 return;
             }
-            if let Some(p) = this.project_mut() {
-                p.revision = Some(revision.clone());
+            this.list_focus = Some(ListFocus::Branches(id));
+            this.focus.focus(window);
+            if event.click_count() == 2 && kind < 2 {
+                this.checkout_reference(id, revision.clone(), cx);
+            } else if event.click_count() == 1 {
+                this.select_reference(
+                    revision.clone(),
+                    target.clone(),
+                    Some(branch_click_interval()),
+                    cx,
+                );
             }
-            if let Some(p) = this.project()
-                && let Some(index) = p.snapshot.commits.iter().position(|c| c.id == target)
-                && let Some(scroll) = this.history_scroll.get(&id)
-            {
-                scroll.scroll_to_item(index, ScrollStrategy::Center);
-            }
-            this.select_commit(target.clone(), cx);
         }))
     }
 
@@ -1199,6 +2831,7 @@ impl Workspace {
         project_id: u64,
         index: usize,
         widths: [f32; 5],
+        window: &Window,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let mut row = div()
@@ -1221,6 +2854,7 @@ impl Workspace {
         };
         let id = commit.id.clone();
         let selected = p.commit.as_deref() == Some(&id);
+        let selection_color = self.selection_color(ListFocus::History(project_id), window);
         let graph = self
             .graphs
             .entry(project_id)
@@ -1228,8 +2862,8 @@ impl Workspace {
             .entry(index)
             .or_insert_with(|| RowGraph::new(commit));
         row = row
-            .bg(rgb(if selected { SELECT } else { PANEL }))
-            .hover(|s| s.bg(rgb(0x202e3c)))
+            .bg(rgb(if selected { selection_color } else { PANEL }))
+            .when(!selected, |row| row.hover(|s| s.bg(rgb(0x202e3c))))
             .child(history_view::cell(0, widths[0]).child(graph.render()));
         let mut description = div()
             .flex()
@@ -1258,11 +2892,22 @@ impl Workspace {
                     )),
             );
         }
+        for tag in &commit.tags {
+            description = description.child(
+                div()
+                    .flex_shrink_0()
+                    .px_1()
+                    .rounded_sm()
+                    .bg(rgb(0x362b49))
+                    .text_color(rgb(0xd6b4ff))
+                    .child(format!("◇ {tag}")),
+            );
+        }
         description =
             description.child(div().min_w_0().text_ellipsis().child(commit.title.clone()));
         row = row.child(history_view::cell(1, widths[1]).child(description));
         for (column, text) in [
-            (2, commit.author.clone()),
+            (2, commit.author_label()),
             (
                 3,
                 history_view::format_time(commit.time, commit.time_offset),
@@ -1271,11 +2916,14 @@ impl Workspace {
         ] {
             row = row.child(
                 history_view::cell(column, widths[column])
+                    .when(column >= 3, |cell| cell.font_family("Cascadia Mono"))
                     .child(div().min_w_0().text_ellipsis().child(text)),
             );
         }
-        row.on_click(cx.listener(move |this, _, _, cx| {
+        row.on_click(cx.listener(move |this, _, window, cx| {
             if this.active == Some(project_id) {
+                this.list_focus = Some(ListFocus::History(project_id));
+                this.focus.focus(window);
                 this.select_commit(id.clone(), cx);
             }
         }))
@@ -1349,7 +2997,7 @@ impl Workspace {
         let list = uniform_list(
             ("commits", project_id as usize),
             count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                 this.graphs
                     .entry(project_id)
                     .or_default()
@@ -1366,7 +3014,7 @@ impl Workspace {
                     });
                 }
                 range
-                    .map(|index| this.history_row(project_id, index, widths, cx))
+                    .map(|index| this.history_row(project_id, index, widths, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1433,7 +3081,7 @@ impl Workspace {
             )
     }
 
-    fn files_panel(&mut self, cx: &Context<Self>) -> Div {
+    fn files_panel(&mut self, window: &Window, cx: &Context<Self>) -> Div {
         let mut tabs = div().flex().gap_1().px_3().py_2().flex_shrink_0();
         for (i, tab) in [FileTab::Stage, FileTab::History].into_iter().enumerate() {
             tabs = tabs.child(
@@ -1447,8 +3095,10 @@ impl Workspace {
                     self.project().is_some_and(|p| p.file_tab == tab),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
+                    this.text_selection = None;
                     if let Some(p) = this.project_mut() {
                         p.file_tab = tab;
+                        p.stage_selection.clear();
                         p.show_commit_detail = tab == FileTab::History;
                         if tab == FileTab::History && p.snapshot.commit_detail.is_some() {
                             p.error = None;
@@ -1482,9 +3132,9 @@ impl Workspace {
         let list = uniform_list(
             ("files", key.1 as usize),
             count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                 range
-                    .map(|index| this.file_row(key, index, cx))
+                    .map(|index| this.file_row(key, index, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1497,27 +3147,31 @@ impl Workspace {
             .child(tabs)
             .when(history, |panel| {
                 panel.child(
-                    button("commit-detail", "커밋상세", detail)
+                    div()
+                        .id("commit-detail")
+                        .bg(rgb(if detail {
+                            self.selection_color(ListFocus::Files(id), window)
+                        } else {
+                            PANEL
+                        }))
+                        .text_color(rgb(TEXT))
+                        .cursor_pointer()
+                        .when(!detail, |row| row.hover(|s| s.bg(rgb(0x263443))))
+                        .text_sm()
                         .h(px(history_view::ROW_HEIGHT))
                         .w_full()
-                        .py_0()
+                        .px_3()
                         .flex()
                         .items_center()
                         .flex_shrink_0()
                         .rounded_none()
                         .border_b_1()
                         .border_color(rgb(LINE))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(p) = this.project_mut() {
-                                p.show_commit_detail = true;
-                                if p.snapshot.commit_detail.is_some() {
-                                    p.error = None;
-                                }
-                                p.selected_file = None;
-                                p.diff_generation += 1;
-                                p.diff_loading = false;
-                                p.diff = Diff::default();
-                            }
+                        .child("커밋상세")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.list_focus = Some(ListFocus::Files(id));
+                            this.focus.focus(window);
+                            this.show_detail();
                             cx.notify();
                         })),
                 )
@@ -1543,7 +3197,13 @@ impl Workspace {
             ))
     }
 
-    fn file_row(&self, key: ListKey, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+    fn file_row(
+        &self,
+        key: ListKey,
+        index: usize,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
         let mut row = div()
             .id(("file-row", index))
             .h(px(history_view::ROW_HEIGHT))
@@ -1558,12 +3218,11 @@ impl Workspace {
         let Some(item) = self.file_items.get(&key).and_then(|rows| rows.get(index)) else {
             return row;
         };
-        if let FileRow::Group(staged) = item {
-            return row.text_xs().text_color(rgb(MUTED)).child(if *staged {
-                "STAGED · 스테이징"
-            } else {
-                "WORKTREE · 작업 디렉터리"
-            });
+        if let FileRow::Group(_) = item {
+            return row
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child("STAGED · 스테이징");
         }
         let FileRow::File(file_index) = *item else {
             unreachable!()
@@ -1584,29 +3243,76 @@ impl Workspace {
         let Some(file) = files.get(file_index) else {
             return row;
         };
+        let selected = (key.1 == 20 && p.stage_selection.contains(file))
+            || (key.1 != 20 && p.selected_file == Some(file_index));
         row = row
-            .bg(rgb(if p.selected_file == Some(file_index) {
-                SELECT
+            .bg(rgb(if selected {
+                self.selection_color(ListFocus::Files(key.0), window)
             } else {
                 PANEL
             }))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(0x263443)))
+            .when(!selected, |row| row.hover(|s| s.bg(rgb(0x263443))))
             .child(
                 div()
                     .text_xs()
                     .flex_shrink_0()
-                    .text_color(rgb(match file.status.as_str() {
-                        "A" => 0x80d9a4,
-                        "D" => 0xf28d95,
-                        _ => 0xe8c783,
+                    .when(key.1 == 20, |status| {
+                        status
+                            .w(px(22.))
+                            .font_family("Cascadia Mono")
+                            .whitespace_nowrap()
+                    })
+                    .text_color(rgb(if key.1 == 20 {
+                        if file.staged { 0x80d9a4 } else { 0xf28d95 }
+                    } else {
+                        match file.status.as_str() {
+                            "A" => 0x80d9a4,
+                            "D" => 0xf28d95,
+                            _ => 0xe8c783,
+                        }
                     }))
-                    .child(file.status.clone()),
+                    .child(if key.1 == 20 {
+                        file.stage_status()
+                    } else {
+                        file.status.clone()
+                    }),
             )
-            .child(div().min_w_0().text_ellipsis().child(file.label.clone()));
-        row.on_click(cx.listener(move |this, _, _, cx| {
+            .child(
+                div()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .when(key.1 == 20 && file.staged, |name| {
+                        name.text_color(rgb(0x80d9a4))
+                    })
+                    .child(file.label.clone()),
+            );
+        row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if this.active == Some(key.0) {
-                this.select_file(file_index, cx);
+                this.list_focus = Some(ListFocus::Files(key.0));
+                this.focus.focus(window);
+                if key.1 == 20 {
+                    let modifiers = event.modifiers();
+                    let selected = this.project_mut().and_then(|project| {
+                        project.stage_selection.click(
+                            &project.snapshot.stage,
+                            file_index,
+                            modifiers.shift,
+                            modifiers.control,
+                        )
+                    });
+                    if let Some(index) = selected {
+                        this.select_file(index, cx);
+                    } else if let Some(project) = this.project_mut() {
+                        project.selected_file = None;
+                        project.diff_generation += 1;
+                        project.diff_loading = false;
+                        project.diff = Diff::default();
+                    }
+                } else {
+                    this.select_file(file_index, cx);
+                }
+                cx.notify();
             }
         }))
     }
@@ -1672,9 +3378,9 @@ impl Workspace {
         let list = uniform_list(
             ("diff-lines", key.1 as usize),
             count,
-            cx.processor(move |this, range: std::ops::Range<usize>, _, _| {
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                 range
-                    .map(|index| this.diff_row(id, index, details, content_width))
+                    .map(|index| this.diff_row(id, index, details, content_width, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -1731,7 +3437,14 @@ impl Workspace {
             })
     }
 
-    fn diff_row(&self, id: u64, index: usize, details: bool, width: f32) -> Div {
+    fn diff_row(
+        &self,
+        id: u64,
+        index: usize,
+        details: bool,
+        width: f32,
+        cx: &Context<Self>,
+    ) -> Div {
         let row = div()
             .flex()
             .w(px(width))
@@ -1739,13 +3452,15 @@ impl Workspace {
             .min_w_full()
             .whitespace_nowrap();
         if details {
-            return row.px_3().child(
-                self.detail_items
-                    .get(&id)
-                    .and_then(|r| r.lines.get(index))
-                    .map(|line| line.replace('\t', "    "))
-                    .unwrap_or_default(),
-            );
+            let text = self
+                .detail_items
+                .get(&id)
+                .and_then(|r| r.lines.get(index))
+                .cloned()
+                .unwrap_or_default();
+            return row
+                .px_3()
+                .child(self.selectable_line((id, 31), index, text, TEXT, cx));
         }
         let Some(line) = self
             .tabs
@@ -1781,13 +3496,223 @@ impl Workspace {
                     .child(line.new.map(|v| v.to_string()).unwrap_or_default()),
             )
             .child(div().w_5().flex_shrink_0().child(line.kind.to_string()))
+            .child(self.selectable_line((id, 30), index, line.text.clone(), fg, cx))
+    }
+
+    fn selectable_line(
+        &self,
+        key: ListKey,
+        row: usize,
+        raw: String,
+        color: u32,
+        cx: &Context<Self>,
+    ) -> Div {
+        let selection = self
+            .text_selection
+            .as_ref()
+            .filter(|(selected, _)| *selected == key)
+            .map(|(_, selection)| selection.clone());
+        let focused = matches!(self.list_focus, Some(ListFocus::Text(selected)) if selected == key);
+        let view = cx.weak_entity();
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .cursor(CursorStyle::IBeam)
             .child(
-                div()
-                    .flex_shrink_0()
-                    .pr_4()
-                    .child(line.text.replace('\t', "    ")),
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let displayed = raw.replace('\t', "    ");
+                        let run = TextRun {
+                            len: displayed.len(),
+                            font: font("Cascadia Mono"),
+                            color: rgb(color).into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shaped = window.text_system().shape_line(
+                            displayed.into(),
+                            window.rem_size() * 0.75,
+                            &[run],
+                            None,
+                        );
+                        let x_for_column =
+                            |column: usize| shaped.x_for_index(displayed_byte(&raw, column));
+                        if let Some(selection) = &selection {
+                            let (start, end) = selection.range();
+                            if row >= start.row && row <= end.row && start != end {
+                                let from = if row == start.row { start.column } else { 0 };
+                                let to = if row == end.row {
+                                    end.column
+                                } else {
+                                    raw.chars().count()
+                                };
+                                let left = x_for_column(from);
+                                let right =
+                                    x_for_column(to) + if row < end.row { px(7.) } else { px(0.) };
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        bounds.origin + point(left, px(0.)),
+                                        size((right - left).max(px(0.)), px(22.)),
+                                    ),
+                                    rgb(0x345b78),
+                                ));
+                            }
+                            if focused && selection.cursor.row == row {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        bounds.origin
+                                            + point(x_for_column(selection.cursor.column), px(1.)),
+                                        size(px(1.), px(19.)),
+                                    ),
+                                    rgb(ACCENT),
+                                ));
+                            }
+                        }
+                        shaped.paint(bounds.origin, px(22.), window, cx).ok();
+                        let down_view = view.clone();
+                        let down_line = shaped.clone();
+                        let down_raw = raw.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture
+                                || event.button != MouseButton::Left
+                                || !bounds.contains(&event.position)
+                            {
+                                return;
+                            }
+                            down_view
+                                .update(cx, |this, cx| {
+                                    if this.history_in_progress()
+                                        || this.help
+                                        || this.commit_dialog.is_some()
+                                        || this.discard_dialog.is_some()
+                                        || this.delete_target.is_some()
+                                        || this.active != Some(key.0)
+                                        || this.tracks.iter().any(|((track_key, _), track)| {
+                                            *track_key == key && track.contains(&event.position)
+                                        })
+                                        || this.viewports.get(&key).is_none_or(|viewport| {
+                                            !viewport.contains(&event.position)
+                                        })
+                                    {
+                                        return;
+                                    }
+                                    let byte = down_line
+                                        .closest_index_for_x(event.position.x - bounds.origin.x);
+                                    let position = Position {
+                                        row,
+                                        column: original_column(&down_raw, byte),
+                                    };
+                                    if event.modifiers.shift
+                                        && let Some((selected_key, selection)) =
+                                            &mut this.text_selection
+                                        && *selected_key == key
+                                    {
+                                        selection.cursor = position;
+                                    } else {
+                                        this.text_selection = Some((
+                                            key,
+                                            Selection {
+                                                anchor: position,
+                                                cursor: position,
+                                            },
+                                        ));
+                                    }
+                                    this.list_focus = Some(ListFocus::Text(key));
+                                    this.text_drag = true;
+                                    this.focus.focus(window);
+                                    cx.notify();
+                                })
+                                .ok();
+                        });
+                        let move_view = view.clone();
+                        let move_line = shaped.clone();
+                        let move_raw = raw.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase != DispatchPhase::Capture || !bounds.contains(&event.position)
+                            {
+                                return;
+                            }
+                            move_view
+                                .update(cx, |this, cx| {
+                                    if !this.text_drag
+                                        || this.history_in_progress()
+                                        || this.help
+                                        || this.commit_dialog.is_some()
+                                        || this.discard_dialog.is_some()
+                                        || this.delete_target.is_some()
+                                        || this.viewports.get(&key).is_none_or(|viewport| {
+                                            !viewport.contains(&event.position)
+                                        })
+                                    {
+                                        return;
+                                    }
+                                    if event.pressed_button != Some(MouseButton::Left) {
+                                        this.text_drag = false;
+                                        return;
+                                    }
+                                    if let Some((selected_key, selection)) =
+                                        &mut this.text_selection
+                                        && *selected_key == key
+                                    {
+                                        selection.cursor = Position {
+                                            row,
+                                            column: original_column(
+                                                &move_raw,
+                                                move_line.closest_index_for_x(
+                                                    event.position.x - bounds.origin.x,
+                                                ),
+                                            ),
+                                        };
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                        });
+                        let up_view = view.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture && event.button == MouseButton::Left
+                            {
+                                up_view.update(cx, |this, _| this.text_drag = false).ok();
+                            }
+                        });
+                    },
+                )
+                .size_full(),
             )
     }
+}
+
+fn displayed_byte(raw: &str, column: usize) -> usize {
+    raw.chars()
+        .take(column)
+        .map(|character| {
+            if character == '\t' {
+                4
+            } else {
+                character.len_utf8()
+            }
+        })
+        .sum()
+}
+
+fn original_column(raw: &str, byte: usize) -> usize {
+    let mut offset = 0;
+    for (column, character) in raw.chars().enumerate() {
+        let next = offset
+            + if character == '\t' {
+                4
+            } else {
+                character.len_utf8()
+            };
+        if byte < next {
+            return column + usize::from(byte - offset > (next - offset) / 2);
+        }
+        offset = next;
+    }
+    raw.chars().count()
 }
 
 fn page_progress() -> Div {
@@ -1944,8 +3869,8 @@ fn format_detail_time(seconds: i64, offset: i32) -> String {
         .unwrap_or_else(|_| seconds.to_string())
 }
 
-impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Workspace {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let mut projects = div()
             .id("project-tabs")
             .flex()
@@ -2004,12 +3929,16 @@ impl Render for Workspace {
                             .child("×")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.close_tab(id);
+                                this.close_tab(id, cx);
                                 cx.notify();
                             })),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.active = Some(id);
+                        this.ensure_active_loaded(cx);
+                        this.list_focus = None;
+                        this.text_selection = None;
+                        this.persist();
                         cx.notify();
                     })),
             );
@@ -2053,7 +3982,7 @@ impl Render for Workspace {
                 .font_family("Segoe UI")
                 .child(top)
                 .child(self.start_page(cx))
-                .when_some(self.error.clone(), |page, error| {
+                .when_some(self.status_error.clone(), |page, error| {
                     page.child(
                         div()
                             .px_4()
@@ -2062,11 +3991,33 @@ impl Render for Workspace {
                             .text_color(rgb(0xf4a0a8))
                             .child(error),
                     )
-                });
+                })
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .h_8()
+                        .flex_shrink_0()
+                        .px_4()
+                        .child(
+                            div()
+                                .id("start-help")
+                                .text_xs()
+                                .text_color(rgb(ACCENT))
+                                .cursor_pointer()
+                                .child("? - 도움말")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.help = true;
+                                    this.focus.focus(window);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(self.settings_link(cx)),
+                );
         }
         let branch = self.branch_panel(cx);
         let history = self.history_panel(cx);
-        let files = self.files_panel(cx);
+        let files = self.files_panel(window, cx);
         let diff = self.diff_panel(window, cx);
         let columns = self
             .layout
@@ -2174,26 +4125,27 @@ impl Render for Workspace {
                         }),
                 )
             });
-        let status = if let Some(err) = &self.error {
-            err.clone()
-        } else if let Some(p) = self.project() {
-            if let Some(err) = &p.error {
-                err.clone()
-            } else {
-                format!(
-                    "{}  ·  {}{}",
-                    p.path.display(),
-                    p.snapshot.head,
-                    if p.loading || p.diff_loading {
-                        "  ·  조회 중…"
-                    } else {
-                        ""
-                    }
-                )
-            }
+        let status = if let Some(error) = &self.status_error {
+            error.clone()
+        } else if let Some(project) = self.project() {
+            let loading =
+                if let Some((_, label)) = self.remote_status.filter(|(id, _)| *id == project.id) {
+                    format!("  ·  {label}")
+                } else if project.loading || project.diff_loading {
+                    "  ·  조회 중…".into()
+                } else {
+                    String::new()
+                };
+            format!(
+                "{}  ·  {}{}",
+                session::display_path(&project.path),
+                project.snapshot.head,
+                loading
+            )
         } else {
             String::new()
         };
+
         div()
             .size_full()
             .flex()
@@ -2219,15 +4171,11 @@ impl Render for Workspace {
                             .min_w_0()
                             .text_xs()
                             .text_ellipsis()
-                            .text_color(rgb(
-                                if self.error.is_some()
-                                    || self.project().is_some_and(|p| p.error.is_some())
-                                {
-                                    0xf4a0a8
-                                } else {
-                                    MUTED
-                                },
-                            ))
+                            .text_color(rgb(if self.status_error.is_some() {
+                                0xf4a0a8
+                            } else {
+                                MUTED
+                            }))
                             .child(status),
                     )
                     .child(
@@ -2235,15 +4183,375 @@ impl Render for Workspace {
                             .ml_3()
                             .text_xs()
                             .text_color(rgb(ACCENT))
-                            .child("● 읽기 전용"),
-                    ),
+                            .cursor_pointer()
+                            .child("? - 도움말")
+                            .id("show-help")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.help = true;
+                                this.focus.focus(window);
+                                cx.notify();
+                            })),
+                    )
+                    .child(self.settings_link(cx)),
             )
+    }
+}
+
+impl Render for Workspace {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.update_status_error(cx);
+        if window.focused(cx).is_none() {
+            self.focus.focus(window);
+        }
+        let content = self.render_content(window, cx);
+        let busy = self.history_in_progress() || self.branch_busy;
+        let mut root = div()
+            .id("workspace")
+            .track_focus(&self.focus)
+            .relative()
+            .size_full()
+            .child(content)
+            .capture_key_down(
+                cx.listener(|this, event, window, cx| this.key_down(event, window, cx)),
+            )
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.history_in_progress() || this.branch_busy {
+                    cx.stop_propagation();
+                }
+            }));
+        if busy
+            || self.help
+            || self.settings.is_some()
+            || self.branch_dialog.is_some()
+            || self.delete_target.is_some()
+            || self.commit_dialog.is_some()
+            || self.discard_dialog.is_some()
+        {
+            let mut card = div()
+                .id("modal-card")
+                .w(px(500.))
+                .max_w_full()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(LINE))
+                .rounded_lg()
+                .on_click(|_, _, cx| cx.stop_propagation());
+            if busy {
+                let message = if self.branch_busy {
+                    "브랜치 작업 중입니다…"
+                } else if self
+                    .tabs
+                    .iter()
+                    .filter_map(WorkspaceTab::project)
+                    .any(|p| p.history_target.is_some())
+                {
+                    "선택한 브랜치의 커밋을 찾는 중입니다…"
+                } else {
+                    "커밋 히스토리를 읽는 중입니다…"
+                };
+                card = card
+                    .child(div().text_lg().child("처리 중"))
+                    .child(message)
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.))
+                            .overflow_hidden()
+                            .bg(rgb(LINE))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .h_full()
+                                    .w(relative(0.3))
+                                    .bg(rgb(ACCENT))
+                                    .with_animation(
+                                        "workspace-progress",
+                                        Animation::new(std::time::Duration::from_millis(900))
+                                            .repeat(),
+                                        |bar, progress| bar.left(relative(progress * 1.3 - 0.3)),
+                                    ),
+                            ),
+                    );
+            } else if let Some(dialog) = &self.branch_dialog {
+                card = card.child(div().text_lg().child(match &dialog.action {
+                    BranchAction::Create { .. } => "브랜치 만들기",
+                    BranchAction::Track(_) => "로컬 브랜치 만들기",
+                }));
+                match &dialog.action {
+                    BranchAction::Create { commit } => {
+                        card = card
+                            .child(format!("선택 커밋: {}", &commit[..commit.len().min(12)]))
+                            .child("브랜치명")
+                            .when_some(dialog.editor.clone(), |card, editor| {
+                                card.child(
+                                    div()
+                                        .h(px(36.))
+                                        .border_1()
+                                        .border_color(rgb(LINE))
+                                        .p_1()
+                                        .child(editor),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("브랜치만 생성하고 현재 체크아웃은 유지합니다."),
+                            );
+                    }
+                    BranchAction::Track(target) => {
+                        card = card
+                            .child(format!(
+                                "같은 이름의 Local 브랜치 '{}'가 없습니다.",
+                                target.local
+                            ))
+                            .child(format!(
+                                "{} 브랜치를 추적하는 Local 브랜치를 만들고 체크아웃할까요?",
+                                target.remote.as_deref().unwrap_or_default()
+                            ));
+                    }
+                }
+                card = card
+                    .when_some(dialog.error.clone(), |card, error| {
+                        card.child(div().text_color(rgb(0xf4a0a8)).child(error))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                button("confirm-branch", "확인 · enter", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.submit_branch(cx))),
+                            )
+                            .child(button("cancel-branch", "취소 · esc", false).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_branch_dialog(window, cx)
+                                }),
+                            )),
+                    );
+            } else if let Some(settings) = &self.settings {
+                card = card
+                    .w(px(760.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_lg().child("세팅"))
+                            .child(
+                                button("close-settings", "닫기 · esc", false)
+                                    .when(!settings.read(cx).can_close(), |button| {
+                                        button.opacity(0.45)
+                                    })
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_settings(window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(settings.clone());
+            } else if let Some(dialog) = &self.discard_dialog {
+                card = card.w(px(640.)).child(div().text_sm().child("선택한 변경사항 폐기"))
+                    .child(format!("{}개 파일의 staged·unstaged 변경을 HEAD로 복원합니다. 신규 파일은 삭제됩니다.",dialog.paths.len()))
+                    .when_some(dialog.error.clone(),|card,error| card.child(div().text_color(rgb(0xf4a0a8)).child(error)))
+                    .when(dialog.busy,|card| card.child("변경사항을 폐기하는 중입니다…"))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child("폐기 : ctrl + s, 취소 : esc"));
+            } else if let Some(dialog) = &self.commit_dialog {
+                card = card
+                    .w(px(640.))
+                    .child(div().text_sm().child("커밋"))
+                    .child(dialog.editor.clone())
+                    .when_some(dialog.error.clone(), |card, error| {
+                        card.child(div().text_color(rgb(0xf4a0a8)).child(error))
+                    })
+                    .when(dialog.busy, |card| {
+                        card.child(if dialog.push_after {
+                            "커밋 후 푸시하는 중입니다…"
+                        } else {
+                            "커밋하는 중입니다…"
+                        })
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("커밋 : ctrl + s, 커밋 후 푸시 : ctrl + p, 취소 : esc"),
+                    );
+            } else if let Some(path) = &self.delete_target
+                && !self.delete_confirm
+            {
+                card = card
+                    .child(div().text_lg().child("최근 저장소 관리"))
+                    .child(session::display_path(path))
+                    .child("목록에서만 제거하거나 저장소 폴더를 삭제할 수 있습니다.")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(button("forget-recent", "목록에서 제거", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(path) = this.delete_target.take() {
+                                        this.recent.retain(|item| *item != path);
+                                        this.persist();
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button("choose-delete", "저장소 삭제…", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.delete_confirm = true;
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button("cancel-recent-action", "취소", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.delete_target = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    );
+            } else if let Some(path) = &self.delete_target {
+                card = card
+                    .child(div().text_lg().child("저장소 삭제"))
+                    .child(session::display_path(path))
+                    .child("미커밋 파일을 포함한 저장소 폴더 전체를 휴지통으로 이동합니다.")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(button("cancel-delete", "취소", false).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.delete_target = None;
+                                    cx.notify();
+                                },
+                            )))
+                            .child(button("confirm-delete", "휴지통으로 이동", true).on_click(
+                                cx.listener(|this, _, _, cx| this.delete_repository(cx)),
+                            )),
+                    );
+            } else {
+                card = card.child(shortcut_help(window));
+            }
+            root = root.child(
+                div()
+                    .id("modal-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .occlude()
+                    .bg(rgba(0x000000a0))
+                    .text_color(rgb(TEXT))
+                    .font_family("Segoe UI")
+                    .text_sm()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_move(|_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this.branch_busy {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if this.branch_dialog.is_some() {
+                            this.close_branch_dialog(window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if this.settings.is_some() {
+                            this.close_settings(window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if !this.history_in_progress()
+                            && !this
+                                .commit_dialog
+                                .as_ref()
+                                .is_some_and(|dialog| dialog.busy)
+                            && !this
+                                .discard_dialog
+                                .as_ref()
+                                .is_some_and(|dialog| dialog.busy)
+                        {
+                            this.help = false;
+                            this.delete_target = None;
+                            this.commit_dialog = None;
+                            this.discard_dialog = None;
+                            this.focus.focus(window);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .child(card),
+            );
+        }
+        root
     }
 }
 
 #[cfg(test)]
 mod detail_tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn opening_repository_replaces_only_the_origin_empty_tab_in_place() {
+        let path = PathBuf::from("repository");
+        let mut tabs = vec![
+            WorkspaceTab::Empty(1),
+            WorkspaceTab::Empty(2),
+            WorkspaceTab::Empty(3),
+        ];
+        assert_eq!(
+            WorkspaceTab::open_in_place(&mut tabs, 2, path.clone()),
+            Some(2)
+        );
+        assert_eq!(
+            tabs.iter().map(WorkspaceTab::id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(matches!(tabs[0], WorkspaceTab::Empty(1)));
+        assert!(matches!(tabs[2], WorkspaceTab::Empty(3)));
+        assert_eq!(tabs[1].project().unwrap().path, path);
+    }
+
+    #[::core::prelude::v1::test]
+    fn reopening_repository_consumes_only_the_origin_and_reuses_the_existing_tab() {
+        let path = PathBuf::from("repository");
+        let mut tabs = vec![
+            WorkspaceTab::Empty(1),
+            WorkspaceTab::Repository(Box::new(Project::new(2, path.clone()))),
+            WorkspaceTab::Empty(3),
+        ];
+        assert_eq!(WorkspaceTab::open_in_place(&mut tabs, 1, path), Some(2));
+        assert_eq!(
+            tabs.iter().map(WorkspaceTab::id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(matches!(tabs[1], WorkspaceTab::Empty(3)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn opening_from_a_closed_or_already_replaced_tab_does_not_add_a_tab() {
+        let path = PathBuf::from("repository");
+        let mut tabs = vec![
+            WorkspaceTab::Empty(1),
+            WorkspaceTab::Repository(Box::new(Project::new(2, path.clone()))),
+        ];
+        assert_eq!(
+            WorkspaceTab::open_in_place(&mut tabs, 3, path.clone()),
+            None
+        );
+        assert_eq!(
+            WorkspaceTab::open_in_place(&mut tabs, 2, PathBuf::from("other")),
+            None
+        );
+        assert_eq!(tabs.len(), 2);
+        assert!(matches!(tabs[0], WorkspaceTab::Empty(1)));
+        assert_eq!(tabs[1].project().unwrap().path, path);
+    }
 
     fn detail(parents: &[&str]) -> CommitDetail {
         CommitDetail {

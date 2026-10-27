@@ -40,9 +40,14 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
     let repo = open(path).context("Git 저장소를 열 수 없습니다")?;
     let root = repo.workdir().unwrap_or(repo.path()).canonicalize()?;
     let mut references = Vec::new();
-    for reference in repo.references()?.all()?.peeled()? {
-        let mut reference = reference.map_err(anyhow::Error::from_boxed)?;
+    let raw_references = repo
+        .references()?
+        .all()?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from_boxed)?;
+    for mut reference in raw_references {
         let full = reference.name().as_bstr().to_str()?.to_owned();
+        let name = reference.name().shorten().to_string();
         let kind = if full.starts_with("refs/heads/") {
             RefTab::Local
         } else if full.starts_with("refs/remotes/") {
@@ -58,7 +63,7 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
             Err(_) => continue,
         };
         references.push(Reference {
-            name: reference.name().shorten().to_string(),
+            name,
             revision: full,
             kind,
             target,
@@ -144,6 +149,14 @@ pub fn load_commit(path: &Path, id: &str) -> Result<CommitSelection> {
         history: history(&repo, id)?,
         detail: detail(&repo, id)?,
     })
+}
+
+pub fn load_stage(path: &Path) -> Result<Vec<FileChange>> {
+    let repo = open(path)?;
+    if repo.workdir().is_none() {
+        bail!("작업 디렉터리가 없는 저장소입니다.");
+    }
+    status(&repo)
 }
 
 fn detail(repo: &gix::Repository, id: &str) -> Result<CommitDetail> {
@@ -235,7 +248,7 @@ fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
             after,
         });
     }
-    files.sort_by(|a, b| b.staged.cmp(&a.staged).then(a.path.cmp(&b.path)));
+    files.sort_by(|a, b| a.path.cmp(&b.path).then(b.staged.cmp(&a.staged)));
     Ok(files)
 }
 

@@ -1712,8 +1712,12 @@ dependencies = [
  "anyhow",
  "gix",
  "gpui",
+ "serde",
+ "serde_json",
  "similar",
  "tempfile",
+ "url",
+ "windows 0.61.3",
 ]
 
 [[package]]

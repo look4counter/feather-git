@@ -4,7 +4,7 @@ use std::{cell::RefCell, rc::Rc};
 
 pub const ROW_HEIGHT: f32 = 24.;
 pub const COLUMNS: [&str; 5] = ["Graph", "Description", "Author", "Date", "Hash"];
-const MIN_WIDTHS: [f32; 5] = [36., 72., 52., 124., 56.];
+const MIN_WIDTHS: [f32; 5] = [36., 72., 52., 136., 76.];
 
 #[derive(Clone, Copy)]
 pub struct ColumnLayout {
@@ -14,7 +14,7 @@ pub struct ColumnLayout {
 impl Default for ColumnLayout {
     fn default() -> Self {
         Self {
-            weights: [0.17, 0.47, 0.15, 0.13, 0.08],
+            weights: [0.17 / 0.79, 0.47 / 0.79, 0.15 / 0.79, 0., 0.],
         }
     }
 }
@@ -176,7 +176,7 @@ mod tests {
                 let widths = layout.widths(width);
                 assert!((widths.iter().sum::<f32>() - width).abs() < 0.001);
                 assert!(widths.iter().all(|w| *w >= 0.));
-                if width >= 340. {
+                if width >= MIN_WIDTHS.iter().sum() {
                     for i in 0..5 {
                         assert!(widths[i] + 0.001 >= MIN_WIDTHS[i]);
                     }
@@ -202,6 +202,19 @@ mod tests {
         }
         let smaller = layout.widths(640.);
         assert!((smaller.iter().sum::<f32>() - 640.).abs() < 0.001);
+    }
+
+    #[::core::prelude::v1::test]
+    fn default_metadata_widths_stay_compact_when_window_grows() {
+        let layout = ColumnLayout::default();
+        let widths = layout.widths(800.);
+        let wider = layout.widths(1920.);
+        assert_eq!(&widths[3..], &[136., 76.]);
+        assert_eq!(&wider[3..], &widths[3..]);
+        for i in 0..3 {
+            assert!(wider[i] > widths[i]);
+        }
+        assert!((wider.iter().sum::<f32>() - 1920.).abs() < 0.001);
     }
 
     #[::core::prelude::v1::test]

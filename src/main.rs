@@ -1,7 +1,14 @@
+mod branches;
+mod commit_editor;
+mod credentials;
 mod history_view;
 mod layout;
 mod scrolling;
+mod session;
+mod settings;
+mod settings_git;
 mod setup;
+mod text_selection;
 mod ui;
 
 use gpui::{prelude::*, *};
@@ -12,7 +19,7 @@ fn main() {
         .map(std::path::PathBuf::from)
         .collect();
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1440.), px(940.)), cx);
+        let bounds = Bounds::centered(None, size(px(1440.), px(790.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

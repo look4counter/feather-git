@@ -1,14 +1,18 @@
 mod branches;
 mod commit_editor;
+mod controls;
 mod credentials;
 mod history_view;
 mod layout;
+mod popup;
 mod scrolling;
 mod session;
 mod settings;
 mod settings_git;
 mod setup;
+mod shortcut;
 mod text_selection;
+mod theme;
 mod ui;
 
 use gpui::{prelude::*, *};

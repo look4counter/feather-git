@@ -1,5 +1,14 @@
+use crate::theme;
 use gpui::{prelude::*, *};
 use std::ops::Range;
+
+fn text_vertical_offset(single_line: bool, height: f32) -> f32 {
+    if single_line {
+        ((height - 22.) / 2.).max(0.)
+    } else {
+        0.
+    }
+}
 
 fn normalized_input(text: &str, single_line: bool) -> String {
     if single_line {
@@ -91,6 +100,7 @@ pub struct CommitEditor {
     single_line: bool,
     pub focus: FocusHandle,
     pub enabled: bool,
+    pub text_size: f32,
     scroll: ScrollHandle,
     bounds: Option<Bounds<Pixels>>,
     lines: Vec<(usize, ShapedLine)>,
@@ -108,6 +118,7 @@ impl CommitEditor {
             single_line: false,
             focus: cx.focus_handle(),
             enabled: true,
+            text_size: 14.,
             scroll: ScrollHandle::new(),
             bounds: None,
             lines: Vec::new(),
@@ -313,7 +324,7 @@ impl CommitEditor {
                 "message-vertical-scroll"
             })
             .flex_shrink_0()
-            .bg(rgb(0x10151d))
+            .bg(rgb(theme::INPUT))
             .cursor_pointer()
             .occlude()
             .when(horizontal, |bar| bar.h(px(12.)).w_full())
@@ -348,9 +359,9 @@ impl CommitEditor {
                         window.paint_quad(quad(
                             rect,
                             px(3.),
-                            rgb(0x8290a6),
+                            rgb(theme::MUTED),
                             px(0.),
-                            rgb(0x8290a6),
+                            rgb(theme::MUTED),
                             Default::default(),
                         ));
                         view.update(cx, |this, _| this.tracks[usize::from(horizontal)] = bounds)
@@ -520,15 +531,17 @@ impl Render for CommitEditor {
                 let run = TextRun {
                     len: text.len(),
                     font: font("Cascadia Mono"),
-                    color: rgb(0xd9e2ed).into(),
+                    color: rgb(theme::TEXT).into(),
                     background_color: None,
                     underline: None,
                     strikethrough: None,
                 };
-                let line =
-                    window
-                        .text_system()
-                        .shape_line(text.to_owned().into(), px(14.), &[run], None);
+                let line = window.text_system().shape_line(
+                    text.to_owned().into(),
+                    px(self.text_size),
+                    &[run],
+                    None,
+                );
                 let current = start;
                 start += text.len() + 1;
                 (current, line)
@@ -540,14 +553,18 @@ impl Render for CommitEditor {
             .fold(0., f32::max)
             + 8.;
         let height = lines.len() as f32 * 22.;
-        let visible = crate::scrolling::Visibility::new(
-            self.viewport.width.into(),
-            self.viewport.height.into(),
-            width,
-            height,
-            true,
-            12.,
-        );
+        let visible = if self.single_line {
+            crate::scrolling::Visibility::default()
+        } else {
+            crate::scrolling::Visibility::new(
+                self.viewport.width.into(),
+                self.viewport.height.into(),
+                width,
+                height,
+                true,
+                12.,
+            )
+        };
         if self.scroll_drag.is_some_and(|(horizontal, _)| {
             if horizontal {
                 !visible.horizontal
@@ -570,7 +587,7 @@ impl Render for CommitEditor {
             .min_w_0()
             .overflow_scroll()
             .track_scroll(&self.scroll)
-            .bg(rgb(0x10151d))
+            .bg(rgb(theme::INPUT))
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(
@@ -587,14 +604,6 @@ impl Render for CommitEditor {
                     this.changed(cx);
                 }),
             )
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                if this.dragging && this.enabled && event.pressed_button == Some(MouseButton::Left)
-                {
-                    let index = this.index_at(event.position);
-                    this.buffer.move_to(index, true);
-                    this.changed(cx);
-                }
-            }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.dragging = false),
@@ -607,13 +616,48 @@ impl Render for CommitEditor {
                 canvas(
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
+                        let single_line = view.read(cx).single_line;
+                        let offset =
+                            px(text_vertical_offset(single_line, bounds.size.height.into()));
+                        let text_bounds = Bounds::new(
+                            bounds.origin + point(px(0.), offset),
+                            size(bounds.size.width, bounds.size.height - offset),
+                        );
+                        let move_view = view.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            move_view.update(cx, |this, cx| {
+                                if !this.dragging {
+                                    return;
+                                }
+                                if !this.enabled
+                                    || !this.focus.is_focused(window)
+                                    || event.pressed_button != Some(MouseButton::Left)
+                                {
+                                    this.dragging = false;
+                                    return;
+                                }
+                                let index = this.index_at(event.position);
+                                this.buffer.move_to(index, true);
+                                this.changed(cx);
+                            });
+                        });
+                        let up_view = view.clone();
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Capture && event.button == MouseButton::Left
+                            {
+                                up_view.update(cx, |this, _| this.dragging = false);
+                            }
+                        });
                         window.handle_input(
                             &focus,
-                            ElementInputHandler::new(bounds, view.clone()),
+                            ElementInputHandler::new(text_bounds, view.clone()),
                             cx,
                         );
                         for (row, (start, line)) in lines.iter().enumerate() {
-                            let origin = bounds.origin + point(px(0.), px(row as f32 * 22.));
+                            let origin = text_bounds.origin + point(px(0.), px(row as f32 * 22.));
                             let end = start + line.len();
                             if selection.start <= end && selection.end > *start {
                                 let left = line.x_for_index(
@@ -627,7 +671,7 @@ impl Render for CommitEditor {
                                         origin + point(left, px(0.)),
                                         size((right - left).max(px(0.)), px(22.)),
                                     ),
-                                    rgb(0x345b78),
+                                    rgb(theme::TEXT_SELECTION),
                                 ));
                             }
                             line.paint(origin, px(22.), window, cx).ok();
@@ -637,7 +681,7 @@ impl Render for CommitEditor {
                                         origin + point(line.x_for_index(cursor - start), px(1.)),
                                         size(px(1.), px(20.)),
                                     ),
-                                    rgb(0x5edac1),
+                                    rgb(theme::ACCENT),
                                 ));
                             }
                             if let Some(marked) = &marked
@@ -654,12 +698,12 @@ impl Render for CommitEditor {
                                         origin + point(left, px(21.)),
                                         size(right - left, px(1.)),
                                     ),
-                                    rgb(0x5edac1),
+                                    rgb(theme::ACCENT),
                                 ));
                             }
                         }
                         view.update(cx, |this, cx| {
-                            this.bounds = Some(bounds);
+                            this.bounds = Some(text_bounds);
                             this.lines = lines.clone();
                             if this.reveal_cursor {
                                 this.reveal_cursor = false;
@@ -708,9 +752,10 @@ impl Render for CommitEditor {
             .flex()
             .flex_col()
             .w_full()
-            .h(px(220.))
+            .h(px(if self.single_line { 26. } else { 220. }))
             .flex_shrink_0()
             .min_w_0()
+            .min_h_0()
             .overflow_hidden()
             .child(
                 canvas(
@@ -753,6 +798,13 @@ impl Render for CommitEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[::core::prelude::v1::test]
+    fn single_line_text_is_centered_without_moving_multiline_text() {
+        assert_eq!(text_vertical_offset(true, 26.), 2.);
+        assert_eq!(text_vertical_offset(true, 22.), 0.);
+        assert_eq!(text_vertical_offset(false, 220.), 0.);
+    }
+
     #[::core::prelude::v1::test]
     fn settings_inputs_keep_unicode_on_one_line_and_commit_messages_keep_newlines() {
         assert_eq!(normalized_input("한글 😀\r\n이름\t", true), "한글 😀이름");

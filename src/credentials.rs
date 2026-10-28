@@ -62,7 +62,6 @@ pub trait CredentialRunner {
 #[derive(Clone)]
 pub struct Gcm {
     command: String,
-    pub version: String,
     context: GitContext,
 }
 
@@ -71,16 +70,16 @@ impl Gcm {
         for name in ["credential-manager", "credential-manager-core"] {
             let mut command = context.command();
             command.args([name, "--version"]);
-            if let Ok(bytes) = run_process(
+            if run_process(
                 command,
                 &[],
                 Duration::from_secs(10),
                 &AtomicBool::new(false),
-            ) {
-                let version = String::from_utf8_lossy(&bytes).trim().to_owned();
+            )
+            .is_ok()
+            {
                 return Some(Self {
                     command: name.into(),
-                    version,
                     context: context.clone(),
                 });
             }

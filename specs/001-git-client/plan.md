@@ -234,3 +234,262 @@ src/model.rs의 Commit에 tags 목록을 추가하고 src/paging.rs에서 기존
 검증은 임시 저장소 생성/전환/원격추적/충돌 회귀 테스트와 두 페이지의 annotated/lightweight 태그 테스트를 먼저 작성한다. fmt/check/clippy와 단위·통합을 실행하고 수렴 점검한다. Rust/GPUI와 Git 기존 기반을 사용하며 새 의존성은 없다. 미작성 헌법은 템플릿으로 처리한다.
 
 브랜치 구현 보완: 첫 클릭에서 대상 커밋이 추가 페이지에 있을 때는 시스템 더블클릭 간격만큼 추가 페이지 모달 시작을 미룬다. 즉시 메타데이터 조회/선택은 유지하고 두 번째 클릭이 오면 대기 중 탐색을 취소해 체크아웃을 진행한다. Windows GetDoubleClickTime을 읽기 위해 기존 windows 의존성의 KeyboardAndMouse 기능만 활성화한다. 또한 재조회에서 선택 커밋의 상세 데이터가 있으면 첫 페이지에 없더라도 선택을 유지한다.
+
+## 전체 변경 스태시 계획
+
+기존 Rust·GPUI·Git CLI를 유지한다. src/setup.rs에서 루트 검증·빈 변경 확인 후 git stash push --include-untracked를 실행한다. 인덱스 부모를 보존하여 --index 복원이 가능하다. 의존성 추가는 없다.
+src/ui.rs에 project_id·busy·error 상태와 확인창·s 도움말을 추가한다. 기존 폐기 작업의 비동기 실행·파일/Diff 갱신을 재사용하고 모달 가드에 포함한다.
+임시 저장소에서 전체 저장·ignored 보존·빈 상태·--index 왕복을 검증한다. fmt/check/clippy·단위 테스트·수렴 점검을 수행한다. 헌법은 템플릿이므로 규범 점검은 생략한다.
+
+## 스태시 목록 갱신·복원 계획
+
+저장 성공 후 src/ui.rs의 저장소 ID 기반 refresh_after_branch 재조회를 호출하여 참조와 목록을 갱신한다. 선택 탭은 유지한다. Stash 더블클릭은 전용 복원 메서드로 라우팅한다. 첫 클릭의 지연 페이지 탐색은 복원 시 취소한다.
+src/setup.rs에서 선택 커밋 해시를 검증하고 stash 목록에 존재하는지 확인 후 git stash apply --index를 실행한다. apply로 성공·실패 모두 원본을 남긴다. 기존 branch_busy와 pending을 사용해 작업을 격리한다. 완료 후 원래 저장소를 재조회하고 성공 시 Stage 탭을 표시한다.
+임시 저장소에서 복수 항목·선택 해시·인덱스 복원·목록 보존·충돌·잘못된 대상 거절을 검증한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 이름 입력과 스태시 삭제 계획
+
+src/ui.rs의 StashDialog를 저장/삭제 공용 상태로 확장한다. 저장은 기존 CommitEditor 단일 행 입력과 IME 보호를 재사용하고 삭제는 selector·해시·이름을 캡처한다. 기존 모달 가드를 그대로 활용한다. d는 브랜치 Stash 포커스일 때 삭제 확인을 우선하고 파일 목록에서는 기존 폐기를 유지한다.
+src/setup.rs의 stash_all에 이름 인수를 추가하고 --message 인수로 전달한다. 삭제 함수는 selector 형식과 커밋 해시를 검증하고 현재 selector 해시 일치를 확인한 뒤 git stash drop을 수행한다. 상태 실패는 확인창에 표시하고 성공 후 기존 참조 재조회를 사용한다. 삭제는 작업 트리와 인덱스를 수정하지 않는다.
+기존 임시 저장소 테스트를 확장해 이름·빈 입력·선택 삭제·다른 항목과 파일 보존·대상 불일치 거절을 검증한다. fmt/check/clippy·단위 테스트와 수렴 점검을 수행한다.
+
+## 참조 작업과 설정 계획
+
+src/branches.rs에 태그 생성과 참조 삭제 함수를 추가한다. full ref와 예상 커밋을 검증하고 Local은 branch -d, Tag는 tag -d로 처리한다. 태그 이름은 check-ref-format refs/tags/로 검증하고 강제 옵션은 사용하지 않는다. Remote의 의미는 명확화 후 확정한다.
+src/ui.rs BranchAction에 Tag·Delete를 추가해 기존 이름 입력/확인/IME/진행/오류 처리와 참조 재조회를 재사용한다. t는 History 포커스, d는 모든 참조 목록 포커스를 요구한다. 삭제 확인은 종류와 이름을 표시한다.
+src/settings.rs에서 체크 라벨을 고정하고 설명·저장 버튼·GCM 정보 표시를 제거한다. ctrl+s와 인증은 유지한다. 불필요해진 표시용 상태는 정리한다. 기존 Rust·GPUI·Git CLI와 테스트 도구를 사용하며 새 의존성은 없다.
+임시 저장소 테스트로 태그 선택/중복·삭제·현재 브랜치 거절·파일 보존을 확인하고 fmt/check/clippy·단위 테스트 후 수렴 점검한다. 헌법은 템플릿이므로 규범 점검은 생략한다.
+
+Remote d는 branch -d -r, Shift+d는 선택 원격과 브랜치를 분리하고 예상 해시의 --force-with-lease로 서버 삭제를 실행한다. 임시 로컬 bare 원격으로 추적 참조 삭제/서버 삭제/변경 대상 거절을 검증한다.
+
+추가 그래프 계획: src/model.rs Snapshot에 head_commit을 추가하고 src/git.rs에서 실제 HEAD 해시를 전달한다. src/ui.rs는 선택 행과 무관하게 해시를 비교하고 src/history_view.rs는 HEAD 노드 중앙을 행 배경으로 가리고 두꺼운 테두리로 그린다. 일반 노드와 경로는 유지한다.
+
+## 입력·원격 생성·커밋 체크아웃 계획
+
+src/commit_editor.rs의 고정 220px 루트 높이를 단일 행일 때 36px 래퍼 안쪽의 26px로 바꾸고 min-height와 클리핑을 명시한다. src/settings.rs와 src/ui.rs의 입력 래퍼에도 클리핑을 추가한다.
+src/branches.rs에 선택 Local ref/예상 해시/원격 이름 검증과 신규 생성 lease를 사용하는 push -u를 추가한다. switch --detach는 해시 검증 후 수행한다. src/ui.rs BranchAction::Upload와 원격명 편집 확인창·u 포커스·진행·오류·재조회를 기존 구조에 연결한다. 태그와 커밋 더블클릭은 공통 비동기 detached 체크아웃 메서드를 사용한다.
+src/history_view.rs의 HEAD 채움은 흰색, 외곽선은 2px로 바꾸고 불필요한 배경 인수를 제거한다. 임시 원격·체크아웃 충돌 테스트 및 fmt/check/clippy·전체 단위/저장소 통합 테스트 후 수렴 점검한다.
+
+## 브랜치 우선 체크아웃 계획
+
+src/branches.rs에 실제 refs/heads·refs/remotes를 조회하는 후보 구조와 조회/선택 체크아웃 검증 함수를 추가한다. 커밋 해시를 검증하고 심볼릭 ref는 제외한다. 선택 대상과 대응 로컬의 tip을 검사해 다른 커밋으로 전환되지 않도록 한다.
+src/ui.rs에서 히스토리 더블클릭은 전용 비동기 준비 경로로 보낸다. 후보 0은 기존 커밋 체크아웃, 1은 검증 후 브랜치 전환 또는 기존 Remote 생성 확인, 복수는 BranchAction::ChooseCheckout으로 선택·확인·취소를 제공한다. 기존 BranchDialog·busy·오류·IME/모달 격리·재조회를 재사용한다. Remote 단일 생성 확인은 선택 커밋 검증을 포함한다. 태그 더블클릭은 기존 경로를 유지한다.
+임시 저장소에서 후보 분기·정렬·Remote/심볼릭·선택 전후 tip 변경·같은 이름 Local 불일치·수정 파일 보호를 검증하고 fmt/check/clippy·단위 테스트·수렴 점검을 수행한다.
+
+## 브랜치 선택 간소화 계획
+
+src/branches.rs 후보 조회에서 모든 Local 이름 집합을 만들고 등록 원격의 가장 긴 이름을 접두사로 제거해 동일한 Local 이름이 있는 원격 후보를 필터한다. 선택 커밋과 무관하게 존재 여부로 판단한다.
+src/ui.rs의 단일 후보는 allow_create=true로 즉시 체크아웃한다. 선택창 버튼 클릭은 selected를 지정하고 즉시 submit_branch를 호출한다. 선택창만 공통 확인/취소 버튼과 Enter 기본 제출을 제외한다. Esc·바깥 클릭과 기존 다른 모달 동작은 유지한다.
+기존 후보 테스트를 먼저 확장하고 fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 공통 팝업 계획
+
+src/popup.rs에 title·width·body·선택적 footer/header_action·viewport를 받는 공통 프레임을 추가한다. 배경/테두리/여백/13px 제목/본문 스크롤/선택적 하단을 한 곳에서 정의한다. src/main.rs에 모듈을 등록한다.
+src/ui.rs의 모든 모달 분기는 본문만 만들고 제목·폭·하단·헤더 동작을 공통 프레임에 전달한다. 설정 닫기는 header_action, 커밋/폐기의 단축키 안내는 footer, 확인 버튼 묶음도 footer로 이동한다. 도움말은 공통 제목을 추가하고 본문 자체의 중복 높이 제한은 제거한다. 기존 backdrop 이벤트와 작업 상태 로직은 유지한다.
+가벼운 레이아웃 리팩터링으로 구현을 복제하는 테스트는 추가하지 않는다. fmt/check/clippy·기존 단위 테스트와 전체 팝업 경로의 구조/이벤트 코드 검토 후 수렴 점검한다. 새 의존성은 없다.
+
+## 현재 브랜치 무시 계획
+
+src/branches.rs에 실제 symbolic HEAD 비교 함수를 추가하고 이미 현재 Local이면 switch를 생략한다. src/ui.rs의 Local 더블클릭과 선택 후보 클릭은 snapshot.current_branch 비교로 작업 시작 전에 반환한다. 히스토리 단일 후보의 비동기 경로는 실제 HEAD 비교 결과를 전달해 무변경이면 refresh_after_branch도 호출하지 않는다. 선택창 설명을 제거한다.
+기존 체크아웃 테스트에 현재 브랜치/detached 판별을 추가하고 fmt/check/clippy·단위 테스트 및 수렴 점검을 수행한다.
+
+## 라이트 팔레트 구현 계획
+
+src/theme.rs에 배경·패널·경계·글자·보조·강조·선택/hover·상태·Diff·태그·텍스트 선택·그래프 색상을 정의하고 src/main.rs에 등록한다. src/ui.rs의 지역 색상 상수와 하드코딩된 상태 색을 공통 팔레트로 전환한다. src/popup.rs·src/settings.rs·src/commit_editor.rs·src/history_view.rs도 같은 토큰을 사용한다. backdrop 투명도를 라이트 화면에 맞게 낮춘다.
+색상 변경은 의미별 매핑으로 한정한다. 실제 실행 플래그 등 비시각적 숫자는 변경하지 않는다. 대비 계산과 기존 어두운 색상 잔존 검색·fmt/check/clippy·단위 테스트 후 수렴 점검한다. 구현을 복제하는 새 테스트는 추가하지 않는다.
+
+## 탭·배지·그래프 계획
+
+src/ui.rs의 탭바에 border를 추가하고 벡터 아이콘 helper로 배지를 통일한다. Remote 판별은 Snapshot references의 종류와 target/name을 사용한다. src/theme.rs에 Remote 배지 색을 정의한다.
+src/history_view.rs에 레인 좌표를 열 폭에 맞추는 공통 함수를 추가한다. src/ui.rs는 전체 로드된 커밋/edge에서 최대 레인 수를 한 번 계산해 모든 행에 전달한다. 경로 캐시는 원점뿐 아니라 폭·레인 수도 키로 사용한다. 좌표 경계 테스트를 먼저 추가하고 fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 히스토리·상세 보완 계획
+
+src/theme.rs의 ACCENT/SELECT를 파랑 계열로 변경하고 대비를 계산한다. src/ui.rs는 태그 루프를 브랜치 앞에 배치하고 브랜치/커밋상세 목록 크기를 12px로 바꾸며 벡터 커밋 아이콘을 추가한다.
+src/history_view.rs는 원을 4개 대칭 cubic 경로로 그려 rounded quad 경로를 제거한다. HEAD는 외곽 색 원과 2px 작은 흰 원을 조합하고 일반 노드는 채움만 그린다. cell의 컬럼 선을 제거하고 헤더 호출에서만 선을 추가한다.
+src/ui.rs의 상세 텍스트 shaping에 라벨과 값의 TextRun을 분리하고 메타데이터 구간만 굵게 한다. 측정도 같은 run을 사용하며 시간 문자열/기존 테스트를 갱신한다. fmt/check/clippy·단위 테스트·대비 계산 후 수렴 점검한다.
+
+## 강조와 크기 조정 계획
+
+src/theme.rs의 ACCENT는 녹색으로 복구하고 SELECT는 파랑으로 유지하며 LOCAL_BG를 추가한다. src/ui.rs 배지에 테두리와 Local 배경을 적용하고 목록 아이콘을 독립 18px 요소로 분리한다. src/history_view.rs HEAD 반지름을 7.5px로 확대하고 기존 좌표 경계 테스트도 확대 크기로 검증한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 확대 대상 정정 계획
+
+src/history_view.rs의 HEAD 반지름과 경계 테스트를 5.5px로 복구한다. src/ui.rs 브랜치 배지에서 현재 표시 원을 이름 문자열과 분리해 16px 요소로 그린다. 이름은 11px를 유지한다. 기존 단위 테스트·fmt/check/clippy 및 수렴 점검을 수행한다.
+
+## 원 정렬 계획
+
+src/ui.rs에 글자 줄높이와 독립적인 current_branch_dot canvas helper를 추가한다. 배지는 18px 고정·원 슬롯은 12px, 목록 슬롯은 18px로 설정하고 실제 원은 각각 슬롯 중앙에 10px로 그린다. 이름/그래프/기존 이벤트를 유지한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 원격 HEAD 표시 필터 계획
+
+src/model.rs Reference에 원격 HEAD 표시 판별을 추가하고 src/git.rs의 reference_rows와 src/paging.rs의 배지 구성에서만 제외한다. 원본 references와 Git 참조는 수정하지 않는다. tests/repository.rs의 기존 원격 HEAD 테스트를 목록/배지 숨김·내부/실제 참조 보존 검증으로 갱신한다. fmt/check/clippy·단위/통합 테스트 후 수렴 점검한다.
+
+## 픽셀 정렬 계획
+
+src/history_view.rs에 physical stroke 두께·중심 스냅 helper를 추가하고 테스트를 먼저 작성한다. 시작/끝 좌표와 노드 중심에 같은 스냅을 사용한다. 수직선은 정렬된 사각형 채움으로, 곡선은 픽셀에 맞춘 stroke로 그린다. DPI를 캐시 키에 추가한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 렌더 굵기·여백 계획
+
+src/ui.rs의 선택 가능한 행과 폭 측정에 shape_text를 이용한 공통 단일 행 helper를 사용한다. WrappedLine의 unwrapped_layout으로 기존 좌표 조회를 유지하고 paint는 줄바꿈 없는 설정을 사용한다. NORMAL/BOLD를 모두 명시하고 run 검증 테스트를 추가한다. diff_panel의 빈 제목 헤더를 생략하고 빈 안내에만 px4/py2를 적용한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+추가 요청: Diff 표식은 h/line_height 22px로 맞춰 기본 18px 줄높이로 인한 위쪽 치우침을 줄인다.
+
+## 드래그 캡처 계획
+
+src/ui.rs selectable_line의 이동은 행의 전체 bounds 검사 대신 뷰어 세로 범위로 clamp한 y가 해당 행인지 판단한다. x는 제한하지 않고 shaped hit test의 시작/끝 clamp를 사용한다. 기존 전역 resize_move 캡처에서 활성 텍스트 선택의 뷰어만 바깥 방향으로 스크롤하고 resize_end에서도 해제한다. 모달/활성 탭/선택 key 검사와 시작 범위는 유지한다. clamp helper 테스트·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+추가 요청: history_row는 head_commit과 commit.id를 비교해 행의 폰트 굵기를 바꾸고 배지에는 NORMAL을 명시한다.
+
+## 키캡 공통화 계획
+
+src/shortcut.rs에 조합키/안내/버튼 라벨 렌더 helper와 키 판별을 추가하고 src/main.rs에 등록한다. src/ui.rs의 도움말·상태줄·버튼 라벨·커밋/폐기 안내를 공통 키캡으로 전환한다. 키 입력 이벤트는 변경하지 않는다. 파서 검증·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 생성 팝업 계획
+
+src/branches.rs에 원격 선택 후 Local 생성·선택적 publish 조합을 추가한다. src/ui.rs Create action에 remote bool을 추가해 체크박스와 연결하고 폰트/버튼 배치를 Create에만 적용한다. src/commit_editor.rs는 개별 글자 크기를 지원해 생성 입력만 13px로 한다. 파일명은 공통 14px를 명시한다. 임시 원격 테스트·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 체크박스·입력 계획
+
+src/controls.rs에 고정 체크박스 helper를 추가하고 설정/브랜치 생성에 적용한다. Create action에 checkout bool을 추가하고 생성 함수는 선택 성공 시 switch를 실행한다. src/commit_editor.rs의 단일 행에 26px 슬롯-22px 줄의 중앙 오프셋을 공통 적용해 paint/IME/hit test를 맞춘다. window 캡처로 포인터가 입력 밖에서도 index_at·선택을 갱신하고 해제한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+추가 점검: Clone URL은 별도 문자열 입력이라 공통 CommitEditor로 전환해 동일한 중앙 정렬/범위 밖 선택/IME를 적용한다. Enter 실행과 작업 중 비활성화는 유지한다.
+
+## 체크 여백 계획
+
+src/ui.rs button과 src/settings.rs action은 빈 라벨을 생략한다. 체크박스 래퍼만 py1·flex 중앙 정렬로 바꾸고 일반 버튼은 유지한다. fmt/check/clippy·기존 단위 테스트 후 수렴 점검한다.
+
+## 공통 팝업 포커스 계획
+
+src/popup.rs에 FocusHandle 목록 순환 helper와 테스트를 추가한다. src/ui.rs의 모달 Tab을 공통으로 처리하며 브랜치 체크 두 항목에 재사용 포커스를 추가한다. src/settings.rs도 같은 helper로 전역 체크를 포함하고 Space 전환을 제공한다. 체크 패딩은 controls의 공통 상수 6px를 사용한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 중복 Space 수정 계획
+
+src/ui.rs 브랜치 체크박스의 Space KeyDown 전환과 src/settings.rs 전역 체크의 on_key_down 전환을 제거한다. 기존 FocusHandle과 on_click은 유지하여 GPUI 기본 KeyUp 클릭으로 한 번만 실행한다. fmt/check/clippy·기존 단위 테스트 후 수렴 점검한다.
+
+## 숫자 포커스 계획
+
+src/ui.rs에 섹션 매핑 helper를 추가하고 기존 modal/입력 가드 뒤에서 1~4를 처리한다. focus/list_focus만 바꾸며 4의 텍스트 커서가 없을 때만 초기화한다. 도움말을 추가하고 매핑 테스트·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 옵션·선택 유지 계획
+
+src/session.rs에 기본값 호환 PopupOptions를 추가하고 Workspace 생성 옵션과 설정 체크 선호를 복원/저장한다. 설정은 전달된 선호를 load 후 반영하고 종료 시 되돌려준다. src/ui.rs의 o는 현재 참조/커밋으로 기존 체크아웃을 호출한다. Tag도 간소화된 footer를 사용한다. src/git.rs에 선택 커밋의 유효성 검사와 선택 페이지까지의 재조회 helper를 추가하고 reload에 사용한다. 생성 후 체크아웃의 선택 초기화는 생략한다. 세션/페이지 테스트·fmt/check/clippy·단위/통합 테스트 후 수렴 점검한다.
+
+## 탐색 동작 계획
+
+src/ui.rs에서 입력 가드 이후 탐색 키를 매핑한다. 브랜치 선택은 revision만 바꾸고 Space에서 기존 select_reference를 호출한다. 선택창의 숫자/클릭은 공통 메서드로 후보를 선택한다. 생성 성공은 다음 렌더에서 Workspace 포커스를 복원하고 기존 list_focus를 유지한다. 불필요한 더블클릭 지연 함수는 제거한다. 매핑 테스트·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## 체크아웃 표시 계획
+
+src/ui.rs refresh_after_branch에서 Local 탭/Branches 포커스 강제 지정을 제거하고 성공 후 실제 키보드 포커스만 복원한다. src/branches.rs 후보 label은 참조 이름만 사용하며 테스트 기대값을 갱신한다. fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+## Reset·선택 유지 계획
+
+src/branches.rs에 ResetMode와 검증된 commit reset 함수를 추가한다. src/ui.rs BranchAction::Reset에 commit/mode/expanded를 보관하고 공통 BranchDialog로 처리한다. selectbox는 포커스/키보드/클릭을 지원하며 확인 전에는 변경하지 않는다. refresh_after_branch에서 선택/모드 초기화를 제거한다. src/popup.rs 하단을 우측 정렬하고 확인/취소 순서를 확인 우측으로 맞춘다. 임시 저장소 reset 상태 테스트·fmt/check/clippy·단위 테스트 후 수렴 점검한다.
+
+
+## 히스토리 작업 팝업 확장 계획
+
+src/branches.rs에서 커밋 해시 검증과 revert/merge/rebase 실행을 담당한다. 편집기를 띄우지 않도록 명시적 비대화 옵션을 사용하고 진행 중 Git 작업은 거절한다. src/ui.rs의 BranchAction에 Revert와 Integrate 상태를 추가한다. Merge/Rebase 목록은 별도 비동기 전체 히스토리 조회와 가상 목록으로 제공하며 원래 선택과 분리한다. Reset 라디오와 Revert 체크 입력은 기존 포커스/공통 footer를 재사용한다. src/session.rs에 no commit 기억을 추가한다. 임시 저장소 테스트와 fmt/check/Clippy로 검증한다.
+
+
+## Reset 대상 표시 정리 계획
+
+src/ui.rs의 Reset 팝업 렌더 분기에서 대상 표시만 제거한다. 실행 상태의 commit은 유지한다. 포맷과 컴파일 검사로 검증한다.
+
+
+## Merge·Rebase 확인 간소화 계획
+
+src/ui.rs의 Integrate 상태를 종류와 고정 커밋으로 줄인다. 팝업 전용 히스토리 조회·스크롤·세대·행 렌더링·방향키 선택을 제거하고 확인 문구로 대체한다. 기존 branches.rs 실행과 공통 확인 footer를 재사용한다. fmt/check/Clippy 및 기존 Git 작업 테스트로 검증한다.
+
+
+## 단축키 통합 설정 계획
+
+Rust/GPUI와 기존 Session 저장을 재사용한다. src/shortcut.rs에 안정 기능 ID, 영역, 기본 두 키와 사용자 재정의를 관리한다. 실제 입력을 등록 기능의 기존 명령 키로 정규화하여 src/ui.rs 실행 경로와 보호 조건을 유지한다. 입력창에서는 일반 앱 키를 처리하지 않으며 확인창 제어는 별도 범위를 사용한다. 설정 표와 도움말은 같은 정의에서 생성한다. 세션에 재정의를 저장하고 없는 필드는 기본값으로 읽는다. 키 충돌·변환·왕복 테스트로 검증한다. 헌법은 미작성 템플릿이므로 별도 제약을 적용하지 않는다. 한글 문서와 전 단계 절차를 준수한다.
+
+
+## 방향 선택 확장 목록 정리 계획
+
+src/ui.rs의 공용 shortcuts_table에서 select- 접두 기능 네 개를 표시 대상에서 제외한다. src/shortcut.rs의 실행·충돌 검사·기본값과 세션 데이터는 그대로 유지하여 기존 동작을 보존한다. 포맷·컴파일·기존 단축키 테스트로 검증한다.
+
+
+## 확인창 공통 키 통합 계획
+
+src/shortcut.rs의 창별 네 제어 정의를 dialog 범위 공통 네 정의로 교체한다. 해석 시 활성 창에 따라 확인을 기존 Enter 또는 Control+S 실행 경로로 변환하고 충돌 검사에 공통 범위를 포함한다. src/ui.rs의 표시와 단축키 설정창 취소·후보창 확인을 공통 정의에 연결한다. 기존 창별 재정의는 실행에서 무시한다. 회귀 테스트·포맷·컴파일·Clippy로 검증한다.
+
+
+## 확인 표시·커밋 팝업 계획
+
+src/ui.rs의 확인 버튼과 확인 안내를 단축키 없는 확인 버튼으로 정리한다. CommitDialog.push_after를 실제 체크 상태로 사용하며 submit_commit은 인자 대신 상태를 읽는다. 전용 체크 포커스를 추가하고 Tab 순환·클릭·Space 전환을 연결한다. 커밋 본문에 라벨/입력창/체크 순서를 적용하고 공통 footer에 확인 하나를 둔다. src/shortcut.rs의 커밋 후 푸시 키는 체크 전환 명령으로 변경한다. 기존 commit_then_push와 오류 복구를 재사용한다.
+
+
+## 단축키 설정 탭 계획
+
+src/ui.rs Workspace에 선택 탭 인덱스를 추가한다. shortcuts_table은 편집 모드에서 다섯 탭을 렌더링하고 선택 그룹만 표시한다. 상단 정적 안내 문구를 제거하며 복원·상태 메시지는 유지한다. 두 열기 경로에서 공통 탭으로 초기화하고 전환 시 등록·메시지를 해제한다. src/shortcut.rs에서 세 기능의 표시명만 변경한다. 기존 설정 ID와 실행은 유지한다.
+
+
+## 히스토리 대상 행 제거 계획
+
+src/ui.rs의 Revert 및 Integrate 렌더 분기에서 대상 커밋 행만 삭제하고 사용하지 않는 commit 패턴은 생략한다. BranchAction 상태와 submit_branch의 실행 대상 전달은 변경하지 않는다. 포맷·컴파일·Clippy와 소스 경로 검토로 검증한다.
+
+
+## 단축키 일괄 승인·헤더 계획
+
+src/ui.rs에서 활성 Bindings와 Option<Bindings> 임시 상태를 분리한다. 열기 시 복제하고 표·등록·해제·복원은 임시 상태만 사용한다. 탭 전환은 임시 데이터를 유지한다. 확인 시 임시 데이터를 넣은 Session을 먼저 저장하고 성공 후 활성 설정을 교체한다. 실패하면 원본과 편집 상태를 유지한다. 취소·바깥 클릭은 편집 상태를 해제한다. 복원·확인은 공통 footer 우측에 배치하고 헤더에 중성 회색 배경과 TEXT 글자를 적용한다. 기존 persist는 공통 세션 생성 메서드를 재사용한다.
+
+저장 승인 검증을 위해 src/session.rs에 save_shortcuts를 두어 전체 세션 저장 성공 후 활성 설정을 갱신하고 다중 그룹·기본값 승인·실패 보존 테스트를 추가한다.
+
+
+## 단축키 설정 헤더 제거 계획
+
+src/ui.rs shortcuts_table의 열 제목 행은 비편집 도움말에만 렌더링하도록 조건을 제한한다. 설정에는 제목 행 없이 본문을 표시한다. px_3 등 패딩은 추가하지 않고 기존 셀 너비와 편집·승인 로직을 유지한다. 포맷·컴파일·Clippy로 검증한다.
+
+
+## 단축키 설정 고정 높이 계획
+
+src/popup.rs 공통 프레임에 선택적 고정 높이를 추가하고 해당 모드에서는 본문을 flex_1로 배치한다. src/ui.rs에서 단축키 설정일 때만 640픽셀을 전달하며 기존 viewport-64 상한으로 제한한다. 탭별 데이터나 항목 수는 높이 계산에 사용하지 않는다.
+
+
+## 공통 방향·전환 통합 계획
+
+src/shortcut.rs에서 nav 네 정의를 navigation 범위로 확장해 기존 주 화면과 reset에 적용하고 명칭을 방향키 방향으로 바꾼다. Reset 전용 방향 정의를 제거하고 창별 Space 전환을 input-toggle 하나로 합쳐 branch/reset/commit-modal에 적용한다. 범위 충돌은 실제 적용 범위의 교집합으로 검사한다. src/ui.rs에서 매핑된 Space의 포커스된 체크 상태 전환을 명시적으로 처리해 변경 키도 작동하게 한다. 브랜치 위치 이동·파일 Stage 정의 및 일반 입력은 유지한다.
+
+
+## Stage 파일목록 범위 계획
+
+src/shortcut.rs에서 stash/commit ID를 유지하며 파일목록 그룹·stage-files 범위로 옮긴다. stage-files는 기존 files·주 화면 공통·방향키 기능도 적용하고 충돌 교집합에 포함한다. src/ui.rs에서 활성 저장소 Files 포커스와 FileTab::Stage를 동시에 검사해 stage-files를 선택하고 두 실행 분기도 같은 범위로 제한한다. 실제 팝업 함수는 유지한다.
+
+
+## 하위 분류·선택 숨김 계획
+
+src/shortcut.rs에 그룹별 하위 분류·포함 판정·목록 표시 판정을 추가한다. 후보/Reset 숫자 정의는 보존하고 표시에서만 제외한다. src/ui.rs는 각 하위 분류별 같은 Command ID의 행을 만들고 UI 요소 ID에는 분류명을 포함한다. 빈 History 분류를 표시하며 두 슬롯은 동일 임시 Bindings를 읽고 쓴다. 실행·승인·고정 높이는 유지한다.
+
+
+## 후보·Reset 키 배지 계획
+
+src/shortcut.rs에 공통 배지 렌더러를 추가한다. src/ui.rs 후보 버튼은 빈 기본 라벨에 배지·참조 이름 행을 넣고 기존 첫 열 개 조건을 유지한다. Reset은 라디오 원·배지·모드 이름을 한 행에 구성한다. 키 라벨은 Bindings.label을 유지하고 선택 콜백은 변경하지 않는다.
+
+
+## 단축키 슬롯 배지 계획
+
+src/ui.rs 설정 슬롯 버튼의 기본 텍스트를 빈 값으로 하고 공통 shortcut::badge를 자식으로 넣는다. 읽기 전용 표도 같은 배지를 사용한다. 버튼 ID·클릭·등록 상태·삭제·임시 Bindings는 그대로 유지한다. 후보/Reset 배지의 라디오 라벨을 위해 src/controls.rs는 IntoElement를 받는다.
+
+
+## 브랜치 삭제 팝업 계획
+
+src/ui.rs의 Delete 제목·렌더링을 바꾸고 Delete를 minimal footer 분류에 포함한다. BranchAction::Delete.server를 checkbox에 직접 연결하며 refs/remotes 대상에서만 클릭/입력전환·포커스 순환을 허용한다. 기존 open_reference_delete의 server 기본값/Remote 제한과 submit_branch→branches::delete_reference 전달은 유지한다. 기존 삭제 테스트로 검증한다.
+
+
+## 참조 종류별 연결 삭제 계획
+
+src/branches.rs에 삭제 계획 스냅샷과 종류·참조 해시·연결 대상·원격 목적지 모델을 추가한다. for-each-ref upstream과 remote fetch refspec으로 관계·정확한 서버 목적지를 구하고 실행 전 재조회한다. 원격과 함께 삭제하는 모든 로컬 대상은 worktree/HEAD·upstream 병합 보호를 선검사하고 Local 단독 삭제는 기존 Git branch -d 판정을 유지한다. lease 서버 삭제·추적 정리 후 기존 안전 branch -d를 실행하며 부분 실패를 설명한다. 기존 delete_reference와 stash 삭제는 재사용한다. src/ui.rs의 Delete는 계획과 추가 삭제 bool을 보관하고 비동기 조회 후 종류별 제목·관계·체크를 표시한다. Tag/Stash 체크·취소 버튼은 제거하고 공통 키/입력전환을 유지한다. 임시 저장소 회귀 테스트로 검증한다.
+
+
+## 브랜치 푸시·우선순위 계획
+
+src/shortcut.rs의 branch-upload ID를 유지하고 이름·기본 키·적용 범위를 브랜치 푸시/shift-p/local-branches로 변경한다. Local 범위는 branches·공통·navigation을 상속한다. 실행 해석은 브랜치 그룹을 먼저 선택하고 충돌 검사에서 브랜치/공통의 중복만 허용한다. src/ui.rs에서 Local 포커스를 해당 범위로 구분하고 Upload 제목·본문·minimal footer를 정리한다. 기존 u 명령은 내부 실행 대상으로 유지하여 비동기 게시 경로를 재사용한다.
+
+
+## 브랜치 푸시 키 복원 계획
+
+src/shortcut.rs의 branch-upload 기본 슬롯만 u로 변경하고 기존 회귀 테스트의 기본 키 기대값 및 Local 공통 Shift+P 해석을 갱신한다. 나머지 이름·범위·팝업·사용자 재정의·우선 정책은 변경하지 않는다.

@@ -97,3 +97,190 @@ StartPage.recent_scroll은 새 탭별 가상 목록 스크롤 핸들이다. rece
 ## 브랜치와 태그 상태
 
 CheckoutTarget은 local 이름과 선택적인 remote 전체 참조, 생성 필요 여부를 갖는다. BranchDialog는 프로젝트 ID·경로·생성 커밋/원격추적 대상·선택적 이름 입력·실행 상태·오류를 갖는다. 생성 커밋은 열 때 캡처한 객체 ID이며 확인 전에는 참조를 바꾸지 않는다. Commit.tags는 해당 커밋을 가리키는 태그 이름 목록이고 기존 branches와 분리한다.
+
+## 스태시 확인 상태
+
+StashDialog는 project_id, busy, error를 가진다. 대기 → 실행 → 성공 시 닫기 또는 오류 후 재시도로 전환한다. 영속 데이터는 Git stash이며 세션 필드는 추가하지 않는다.
+
+## 스태시 복원 상태
+
+Reference의 Stash revision과 target은 커밋 해시다. 복원 작업은 저장소 ID와 선택 해시를 캡처한다. branch_busy·pending은 실행 중에만 유지하고 별도 영속 필드는 없다.
+
+## 저장·삭제 확인 상태 확장
+
+StashDialog는 기존 project_id·busy·error 외에 선택적 editor와 선택적 삭제 대상(selector, commit, name)을 가진다. 저장에서만 editor가 존재하고 삭제에서는 대상만 존재한다. 실행 중 editor.enabled를 끄고 실패 시 다시 켠다.
+
+## 참조 작업 상태 확장
+
+BranchAction에 Tag(commit)와 Delete(reference, expected)를 추가한다. 이름 입력은 Create·Tag, 확인만 필요한 Delete는 editor가 없다. 기존 BranchDialog와 branch_busy로 작업을 격리한다.
+
+Snapshot.head_commit은 Option<String>으로 unborn이면 None, 일반/Detached HEAD에서는 실제 커밋 해시다.
+
+## 원격 생성 상태
+
+BranchAction::Upload는 Local 전체 참조와 예상 커밋을 보관하고 editor는 원격 이름을 입력한다. 커밋 체크아웃은 저장소 ID와 커밋 해시를 캡처하고 기존 branch_busy·pending으로 진행을 격리한다.
+
+## 커밋 체크아웃 후보
+
+CheckoutCandidate는 reference와 label을 가진다. BranchAction::ChooseCheckout은 commit, candidates, selected를 가진다. 선택은 팝업의 임시 상태이며 저장소에는 쓰지 않는다. 확인 시 commit과 ref tip을 재검증한다.
+
+## 즉시 선택 상태
+
+ChooseCheckout.selected는 클릭한 인덱스를 실행 함수로 전달하는 임시 필드로 유지한다. 기본 선택은 Enter로 제출하지 않으며 클릭만 실행을 시작한다.
+
+## 팝업 표시 인수
+
+공통 프레임은 title·width·body·footer·header_action·viewport를 입력받는다. footer/header_action은 선택적 UI 요소이고 상태나 영속 데이터는 추가하지 않는다.
+
+## 무변경 체크아웃 결과
+
+히스토리 준비 결과에 switched 여부를 함께 전달해 후보 없음/실제 전환과 현재 브랜치 무변경을 구분한다. 영속 상태 추가는 없다.
+
+## 테마 표시 상수
+
+theme 모듈의 의미별 u32 색상과 그래프 팔레트를 사용한다. 모델·저장소·세션 데이터와 영속 설정은 추가하지 않는다.
+
+## 그래프 레이아웃
+
+렌더링 인수 graph_lanes는 현재 로드된 전체 커밋의 marker/input/output 레인 최댓값+1이다. 경로 캐시 키는 원점·폭·레인 수다. 영속 데이터는 없다.
+
+## 상세 표시 범위
+
+TextRows는 첫 빈 줄 이전을 메타데이터 구간으로 판별한다. 표시 run은 라벨 바이트 길이를 기준으로 굵은 라벨/일반 값을 분리한다. 문자열과 영속 데이터 구조는 유지한다.
+
+## 표시 상수 보완
+
+Local 배지 배경 토큰과 HEAD 반지름·목록 아이콘 크기만 바꾸며 데이터 모델은 유지한다.
+
+## 배지 원 표시
+
+기존 current_branch 비교를 사용하며 데이터 모델은 변경하지 않는다.
+
+## 고정 원 표시
+
+기존 current_branch 판별을 유지하고 크기와 중앙 위치만 UI helper에서 관리한다.
+
+## 원격 HEAD 표시 판별
+
+Reference의 Remote 종류와 /HEAD 이름으로 표시 제외를 판별한다. 원본 데이터와 영속 상태는 유지한다.
+
+## 그래프 캐시 DPI
+
+경로 캐시 키에 화면 scale_factor를 추가한다. 영속 모델은 변경하지 않는다.
+
+## 상세 렌더 레이아웃
+
+줄바꿈 없는 WrappedLine과 unwrapped_layout을 사용해 paint/선택좌표/폭 측정을 통일한다. 기존 텍스트 데이터는 유지한다.
+
+## 드래그 상태
+
+기존 text_drag·text_selection·viewports·list_scroll을 재사용하며 영속 데이터는 추가하지 않는다.
+
+## 단축키 표시
+
+공통 표시 helper만 추가하며 저장 데이터와 실제 키 바인딩은 변경하지 않는다.
+
+## 생성 선택 상태
+
+Create action에 remote bool을 추가하고 편집기에 개별 text_size를 추가한다. 영속 데이터는 변경하지 않는다.
+
+## 생성 옵션
+
+Create의 checkout bool은 기본 false다. 체크박스는 표시 helper이며 입력 bounds는 세로 오프셋을 반영한다.
+
+## 체크 여백
+
+표시 레이아웃만 바꾸고 상태/데이터는 유지한다.
+
+## 입력 포커스
+
+브랜치 체크용 FocusHandle 두 개와 설정 전역 체크 FocusHandle을 추가한다. 영속 데이터는 유지한다.
+
+## 체크 상태
+
+기존 상태/포커스/클릭 동작을 유지하고 입력 경로만 단일화한다.
+
+## 숫자 키 매핑
+
+기존 ListFocus만 사용하고 영속 데이터는 변경하지 않는다.
+
+## 팝업 옵션
+
+PopupOptions는 branch_remote·branch_checkout·use_global(선택적 bool)을 가지며 serde default로 과거 세션을 지원한다.
+
+## 포커스 복원 상태
+
+일회성 focus_after_popup 플래그만 추가하고 기존 list_focus/revision을 재사용한다.
+
+## 후보·포커스
+
+기존 list_focus와 ref_tab을 유지하고 후보 label 형식만 바꾼다.
+
+## Reset 상태
+
+ResetMode는 Soft/Mixed/Hard이며 Reset action은 대상 commit·mode·selectbox expanded를 가진다. 별도 영속 데이터는 없다.
+
+
+## 히스토리 작업 상태
+
+Reset은 커밋/모드만 유지한다. Revert는 커밋/no_commit을 가진다. Integrate는 Merge/Rebase 종류, 독립 커밋 목록, 선택 인덱스, 조회 상태를 가진다. PopupOptions.revert_no_commit은 기본 false이고 세션에 저장된다.
+
+
+## Merge·Rebase 고정 대상
+
+Integrate는 kind와 commit만 보유한다. 이전의 commits/selected/loading과 전용 스크롤·조회 세대는 제거한다.
+
+
+## 단축키 설정 데이터
+
+기능 정의는 안정 ID·영역·이름·기존 명령·기본 두 키이다. 사용자 설정은 기능 ID에서 두 문자열 슬롯으로의 맵이다. 빈 문자열은 해제를 뜻하며 미등록 ID는 실행하지 않는다. 같은 영역 또는 공통 영역의 기존 할당과 충돌하면 거절한다. 화면 상태는 열림·등록 대상·안내 문구이며 영속화하지 않는다.
+
+
+## 확인창 공통 설정
+
+confirm, cancel, next-input, previous-input 네 ID가 두 키 슬롯을 공유한다. dialog 범위는 기존 확인창 범위와 주소 입력창에 적용한다. 과거 창별 submit/close/tab/backtab ID는 더 이상 정의되지 않아 무시된다.
+
+
+## 커밋 옵션 상태
+
+CommitDialog.push_after는 팝업 동안 유지되는 체크 상태다. 초기 false이고 실행 중 고정된다. 실패 시 메시지와 함께 유지한다. 별도 세션 저장은 추가하지 않는다.
+
+
+## 설정 선택 탭
+
+선택 탭은 GROUPS의 인덱스이며 초기값 0인 임시 화면 상태다. 열기 시 초기화하고 세션에는 저장하지 않는다. 세 기능의 ID는 유지하고 name만 교체한다.
+
+
+## 단축키 임시 편집 상태
+
+활성 shortcuts는 실제 실행·도움말·일반 세션 저장에 사용한다. shortcut_draft는 팝업 열기 시 활성 설정을 복제한 Option 값이다. 탭 전환은 같은 복제본을 사용한다. 확인 성공 또는 취소 시 None으로 해제한다. 저장 실패는 복제본을 유지한다.
+
+
+## 공통 방향·전환 정의
+
+nav-up/down/left/right ID는 유지하고 navigation 범위를 사용한다. input-toggle은 branch/reset/commit-modal의 공유 두 슬롯이며 기본 Space다. reset 방향·창별 Space 정의는 제거되어 저장된 과거 ID는 무시한다. branch-jump/files-stage와 설정 승인 데이터 모델은 유지한다.
+
+
+## Stage 파일 단축키 범위
+
+stage-files는 활성 저장소의 Stage 파일목록에만 해당한다. files 범위의 키와 주 화면 공통/방향키를 상속한다. stash/commit은 해당 범위에만 정의하고 저장 ID와 두 슬롯은 유지한다.
+
+
+## 하위 분류 표시 데이터
+
+브랜치 하위 분류는 Local/Remote/Stash/Tag, 파일목록은 Stage/History다. Command는 복제 저장하지 않고 분류별 포함 판정으로 재사용한다. UI 요소 ID에는 분류명을 추가하여 중복을 피하고 Bindings ID는 유지한다. 가시성은 선택 확장·checkout/reset 전용 정의를 제외한다.
+
+
+## 삭제 체크 상태
+
+기존 BranchAction::Delete.server를 팝업 내 체크 상태로 사용한다. 참조 경로가 refs/remotes/일 때만 변경 가능하다. 세션에 저장하지 않고 취소 시 팝업 상태와 함께 폐기한다.
+
+
+## 연결 삭제 계획
+
+삭제 계획은 Local/Remote/Tag 종류, 주 대상 참조·기대 해시·선택 원격 서버/목적지, 연결 대상 배열을 보관한다. 원격 목적지는 fetch refspec으로 확정한다. 계획은 비교 가능하며 추가 삭제 시 관계까지 다시 비교한다. UI는 계획과 delete_related만 보관하고 초기 false다. Stash는 기존 reflog 예상 해시를 유지한다. 세션 저장은 추가하지 않는다.
+
+
+## 브랜치 키 우선순위
+
+branch-upload의 저장 ID는 유지하고 기본 슬롯만 shift-p로 변경한다. local-branches는 실제 활성 저장소 Local 참조 포커스다. 정의의 group이 브랜치이면 공통보다 높은 해석 우선순위를 갖는다. 우선순위는 저장 설정에 새 필드를 추가하지 않는다.

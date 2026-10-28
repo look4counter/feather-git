@@ -576,7 +576,7 @@ fn branch_targets_load_whole_pages_and_preserve_history_on_retry() {
 }
 
 #[test]
-fn symbolic_remote_head_keeps_its_own_name_in_refs_and_commit_badges() {
+fn remote_head_is_hidden_in_rows_and_badges_but_preserved_in_git() {
     let dir = init();
     write(dir.path(), "file.txt", "content\n");
     commit(dir.path(), "initial");
@@ -614,9 +614,23 @@ fn symbolic_remote_head_keeps_its_own_name_in_refs_and_commit_badges() {
                     .iter()
                     .filter(|branch| *branch == name)
                     .count(),
-                1
+                usize::from(name != "origin/HEAD")
             );
         }
+        assert!(
+            snapshot.reference_rows[RefTab::Remote.index()]
+                .iter()
+                .all(|i| snapshot.references[*i].name != "origin/HEAD")
+        );
+        assert!(
+            snapshot.reference_rows[RefTab::Remote.index()]
+                .iter()
+                .any(|i| snapshot.references[*i].name == "origin/main")
+        );
+        assert_eq!(
+            run(dir.path(), &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            "refs/remotes/origin/main"
+        );
         assert!(
             snapshot
                 .references
@@ -823,4 +837,39 @@ fn external_filters_are_not_executed() {
     let snapshot = git::load(path, None, None).unwrap();
     assert!(snapshot.stage.iter().any(|f| f.label == "file.txt"));
     assert!(!path.join("filter-called.txt").exists());
+}
+
+#[test]
+fn actual_head_id_survives_selection_and_detached_head_and_unborn() {
+    let dir = init();
+    let path = dir.path();
+    assert!(git::load_initial(path, None).unwrap().head_commit.is_none());
+    run(path, &["commit", "--allow-empty", "-m", "first"]);
+    let first = run(path, &["rev-parse", "HEAD"]);
+    run(path, &["commit", "--allow-empty", "-m", "second"]);
+    let second = run(path, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git::load_initial(path, Some(&first))
+            .unwrap()
+            .head_commit
+            .as_deref(),
+        Some(second.as_str())
+    );
+    run(path, &["checkout", "--detach", &first]);
+    let snapshot = git::load_initial(path, Some(&second)).unwrap();
+    assert_eq!(snapshot.head_commit.as_deref(), Some(first.as_str()));
+    assert!(snapshot.current_branch.is_none());
+}
+
+#[test]
+fn refresh_keeps_selected_commit_beyond_first_page_after_reference_creation() {
+    let dir = imported_history(450);
+    let selected = run(dir.path(), &["rev-parse", "HEAD~400"]);
+    run(dir.path(), &["branch", "added", &selected]);
+    run(dir.path(), &["tag", "added", &selected]);
+    let snapshot = git::load_for_refresh(dir.path(), Some(&selected)).unwrap();
+    assert!(snapshot.commits.iter().any(|commit| commit.id == selected
+        && commit.branches.contains(&"added".to_owned())
+        && commit.tags.contains(&"added".to_owned())));
+    assert_eq!(snapshot.commit_detail.as_ref().unwrap().id, selected);
 }

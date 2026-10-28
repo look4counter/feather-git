@@ -40,6 +40,12 @@ pub struct Reference {
     pub target: String,
 }
 
+impl Reference {
+    pub fn is_remote_head(&self) -> bool {
+        self.kind == RefTab::Remote && self.revision.ends_with("/HEAD")
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Commit {
     pub id: String,
@@ -256,6 +262,7 @@ impl StageSelection {
 pub struct Snapshot {
     pub root: PathBuf,
     pub head: String,
+    pub head_commit: Option<String>,
     pub references: Vec<Reference>,
     pub commits: Vec<Commit>,
     pub stage: Vec<FileChange>,

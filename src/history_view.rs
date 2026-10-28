@@ -1,3 +1,4 @@
+use crate::theme;
 use feather_git::model::Commit;
 use gpui::{prelude::*, *};
 use std::{cell::RefCell, rc::Rc};
@@ -51,7 +52,10 @@ pub fn format_time(seconds: i64, offset: i32) -> String {
         .unwrap_or_else(|_| seconds.to_string())
 }
 
-type PathCache = (Point<Pixels>, Vec<(Path<Pixels>, Rgba)>);
+type PathCache = (
+    (Point<Pixels>, Pixels, usize, f32),
+    Vec<(Path<Pixels>, Rgba)>,
+);
 type Segment = (Point<Pixels>, Point<Pixels>, Rgba);
 
 #[derive(Clone)]
@@ -63,10 +67,58 @@ pub struct RowGraph {
 }
 
 fn color(index: usize) -> Rgba {
-    const COLORS: [u32; 8] = [
-        0x60a5fa, 0xa78bfa, 0x34d399, 0xf87171, 0xfbbf24, 0x22d3ee, 0xf472b6, 0x818cf8,
-    ];
-    rgb(COLORS[index % COLORS.len()])
+    rgb(theme::GRAPH[index % theme::GRAPH.len()])
+}
+
+fn paint_circle(window: &mut Window, center: Point<Pixels>, radius: f32, tint: Rgba) {
+    let r = px(radius);
+    let k = px(radius * 0.552_284_8);
+    let mut path = PathBuilder::fill();
+    path.move_to(center + point(r, px(0.)));
+    path.cubic_bezier_to(
+        center + point(px(0.), r),
+        center + point(r, k),
+        center + point(k, r),
+    );
+    path.cubic_bezier_to(
+        center - point(r, px(0.)),
+        center + point(-k, r),
+        center + point(-r, k),
+    );
+    path.cubic_bezier_to(
+        center - point(px(0.), r),
+        center - point(r, k),
+        center - point(k, r),
+    );
+    path.cubic_bezier_to(
+        center + point(r, px(0.)),
+        center + point(k, -r),
+        center + point(r, -k),
+    );
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, tint);
+    }
+}
+
+fn graph_stroke_width(scale: f32) -> f32 {
+    (2. * scale).round().max(1.) / scale
+}
+
+fn snap_graph_coordinate(value: f32, scale: f32) -> f32 {
+    let phase = (2. * scale).round().max(1.) % 2. / 2.;
+    ((value * scale - phase).round() + phase) / scale
+}
+
+fn graph_x(x: f32, width: f32, lanes: usize) -> f32 {
+    let left = 8_f32.min(width.max(0.) / 2.);
+    let span = lanes.saturating_sub(1) as f32 * 12.;
+    let scale = if span > 0. {
+        ((width - 16.).max(0.) / span).min(1.)
+    } else {
+        1.
+    };
+    left + (x - 8.) * scale
 }
 
 impl RowGraph {
@@ -93,25 +145,50 @@ impl RowGraph {
         }
     }
 
-    pub fn render(&self) -> impl IntoElement + use<> {
+    pub fn render(&self, checked_out: bool, lanes: usize) -> impl IntoElement + use<> {
         let graph = self.clone();
         canvas(
             |_, _, _| (),
             move |bounds, _, window, _| {
+                let scale = window.scale_factor();
+                let stroke = px(graph_stroke_width(scale));
+                let snap = |position: Point<Pixels>| {
+                    point(
+                        px(snap_graph_coordinate(position.x.into(), scale)),
+                        px(snap_graph_coordinate(position.y.into(), scale)),
+                    )
+                };
+                let key = (bounds.origin, bounds.size.width, lanes, scale);
                 let mut cache = graph.cache.borrow_mut();
                 if cache
                     .as_ref()
-                    .is_none_or(|(origin, _)| *origin != bounds.origin)
+                    .is_none_or(|(cached_key, _)| *cached_key != key)
                 {
                     let mut paths = Vec::new();
                     for (start, end, color) in graph.segments.iter() {
-                        let start = *start + bounds.origin;
-                        let end = *end + bounds.origin;
-                        let mut path = PathBuilder::stroke(px(2.));
-                        path.move_to(start);
-                        if start.x == end.x {
-                            path.line_to(end);
+                        let start = point(
+                            px(graph_x(start.x.into(), bounds.size.width.into(), lanes)),
+                            start.y,
+                        ) + bounds.origin;
+                        let end = point(
+                            px(graph_x(end.x.into(), bounds.size.width.into(), lanes)),
+                            end.y,
+                        ) + bounds.origin;
+                        let start = snap(start);
+                        let end = snap(end);
+                        let mut path = if start.x == end.x {
+                            PathBuilder::fill()
                         } else {
+                            PathBuilder::stroke(stroke)
+                        };
+                        if start.x == end.x {
+                            path.move_to(start - point(stroke / 2., px(0.)));
+                            path.line_to(start + point(stroke / 2., px(0.)));
+                            path.line_to(end + point(stroke / 2., px(0.)));
+                            path.line_to(end - point(stroke / 2., px(0.)));
+                            path.close();
+                        } else {
+                            path.move_to(start);
                             let offset = (end.y - start.y) * 0.6;
                             path.cubic_bezier_to(
                                 end,
@@ -123,30 +200,35 @@ impl RowGraph {
                             paths.push((path, *color));
                         }
                     }
-                    *cache = Some((bounds.origin, paths));
+                    *cache = Some((key, paths));
                 }
                 if let Some((_, paths)) = cache.as_ref() {
                     for (path, color) in paths {
                         window.paint_path(path.clone(), *color);
                     }
                 }
-                let center =
-                    bounds.origin + point(px(8. + graph.lane as f32 * 12.), px(ROW_HEIGHT / 2.));
-                window.paint_quad(quad(
-                    Bounds::new(center - point(px(4.5), px(4.5)), size(px(9.), px(9.))),
-                    px(4.5),
-                    color(graph.color),
-                    px(1.),
-                    rgb(0xd9e2ed),
-                    Default::default(),
-                ));
+                let center = bounds.origin
+                    + point(
+                        px(graph_x(
+                            8. + graph.lane as f32 * 12.,
+                            bounds.size.width.into(),
+                            lanes,
+                        )),
+                        px(ROW_HEIGHT / 2.),
+                    );
+                let center = snap(center);
+                let radius = if checked_out { 5.5 } else { 4.5 };
+                paint_circle(window, center, radius, color(graph.color));
+                if checked_out {
+                    paint_circle(window, center, radius - 2., rgb(theme::HEAD_FILL));
+                }
             },
         )
         .size_full()
     }
 }
 
-pub fn cell(index: usize, width: f32) -> Div {
+pub fn cell(_index: usize, width: f32) -> Div {
     div()
         .w(px(width))
         .h(px(ROW_HEIGHT))
@@ -154,9 +236,6 @@ pub fn cell(index: usize, width: f32) -> Div {
         .min_w_0()
         .overflow_hidden()
         .px_2()
-        .when(index != 0, |cell| {
-            cell.border_l_1().border_color(rgb(0x293343))
-        })
         .flex()
         .items_center()
         .text_xs()
@@ -165,6 +244,39 @@ pub fn cell(index: usize, width: f32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn graph_strokes_align_to_physical_pixel_edges_at_fractional_dpi() {
+        for scale in [1., 1.25, 1.5, 1.75, 2.] {
+            let width = graph_stroke_width(scale);
+            for position in [-10.4, 0., 8.3, 21.75, 100.2] {
+                let snapped = snap_graph_coordinate(position, scale);
+                for edge in [snapped - width / 2., snapped + width / 2.] {
+                    let physical = edge * scale;
+                    assert!((physical - physical.round()).abs() < 0.0001);
+                }
+                assert!((snapped - position).abs() <= 0.501 / scale);
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn graph_nodes_stay_inside_narrow_columns_with_shared_lane_spacing() {
+        for lanes in [1, 2, 8, 32] {
+            for width in [16., 20., 36., 64., 240.] {
+                let mut previous = -1.;
+                for lane in 0..lanes {
+                    let x = graph_x(8. + lane as f32 * 12., width, lanes);
+                    assert!(x - 5.5 >= 0.);
+                    assert!(x + 5.5 <= width);
+                    assert!(x >= previous);
+                    previous = x;
+                }
+            }
+        }
+        assert_eq!(graph_x(20., 100., 3), 20.);
+        assert!(graph_x(20., 20., 3) < graph_x(20., 100., 3));
+    }
 
     #[::core::prelude::v1::test]
     fn resize_preserves_total_and_minima_across_window_sizes() {

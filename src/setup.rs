@@ -66,6 +66,108 @@ pub fn fetch(path: &Path) -> Result<()> {
     RemoteOperation::Fetch.run(path)
 }
 
+pub fn stash_all(repository: &Path, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        bail!("스태시 이름을 한 줄로 입력하세요.");
+    }
+    let root = feather_git::git::repository_root(repository)?;
+    let status = git_command(&root)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .context("변경 사항을 확인하지 못했습니다.")?;
+    if !status.status.success() {
+        bail!(
+            "변경 사항 확인 실패: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+    }
+    if status.stdout.is_empty() {
+        bail!("스태시에 저장할 변경 사항이 없습니다.");
+    }
+    let output = git_command(&root)
+        .args(["stash", "push", "--include-untracked", "--message", name])
+        .output()
+        .context("스태시를 실행하지 못했습니다.")?;
+    if !output.status.success() {
+        bail!(
+            "스태시 저장 실패: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
+pub fn delete_stash(repository: &Path, selector: &str, expected: &str) -> Result<()> {
+    let index = selector
+        .strip_prefix("stash@{")
+        .and_then(|s| s.strip_suffix('}'));
+    if !index.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        || ![40, 64].contains(&expected.len())
+        || !expected.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        bail!("올바른 스태시를 선택하세요.");
+    }
+    let root = feather_git::git::repository_root(repository)?;
+    let current = git_command(&root)
+        .args(["rev-parse", "--verify", selector])
+        .output()?;
+    if !current.status.success()
+        || !String::from_utf8_lossy(&current.stdout)
+            .trim()
+            .eq_ignore_ascii_case(expected)
+    {
+        bail!("스태시 목록이 변경되었습니다. 새로고침 후 다시 선택하세요.");
+    }
+    let output = git_command(&root)
+        .args(["stash", "drop", selector])
+        .output()
+        .context("스태시 삭제를 실행하지 못했습니다.")?;
+    if !output.status.success() {
+        bail!(
+            "스태시 삭제 실패: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
+pub fn restore_stash(repository: &Path, commit: &str) -> Result<()> {
+    if ![40, 64].contains(&commit.len()) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("올바른 스태시를 선택하세요.");
+    }
+    let root = feather_git::git::repository_root(repository)?;
+    let entries = git_command(&root)
+        .args(["stash", "list", "--format=%H"])
+        .output()?;
+    if !entries.status.success() {
+        bail!(
+            "스태시 목록 조회 실패: {}",
+            String::from_utf8_lossy(&entries.stderr)
+        );
+    }
+    if !String::from_utf8_lossy(&entries.stdout)
+        .lines()
+        .any(|entry| entry.eq_ignore_ascii_case(commit))
+    {
+        bail!("선택한 스태시가 더 이상 목록에 없습니다.");
+    }
+    let output = git_command(&root)
+        .args(["stash", "apply", "--index", commit])
+        .output()
+        .context("스태시 복원을 실행하지 못했습니다.")?;
+    if !output.status.success() {
+        bail!(
+            "스태시 복원 실패. 원본 스태시는 유지됩니다: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
 pub fn commit_then_push(repository: &Path, message: &str, push: bool) -> Result<Option<String>> {
     commit(repository, message)?;
     Ok(if push {
@@ -1112,5 +1214,108 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod stash_tests {
+    use super::*;
+
+    fn run(path: &Path, args: &[&str]) -> Vec<u8> {
+        let output = git_command(path).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn stash_preserves_index_worktree_untracked_and_ignored() {
+        let repo = tempfile::tempdir().unwrap();
+        let path = repo.path();
+        run(path, &["init", "-b", "main"]);
+        run(path, &["config", "core.autocrlf", "false"]);
+        run(path, &["config", "user.name", "Test"]);
+        run(path, &["config", "user.email", "test@example.invalid"]);
+        run(path, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(path.join("tracked"), "base\n").unwrap();
+        std::fs::write(path.join(".gitignore"), "ignored\n").unwrap();
+        run(path, &["add", "."]);
+        run(path, &["commit", "-m", "base"]);
+        assert!(stash_all(path, "--이름 있는 작업").is_err());
+        std::fs::write(path.join("tracked"), "staged\n").unwrap();
+        run(path, &["add", "tracked"]);
+        std::fs::write(path.join("tracked"), "unstaged\n").unwrap();
+        std::fs::write(path.join("new"), "untracked\n").unwrap();
+        std::fs::write(path.join("ignored"), "keep\n").unwrap();
+        let before = run(path, &["status", "--porcelain=v1", "-z"]);
+        assert!(stash_all(path, "   ").is_err());
+        assert_eq!(run(path, &["status", "--porcelain=v1", "-z"]), before);
+        stash_all(path, "--이름 있는 작업").unwrap();
+        assert!(run(path, &["status", "--porcelain=v1", "-z"]).is_empty());
+        assert_eq!(std::fs::read(path.join("tracked")).unwrap(), b"base\n");
+        assert!(!path.join("new").exists());
+        assert_eq!(std::fs::read(path.join("ignored")).unwrap(), b"keep\n");
+        let chosen = String::from_utf8(run(path, &["rev-parse", "refs/stash"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        std::fs::write(path.join("tracked"), "other stash\n").unwrap();
+        stash_all(path, "--이름 있는 작업").unwrap();
+        let subjects = String::from_utf8(run(path, &["stash", "list", "--format=%gs"])).unwrap();
+        assert!(subjects.lines().all(|s| s.ends_with("--이름 있는 작업")));
+        let snapshot = feather_git::git::load_initial(path, None).unwrap();
+        assert_eq!(
+            snapshot
+                .references
+                .iter()
+                .filter(|r| r.kind == feather_git::model::RefTab::Stash)
+                .count(),
+            2
+        );
+        assert!(restore_stash(path, "--all").is_err());
+        let head = String::from_utf8(run(path, &["rev-parse", "HEAD"])).unwrap();
+        assert!(restore_stash(path, head.trim()).is_err());
+        assert_eq!(
+            run(path, &["stash", "list", "--format=%gd"])
+                .split(|b| *b == b'\n')
+                .filter(|s| !s.is_empty())
+                .count(),
+            2
+        );
+        let entries = run(path, &["stash", "list", "--format=%H"]);
+        restore_stash(path, &chosen).unwrap();
+        assert_eq!(run(path, &["stash", "list", "--format=%H"]), entries);
+        assert_eq!(run(path, &["status", "--porcelain=v1", "-z"]), before);
+        assert_eq!(run(path, &["show", ":tracked"]), b"staged\n");
+        assert_eq!(std::fs::read(path.join("tracked")).unwrap(), b"unstaged\n");
+        assert_eq!(std::fs::read(path.join("new")).unwrap(), b"untracked\n");
+        std::fs::write(path.join("tracked"), "local edit\n").unwrap();
+        assert!(restore_stash(path, &chosen).is_err());
+        assert_eq!(
+            std::fs::read(path.join("tracked")).unwrap(),
+            b"local edit\n"
+        );
+        assert_eq!(run(path, &["stash", "list", "--format=%H"]), entries);
+        let status = run(path, &["status", "--porcelain=v1", "-z"]);
+        let index = run(path, &["show", ":tracked"]);
+        let newest = String::from_utf8(run(path, &["rev-parse", "stash@{0}"])).unwrap();
+        assert!(delete_stash(path, "stash@{0}", &chosen).is_err());
+        assert!(delete_stash(path, "--all", &chosen).is_err());
+        delete_stash(path, "stash@{1}", &chosen).unwrap();
+        assert!(delete_stash(path, "stash@{1}", &chosen).is_err());
+        assert_eq!(
+            run(path, &["stash", "list", "--format=%H"]),
+            newest.as_bytes()
+        );
+        assert_eq!(run(path, &["status", "--porcelain=v1", "-z"]), status);
+        assert_eq!(run(path, &["show", ":tracked"]), index);
+        assert_eq!(
+            std::fs::read(path.join("tracked")).unwrap(),
+            b"local edit\n"
+        );
+        assert_eq!(std::fs::read(path.join("new")).unwrap(), b"untracked\n");
     }
 }

@@ -36,6 +36,22 @@ pub fn load_initial(path: &Path, selected_commit: Option<&str>) -> Result<Snapsh
     load_snapshot(path, selected_commit, true)
 }
 
+pub fn load_for_refresh(path: &Path, selected_commit: Option<&str>) -> Result<Snapshot> {
+    let mut snapshot = load_initial(path, selected_commit)?;
+    while snapshot.has_more
+        && selected_commit
+            .is_some_and(|selected| !snapshot.commits.iter().any(|commit| commit.id == selected))
+    {
+        let Some(session) = &snapshot.session else {
+            break;
+        };
+        let page = session.next_page()?;
+        snapshot.commits.extend(page.commits);
+        snapshot.has_more = page.has_more;
+    }
+    Ok(snapshot)
+}
+
 fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Result<Snapshot> {
     let repo = open(path).context("Git 저장소를 열 수 없습니다")?;
     let root = repo.workdir().unwrap_or(repo.path()).canonicalize()?;
@@ -112,6 +128,9 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
     let current_branch = repo.head_name()?.map(|n| n.to_string());
     let mut reference_rows: [Vec<usize>; 4] = Default::default();
     for (index, reference) in references.iter().enumerate() {
+        if reference.is_remote_head() {
+            continue;
+        }
         reference_rows[reference.kind.index()].push(index);
     }
     let stage = if repo.workdir().is_some() {
@@ -120,7 +139,11 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
         Vec::new()
     };
     let history_id = selected_commit
-        .filter(|id| commits.iter().any(|c| c.id == *id))
+        .filter(|id| {
+            gix::ObjectId::from_hex(id.as_bytes())
+                .ok()
+                .is_some_and(|id| repo.find_commit(id).is_ok())
+        })
         .or_else(|| commits.first().map(|c| c.id.as_str()));
     let history = match history_id {
         Some(id) => history(&repo, id)?,
@@ -130,6 +153,11 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
     Ok(Snapshot {
         root,
         head,
+        head_commit: if repo.head()?.is_unborn() {
+            None
+        } else {
+            Some(repo.head_id()?.to_string())
+        },
         references,
         commits,
         stage,

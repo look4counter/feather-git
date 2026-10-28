@@ -33,6 +33,9 @@ impl HistorySession {
         let mut branches: HashMap<String, Vec<String>> = HashMap::new();
         let mut tags: HashMap<String, Vec<String>> = HashMap::new();
         for reference in references {
+            if reference.is_remote_head() {
+                continue;
+            }
             let decorations = match reference.kind {
                 RefTab::Local | RefTab::Remote => &mut branches,
                 RefTab::Tag => &mut tags,

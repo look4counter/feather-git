@@ -1,3 +1,4 @@
+use crate::theme;
 use crate::{
     commit_editor::CommitEditor,
     credentials::{self, Gcm, LoginTarget},
@@ -42,8 +43,10 @@ pub struct SettingsPanel {
     email: Entity<CommitEditor>,
     login_url: Entity<CommitEditor>,
     use_global: bool,
+    preferred_global: Option<bool>,
+    global_focus: FocusHandle,
     gcm: Option<Gcm>,
-    helper_configured: bool,
+    _helper_configured: bool,
     account: Option<(String, String)>,
     work: Option<Work>,
     error: Option<String>,
@@ -58,7 +61,11 @@ impl Drop for SettingsPanel {
 }
 
 impl SettingsPanel {
-    pub fn new(repository: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        repository: Option<PathBuf>,
+        preferred_global: Option<bool>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut panel = Self {
             context: GitContext::new(repository),
             tab: SettingsTab::User,
@@ -67,8 +74,10 @@ impl SettingsPanel {
             email: cx.new(|cx| CommitEditor::single_line("", cx)),
             login_url: cx.new(|cx| CommitEditor::single_line("", cx)),
             use_global: true,
+            preferred_global,
+            global_focus: cx.focus_handle(),
             gcm: None,
-            helper_configured: false,
+            _helper_configured: false,
             account: None,
             work: None,
             error: None,
@@ -77,6 +86,10 @@ impl SettingsPanel {
         };
         panel.load(cx);
         panel
+    }
+
+    pub fn use_global_preference(&self) -> Option<bool> {
+        self.snapshot.as_ref().map(|_| self.use_global)
     }
 
     pub fn can_close(&self) -> bool {
@@ -94,19 +107,38 @@ impl SettingsPanel {
     }
 
     pub fn focus_next(&self, backwards: bool, window: &mut Window, cx: &App) {
-        if self.tab != SettingsTab::User || self.work.is_some() {
+        if self.tab != SettingsTab::User || self.work.is_some() || self.is_composing(cx) {
             return;
         }
-        let inputs = [&self.name, &self.email, &self.login_url];
-        let index = inputs
-            .iter()
-            .position(|input| input.read(cx).focus.is_focused(window));
-        let next = match index {
-            Some(index) if backwards => (index + 2) % 3,
-            Some(index) => (index + 1) % 3,
-            None => 0,
-        };
-        inputs[next].read(cx).focus.focus(window);
+        let mut inputs = vec![
+            self.name.read(cx).focus.clone(),
+            self.email.read(cx).focus.clone(),
+        ];
+        if self.context.repository.is_some() {
+            inputs.push(self.global_focus.clone());
+        }
+        inputs.push(self.login_url.read(cx).focus.clone());
+        crate::popup::focus_next(&inputs, backwards, window);
+    }
+
+    fn toggle_global(&mut self, cx: &mut Context<Self>) {
+        if self.work.is_some() || self.context.repository.is_none() {
+            return;
+        }
+        self.use_global = !self.use_global;
+        self.preferred_global = Some(self.use_global);
+        if let Some(snapshot) = &self.snapshot {
+            let identity = if self.use_global {
+                &snapshot.global
+            } else {
+                &snapshot.effective
+            };
+            self.name
+                .update(cx, |editor, cx| editor.set_text(&identity.name, cx));
+            self.email
+                .update(cx, |editor, cx| editor.set_text(&identity.email, cx));
+        }
+        cx.notify();
     }
 
     fn set_work(&mut self, work: Option<Work>, cx: &mut Context<Self>) {
@@ -121,13 +153,17 @@ impl SettingsPanel {
     }
 
     fn apply(&mut self, snapshot: SettingsSnapshot, cx: &mut Context<Self>) {
-        self.use_global = snapshot.use_global;
-        self.name.update(cx, |editor, cx| {
-            editor.set_text(&snapshot.effective.name, cx)
-        });
-        self.email.update(cx, |editor, cx| {
-            editor.set_text(&snapshot.effective.email, cx)
-        });
+        self.use_global = self.context.repository.is_none()
+            || self.preferred_global.unwrap_or(snapshot.use_global);
+        let identity = if self.use_global {
+            &snapshot.global
+        } else {
+            &snapshot.effective
+        };
+        self.name
+            .update(cx, |editor, cx| editor.set_text(&identity.name, cx));
+        self.email
+            .update(cx, |editor, cx| editor.set_text(&identity.email, cx));
         if self.login_url.read(cx).message().is_empty() {
             let target = snapshot
                 .info
@@ -159,7 +195,7 @@ impl SettingsPanel {
             let (snapshot, gcm, configured) = task.await;
             this.update(cx, |this, cx| {
                 this.gcm = gcm;
-                this.helper_configured = configured;
+                this._helper_configured = configured;
                 match snapshot {
                     Ok(snapshot) => this.apply(snapshot, cx),
                     Err(error) => this.error = Some(error.to_string()),
@@ -214,7 +250,8 @@ impl SettingsPanel {
             return;
         }
         let Some(gcm) = self.gcm.clone() else {
-            self.error = Some("Git Credential Manager를 설치한 뒤 설정을 다시 열어 주세요.".into());
+            self.error =
+                Some("사용 가능한 인증 도구가 없습니다. Git 인증 설정을 확인해 주세요.".into());
             cx.notify();
             return;
         };
@@ -275,12 +312,12 @@ impl SettingsPanel {
                 if this.cancel.load(Ordering::Relaxed) { return; }
                 match result {
                     Ok((account, configured)) => {
-                        this.helper_configured = configured;
+                        this._helper_configured = configured;
                         if !matches!(action, AuthAction::Configure) { this.account = account.map(|account| (url, account)); }
                         this.notice = Some(match action {
-                            AuthAction::Configure => "Git에 GCM을 연결했습니다.",
+                            AuthAction::Configure => "Git 인증을 연결했습니다.",
                             AuthAction::Logout => "저장된 로그인을 삭제했습니다. 브라우저 로그인 세션은 유지됩니다.",
-                            _ => "GCM 로그인 정보를 확인했습니다.",
+                            _ => "로그인 정보를 확인했습니다.",
                         }.into());
                     }
                     Err(error) => { this.account = None; this.notice = None; this.error = Some(error.to_string()); }
@@ -290,7 +327,7 @@ impl SettingsPanel {
         }).detach();
     }
 
-    fn user_tab(&self, cx: &Context<Self>) -> Div {
+    fn user_tab(&self, window: &Window, cx: &Context<Self>) -> Div {
         let mut body = div().flex().flex_col().gap_3();
         body = body
             .child(field("이름", self.name.clone()))
@@ -298,67 +335,28 @@ impl SettingsPanel {
             .child(
                 action(
                     "settings-global",
-                    if self.use_global {
-                        "☑ 전역 설정 사용"
-                    } else {
-                        "☐ 현재 저장소 설정 사용"
-                    },
+                    "",
                     self.work.is_none() && self.context.repository.is_some(),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if this.work.is_some() || this.context.repository.is_none() {
-                        return;
-                    }
-                    this.use_global = !this.use_global;
-                    if let Some(snapshot) = &this.snapshot {
-                        let identity = if this.use_global {
-                            &snapshot.global
-                        } else {
-                            &snapshot.effective
-                        };
-                        this.name
-                            .update(cx, |editor, cx| editor.set_text(&identity.name, cx));
-                        this.email
-                            .update(cx, |editor, cx| editor.set_text(&identity.email, cx));
-                    }
-                    cx.notify();
+                .track_focus(&self.global_focus)
+                .when(self.global_focus.is_focused(window), |button| {
+                    button.bg(rgb(theme::SELECT))
+                })
+                .py(px(crate::controls::CHECKBOX_PADDING))
+                .flex()
+                .items_center()
+                .child(crate::controls::checkbox(self.use_global, "전역 설정 사용"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.global_focus.focus(window);
+                    this.toggle_global(cx);
                 })),
             )
-            .child(div().text_xs().text_color(rgb(0x8290a6)).child(
-                if self.context.repository.is_none() {
-                    "새 탭에서는 전역 설정만 편집할 수 있습니다."
-                } else if self.use_global {
-                    "저장하면 현재 저장소의 개별 이름·이메일을 제거하고 전역 값을 사용합니다."
-                } else {
-                    "현재 저장소의 이름·이메일만 저장합니다."
-                },
-            ))
             .child(
-                action(
-                    "settings-save",
-                    "사용자 설정 저장 · ctrl + s",
-                    self.work.is_none() && self.snapshot.is_some(),
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-            )
-            .child(div().mt_3().text_color(rgb(0x5edac1)).child("원격 로그인"));
-        if let Some(gcm) = &self.gcm {
-            body = body.child(div().text_xs().child(format!(
-                "GCM {} · {}",
-                gcm.version,
-                if self.helper_configured {
-                    "Git에 연결됨"
-                } else {
-                    "Git 연결 필요"
-                }
-            )));
-        } else {
-            body = body.child(
                 div()
-                    .text_xs()
-                    .child("Git Credential Manager가 없습니다. 설치 후 설정을 다시 열어 주세요."),
+                    .mt_3()
+                    .text_color(rgb(theme::ACCENT))
+                    .child("원격 로그인"),
             );
-        }
         body = body.child(field(
             "로그인할 HTTPS 저장소 또는 서비스 URL",
             self.login_url.clone(),
@@ -376,12 +374,29 @@ impl SettingsPanel {
             ),
         );
         let enabled = self.work.is_none() && self.gcm.is_some();
-        body = body.child(div().flex().flex_wrap().gap_2()
-            .child(action("settings-auth-status", "상태 확인", enabled).on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Status, cx))))
-            .child(action("settings-auth-login", "브라우저 로그인", enabled).on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Login, cx))))
-            .child(action("settings-auth-logout", "로그아웃", enabled).on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Logout, cx))))
-            .child(action("settings-auth-configure", "Git에 GCM 연결", enabled).on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Configure, cx)))))
-            .child(div().text_xs().text_color(rgb(0x8290a6)).child("인증 정보는 GCM이 관리합니다. 브라우저 로그인 지원은 서비스와 GCM 버전에 따릅니다."));
+        body = body.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    action("settings-auth-status", "상태 확인", enabled)
+                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Status, cx))),
+                )
+                .child(
+                    action("settings-auth-login", "브라우저 로그인", enabled)
+                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Login, cx))),
+                )
+                .child(
+                    action("settings-auth-logout", "로그아웃", enabled)
+                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Logout, cx))),
+                )
+                .child(
+                    action("settings-auth-configure", "Git 연결", enabled).on_click(
+                        cx.listener(|this, _, _, cx| this.auth(AuthAction::Configure, cx)),
+                    ),
+                ),
+        );
         body
     }
 
@@ -410,12 +425,16 @@ impl SettingsPanel {
             let mut entry = div()
                 .p_3()
                 .border_1()
-                .border_color(rgb(0x293343))
+                .border_color(rgb(theme::LINE))
                 .rounded_md()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .child(div().text_color(rgb(0x5edac1)).child(remote.name.clone()));
+                .child(
+                    div()
+                        .text_color(rgb(theme::ACCENT))
+                        .child(remote.name.clone()),
+                );
             for url in &remote.fetch_urls {
                 entry = entry.child(format!("가져오기: {}", display_url(url)));
             }
@@ -427,7 +446,7 @@ impl SettingsPanel {
         body.child(
             div()
                 .text_xs()
-                .text_color(rgb(0x8290a6))
+                .text_color(rgb(theme::MUTED))
                 .child("원격 정보는 읽기 전용입니다."),
         )
     }
@@ -436,7 +455,7 @@ impl SettingsPanel {
 impl Render for SettingsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = if self.tab == SettingsTab::User {
-            self.user_tab(cx)
+            self.user_tab(window, cx)
         } else {
             self.remote_tab()
         };
@@ -454,7 +473,7 @@ impl Render for SettingsPanel {
                     .child(
                         action("settings-user-tab", "사용자", true)
                             .when(self.tab == SettingsTab::User, |tab| {
-                                tab.bg(rgb(0x203d42)).text_color(rgb(0x5edac1))
+                                tab.bg(rgb(theme::SELECT)).text_color(rgb(theme::ACCENT))
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.tab = SettingsTab::User;
@@ -464,7 +483,7 @@ impl Render for SettingsPanel {
                     .child(
                         action("settings-remote-tab", "원격", true)
                             .when(self.tab == SettingsTab::Remote, |tab| {
-                                tab.bg(rgb(0x203d42)).text_color(rgb(0x5edac1))
+                                tab.bg(rgb(theme::SELECT)).text_color(rgb(theme::ACCENT))
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.tab = SettingsTab::Remote;
@@ -489,10 +508,10 @@ impl Render for SettingsPanel {
                 })
             })
             .when_some(self.error.clone(), |panel, error| {
-                panel.child(div().text_sm().text_color(rgb(0xf4a0a8)).child(error))
+                panel.child(div().text_sm().text_color(rgb(theme::ERROR)).child(error))
             })
             .when_some(self.notice.clone(), |panel, notice| {
-                panel.child(div().text_sm().text_color(rgb(0x5edac1)).child(notice))
+                panel.child(div().text_sm().text_color(rgb(theme::ACCENT)).child(notice))
             })
             .when(self.snapshot.is_none() && self.work.is_none(), |panel| {
                 panel.child(
@@ -510,15 +529,15 @@ fn action(id: &'static str, label: &str, enabled: bool) -> Stateful<Div> {
         .py_2()
         .rounded_md()
         .text_sm()
-        .bg(rgb(0x202b39))
-        .text_color(rgb(0xd9e2ed))
+        .bg(rgb(theme::BUTTON))
+        .text_color(rgb(theme::TEXT))
         .when(enabled, |button| {
             button
                 .cursor_pointer()
-                .hover(|button| button.bg(rgb(0x2c4052)))
+                .hover(|button| button.bg(rgb(theme::BUTTON_HOVER)))
         })
         .when(!enabled, |button| button.opacity(0.45))
-        .child(label.to_owned())
+        .when(!label.is_empty(), |button| button.child(label.to_owned()))
 }
 
 fn field(label: &str, editor: Entity<CommitEditor>) -> Div {
@@ -530,9 +549,10 @@ fn field(label: &str, editor: Entity<CommitEditor>) -> Div {
         .child(
             div()
                 .h(px(36.))
+                .overflow_hidden()
                 .flex_shrink_0()
                 .border_1()
-                .border_color(rgb(0x293343))
+                .border_color(rgb(theme::LINE))
                 .rounded_sm()
                 .p_1()
                 .child(editor),

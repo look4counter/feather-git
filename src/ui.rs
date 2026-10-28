@@ -2,6 +2,7 @@ use crate::commit_editor::CommitEditor;
 use crate::history_view::{self, ColumnLayout, RowGraph};
 use crate::layout::{SplitAxis, SplitLayout};
 use crate::settings::SettingsPanel;
+use crate::theme::*;
 use crate::{
     session::{self, Session},
     text_selection::{self, Position, Selection},
@@ -13,11 +14,10 @@ use std::path::PathBuf;
 
 #[derive(Default)]
 struct StartPage {
-    url: String,
+    url_editor: Option<Entity<CommitEditor>>,
     clone_form: bool,
     busy: bool,
     error: Option<String>,
-    select_all: bool,
     recent_scroll: UniformListScrollHandle,
 }
 
@@ -26,6 +26,14 @@ struct CommitDialog {
     editor: Entity<CommitEditor>,
     busy: bool,
     push_after: bool,
+    error: Option<String>,
+}
+
+struct StashDialog {
+    project_id: u64,
+    editor: Option<Entity<CommitEditor>>,
+    deletion: Option<(String, String, String)>,
+    busy: bool,
     error: Option<String>,
 }
 
@@ -38,7 +46,39 @@ struct DiscardDialog {
 
 #[derive(Clone)]
 enum BranchAction {
-    Create { commit: String },
+    Create {
+        commit: String,
+        remote: bool,
+        checkout: bool,
+    },
+    Tag {
+        commit: String,
+    },
+    Delete {
+        plan: crate::branches::DeletePlan,
+        delete_related: bool,
+    },
+    Upload {
+        reference: String,
+        expected: String,
+    },
+    ChooseCheckout {
+        commit: String,
+        candidates: Vec<crate::branches::CheckoutCandidate>,
+        selected: usize,
+    },
+    Reset {
+        commit: String,
+        mode: crate::branches::ResetMode,
+    },
+    Revert {
+        commit: String,
+        no_commit: bool,
+    },
+    Integrate {
+        kind: crate::branches::IntegrateKind,
+        commit: String,
+    },
     Track(crate::branches::CheckoutTarget),
 }
 
@@ -50,34 +90,48 @@ struct BranchDialog {
     error: Option<String>,
 }
 
-const BG: u32 = 0x10151d;
-const PANEL: u32 = 0x151c26;
-const LINE: u32 = 0x293343;
-const TEXT: u32 = 0xd9e2ed;
-const MUTED: u32 = 0x8290a6;
-const ACCENT: u32 = 0x5edac1;
-const SELECT: u32 = 0x203d42;
-const SELECT_INACTIVE: u32 = 0x303844;
 const TAB_BAR_HEIGHT: f32 = 44.;
 const SCROLLBAR: f32 = 12.;
 const RECENT_ROW_HEIGHT: f32 = 40.;
 
-fn branch_click_interval() -> std::time::Duration {
-    #[cfg(windows)]
-    let millis =
-        unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() } as u64;
-    #[cfg(not(windows))]
-    let millis = 500;
-    std::time::Duration::from_millis(millis + 30)
+fn navigation_key(key: &str) -> &str {
+    match key {
+        "i" | "I" => "up",
+        "j" | "J" => "left",
+        "k" | "K" => "down",
+        "l" | "L" => "right",
+        _ => key,
+    }
 }
+
+fn candidate_shortcut(key: &str) -> Option<usize> {
+    match key {
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+            key.parse::<usize>().ok().map(|n| n - 1)
+        }
+        "0" => Some(9),
+        _ => None,
+    }
+}
+
 type ListKey = (u64, u8);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ListFocus {
     Branches(u64),
     Files(u64),
     History(u64),
     Text(ListKey),
+}
+
+fn section_focus(key: &str, id: u64, details: bool) -> Option<ListFocus> {
+    match key {
+        "1" => Some(ListFocus::Branches(id)),
+        "2" => Some(ListFocus::History(id)),
+        "3" => Some(ListFocus::Files(id)),
+        "4" => Some(ListFocus::Text((id, if details { 31 } else { 30 }))),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -136,19 +190,31 @@ impl WorkspaceTab {
 
 pub struct Workspace {
     state_path: Option<PathBuf>,
+    popup_options: session::PopupOptions,
     recent: Vec<PathBuf>,
     pending: usize,
     staging: HashSet<u64>,
     remote_status: Option<(u64, &'static str)>,
     help: bool,
+    shortcut_settings: bool,
+    shortcut_tab: usize,
+    shortcut_draft: Option<crate::shortcut::Bindings>,
+    shortcuts: crate::shortcut::Bindings,
+    shortcut_capture: Option<(String, usize)>,
+    shortcut_message: Option<String>,
     settings: Option<Entity<SettingsPanel>>,
     branch_dialog: Option<BranchDialog>,
     branch_busy: bool,
+    focus_after_popup: bool,
     commit_dialog: Option<CommitDialog>,
     discard_dialog: Option<DiscardDialog>,
+    stash_dialog: Option<StashDialog>,
     delete_target: Option<PathBuf>,
     delete_confirm: bool,
     focus: FocusHandle,
+    branch_checks_focus: [FocusHandle; 2],
+    commit_push_focus: FocusHandle,
+    reset_mode_focus: FocusHandle,
     list_focus: Option<ListFocus>,
     text_selection: Option<(ListKey, Selection)>,
     text_drag: bool,
@@ -164,7 +230,6 @@ pub struct Workspace {
     body_bounds: Bounds<Pixels>,
     resize_drag: Option<(SplitAxis, Pixels)>,
     start_pages: HashMap<u64, StartPage>,
-    url_focus: FocusHandle,
     graphs: HashMap<u64, HashMap<usize, RowGraph>>,
     history_scroll: HashMap<u64, UniformListScrollHandle>,
     grid_columns: ColumnLayout,
@@ -182,6 +247,7 @@ pub struct Workspace {
 }
 
 fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Stateful<Div> {
+    let label: SharedString = label.into();
     div()
         .id(id)
         .px_3()
@@ -191,8 +257,10 @@ fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool
         .text_sm()
         .bg(rgb(if active { SELECT } else { PANEL }))
         .text_color(rgb(if active { ACCENT } else { MUTED }))
-        .hover(|s| s.bg(rgb(0x263443)).text_color(rgb(TEXT)))
-        .child(label.into())
+        .hover(|s| s.bg(rgb(HOVER)).text_color(rgb(TEXT)))
+        .when(!label.is_empty(), |button| {
+            button.child(crate::shortcut::label(label.as_ref()))
+        })
 }
 
 fn panel() -> Div {
@@ -212,6 +280,103 @@ fn empty(message: &str) -> Div {
         .text_sm()
         .text_color(rgb(MUTED))
         .child(message.to_owned())
+}
+
+fn current_branch_dot(slot: f32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let center = bounds.origin + point(bounds.size.width / 2., bounds.size.height / 2.);
+            window.paint_quad(quad(
+                Bounds::new(center - point(px(5.), px(5.)), size(px(10.), px(10.))),
+                px(5.),
+                rgb(ACCENT),
+                px(0.),
+                rgb(ACCENT),
+                Default::default(),
+            ));
+        },
+    )
+    .size(px(slot))
+    .flex_shrink_0()
+}
+
+fn commit_icon() -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        |bounds, _, window, _| {
+            let center = bounds.origin + point(px(6.), px(6.));
+            let mut path = PathBuilder::stroke(px(1.2));
+            path.move_to(bounds.origin + point(px(0.), px(6.)));
+            path.line_to(bounds.origin + point(px(3.), px(6.)));
+            path.move_to(bounds.origin + point(px(9.), px(6.)));
+            path.line_to(bounds.origin + point(px(12.), px(6.)));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(MUTED));
+            }
+            window.paint_quad(quad(
+                Bounds::new(center - point(px(3.), px(3.)), size(px(6.), px(6.))),
+                px(3.),
+                rgb(PANEL),
+                px(1.2),
+                rgb(MUTED),
+                Default::default(),
+            ));
+        },
+    )
+    .w(px(12.))
+    .h(px(12.))
+    .flex_shrink_0()
+}
+
+fn reference_badge_icon(tag: bool, tint: u32) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let mut path = PathBuilder::stroke(px(1.2));
+            let origin = bounds.origin;
+            if tag {
+                let points = [(1., 1.), (5., 1.), (10., 6.), (6., 10.), (1., 5.), (1., 1.)];
+                path.move_to(origin + point(px(points[0].0), px(points[0].1)));
+                for (x, y) in &points[1..] {
+                    path.line_to(origin + point(px(*x), px(*y)));
+                }
+            } else {
+                path.move_to(origin + point(px(3.), px(2.)));
+                path.line_to(origin + point(px(3.), px(9.)));
+                path.move_to(origin + point(px(3.), px(7.)));
+                path.cubic_bezier_to(
+                    origin + point(px(9.), px(3.)),
+                    origin + point(px(8.), px(7.)),
+                    origin + point(px(9.), px(6.)),
+                );
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(tint));
+            }
+            let dots: &[(f32, f32)] = if tag {
+                &[(3., 3.)]
+            } else {
+                &[(3., 2.), (3., 9.), (9., 3.)]
+            };
+            for (x, y) in dots {
+                window.paint_quad(quad(
+                    Bounds::new(
+                        origin + point(px(*x - 1.), px(*y - 1.)),
+                        size(px(2.), px(2.)),
+                    ),
+                    px(1.),
+                    rgb(tint),
+                    px(0.),
+                    rgb(tint),
+                    Default::default(),
+                ));
+            }
+        },
+    )
+    .w(px(11.))
+    .h(px(11.))
+    .flex_shrink_0()
 }
 
 fn trash_icon() -> impl IntoElement {
@@ -240,112 +405,257 @@ fn trash_icon() -> impl IntoElement {
     .size(px(18.))
 }
 
-fn shortcut_help(window: &Window) -> Stateful<Div> {
-    let sections: &[(&str, &[&str])] = &[
-        (
-            "공통",
-            &[
-                "f - 패치",
-                "f5 - 새로고침",
-                "ctrl + r - 새로고침",
-                "c - 커밋",
-                "p - 풀",
-                "shift + p - 푸시",
-                "? - 도움말",
-                "f12 - 세팅",
-                "esc - 도움말 닫기",
-            ],
-        ),
-        ("브랜치", &[]),
-        ("커밋히스토리", &["b - 선택 커밋에 브랜치 만들기"]),
-        (
-            "파일목록",
-            &[
-                "shift + ↑ - 위로 범위 선택",
-                "shift + ↓ - 아래로 범위 선택",
-                "ctrl + a - 전체 선택",
-                "space - 선택 파일 stage / unstage",
-                "d - 선택 파일 변경사항 폐기 확인",
-            ],
-        ),
-        (
-            "텍스트뷰어",
-            &[
-                "방향키 - 커서 이동",
-                "home - 줄 처음으로 이동",
-                "end - 줄 끝으로 이동",
-                "shift + 방향키 - 선택 확장",
-                "shift + home - 줄 처음까지 선택",
-                "shift + end - 줄 끝까지 선택",
-                "ctrl + a - 전체 선택",
-                "ctrl + c - 복사",
-            ],
-        ),
-    ];
-    let mut help = div()
-        .id("shortcut-help")
-        .flex()
-        .flex_col()
-        .gap_3()
-        .max_h(window.viewport_size().height - px(120.))
-        .overflow_y_scroll();
-    for &(title, shortcuts) in sections {
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .flex_shrink_0()
-            .gap_1()
-            .child(div().text_color(rgb(ACCENT)).child(title));
-        if title == "공통" {
-            section = section.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("입력창과 확인창에서는 제외"),
-            );
-        } else if title == "파일목록" {
-            section = section.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("stage 파일목록 포커스 필요"),
-            );
-        } else if title == "텍스트뷰어" {
-            section = section.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("텍스트뷰어 포커스 필요"),
-            );
-        }
-        if shortcuts.is_empty() {
-            section = section.child(div().text_color(rgb(MUTED)).child("표시할 단축키 없음"));
-        }
-        for &shortcut in shortcuts {
-            section = section.child(shortcut);
-        }
-        help = help.child(section);
-    }
-    help
-}
-
 impl Workspace {
+    fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_draft = Some(self.shortcuts.clone());
+        self.shortcut_settings = true;
+        self.shortcut_tab = 0;
+        self.shortcut_capture = None;
+        self.shortcut_message = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shortcut_settings = false;
+        self.shortcut_draft = None;
+        self.shortcut_capture = None;
+        self.shortcut_message = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn apply_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.shortcut_draft else {
+            return;
+        };
+        let Some(path) = &self.state_path else {
+            self.shortcut_message = Some("설정 저장 경로를 사용할 수 없습니다.".into());
+            cx.notify();
+            return;
+        };
+        let mut state = self.session_state();
+        match session::save_shortcuts(path, &mut state, draft) {
+            Ok(()) => {
+                self.shortcuts = state.shortcuts;
+                self.close_shortcuts(window, cx);
+            }
+            Err(error) => {
+                self.shortcut_message = Some(format!("단축키 저장 실패: {error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    fn shortcuts_link(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("show-shortcuts")
+            .ml_3()
+            .text_xs()
+            .text_color(rgb(ACCENT))
+            .cursor_pointer()
+            .child(crate::shortcut::hint(
+                "단축키",
+                &self.shortcuts.label("shortcuts"),
+            ))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_shortcuts(window, cx);
+            }))
+    }
+
+    fn shortcuts_table(&self, editable: bool, cx: &mut Context<Self>) -> Div {
+        let mut table = div().flex().flex_col().gap_3();
+        if editable {
+            let mut tabs = div().flex().flex_wrap().gap_1();
+            for (index, group) in crate::shortcut::GROUPS.into_iter().enumerate() {
+                tabs = tabs.child(
+                    button(("shortcut-tab", index), group, self.shortcut_tab == index).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.shortcut_tab = index;
+                            this.shortcut_capture = None;
+                            this.shortcut_message = None;
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+            table = table.child(tabs);
+            if let Some(message) = &self.shortcut_message {
+                table = table.child(div().text_color(rgb(ACCENT)).child(message.clone()));
+            }
+        }
+        let bindings = if editable {
+            self.shortcut_draft.as_ref().unwrap_or(&self.shortcuts)
+        } else {
+            &self.shortcuts
+        };
+        let commands = crate::shortcut::commands();
+        for (index, group) in crate::shortcut::GROUPS.into_iter().enumerate() {
+            if editable && self.shortcut_tab != index {
+                continue;
+            }
+            for subsection in crate::shortcut::subsections(group).iter().copied() {
+                let mut section = div()
+                    .flex()
+                    .flex_col()
+                    .flex_shrink_0()
+                    .gap_1()
+                    .when(!editable || !subsection.is_empty(), |section| {
+                        let heading = if editable {
+                            subsection.to_owned()
+                        } else if subsection.is_empty() {
+                            group.to_owned()
+                        } else {
+                            format!("{group} / {subsection}")
+                        };
+                        section.child(
+                            div()
+                                .text_color(rgb(ACCENT))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(heading),
+                        )
+                    })
+                    .when(!editable, |section| {
+                        section.child(
+                            div()
+                                .flex()
+                                .border_b_1()
+                                .border_color(rgb(LINE))
+                                .bg(rgb(0xe5e7eb))
+                                .text_color(rgb(TEXT))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .py_2()
+                                .child(div().flex_1().child("기능"))
+                                .child(div().w(px(210.)).child("단축키1"))
+                                .child(div().w(px(210.)).child("단축키2")),
+                        )
+                    });
+                let section_commands: Vec<_> = commands
+                    .iter()
+                    .filter(|c| {
+                        c.group == group
+                            && crate::shortcut::list_visible(c)
+                            && crate::shortcut::in_subsection(c, subsection)
+                    })
+                    .collect();
+                if section_commands.is_empty() {
+                    section = section.child(
+                        div()
+                            .py_2()
+                            .text_color(rgb(MUTED))
+                            .child("등록된 단축키 없음"),
+                    );
+                }
+                for command in section_commands {
+                    let mut row = div()
+                        .flex()
+                        .items_center()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(rgb(LINE))
+                        .child(div().flex_1().min_w_0().child(command.name.clone()));
+                    for (slot, value) in bindings.slots(command).into_iter().enumerate() {
+                        let id = command.id.clone();
+                        let clearing_id = id.clone();
+                        let capturing = self
+                            .shortcut_capture
+                            .as_ref()
+                            .is_some_and(|(selected, index)| selected == &id && *index == slot);
+                        let label = if capturing {
+                            "키 입력…".into()
+                        } else if value.is_empty() {
+                            "미지정".into()
+                        } else {
+                            value.replace("-", " + ")
+                        };
+                        let mut cell = div().w(px(210.)).flex().items_center().gap_1();
+                        if editable {
+                            cell = cell
+                                .child(
+                                    button(
+                                        (
+                                            SharedString::from(format!("key-{subsection}-{id}")),
+                                            slot,
+                                        ),
+                                        "",
+                                        capturing,
+                                    )
+                                    .child(crate::shortcut::badge(&label))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.shortcut_capture = Some((id.clone(), slot));
+                                            this.shortcut_message = None;
+                                            this.focus.focus(window);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    button(
+                                        (
+                                            SharedString::from(format!(
+                                                "clear-{subsection}-{clearing_id}"
+                                            )),
+                                            slot,
+                                        ),
+                                        "×",
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if let Some(draft) = &mut this.shortcut_draft
+                                                && draft
+                                                    .set(&clearing_id, slot, String::new())
+                                                    .is_ok()
+                                            {
+                                                this.shortcut_capture = None;
+                                                this.shortcut_message = None;
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
+                                );
+                        } else {
+                            cell = cell.child(crate::shortcut::badge(&label));
+                        }
+                        row = row.child(cell);
+                    }
+                    section = section.child(row);
+                }
+                table = table.child(section);
+            }
+        }
+        table
+    }
+
     pub fn new(paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             state_path: session::state_path().ok(),
+            popup_options: session::PopupOptions::default(),
             recent: Vec::new(),
             pending: 0,
             staging: HashSet::new(),
             remote_status: None,
             help: false,
+            shortcut_settings: false,
+            shortcut_tab: 0,
+            shortcut_draft: None,
+            shortcuts: crate::shortcut::Bindings::default(),
+            shortcut_capture: None,
+            shortcut_message: None,
             settings: None,
             branch_dialog: None,
             branch_busy: false,
+            focus_after_popup: false,
             commit_dialog: None,
             discard_dialog: None,
+            stash_dialog: None,
             delete_target: None,
             delete_confirm: false,
             focus: cx.focus_handle(),
+            branch_checks_focus: [cx.focus_handle(), cx.focus_handle()],
+            commit_push_focus: cx.focus_handle(),
+            reset_mode_focus: cx.focus_handle(),
             list_focus: None,
             text_selection: None,
             text_drag: false,
@@ -361,7 +671,6 @@ impl Workspace {
             body_bounds: Bounds::default(),
             resize_drag: None,
             start_pages: HashMap::new(),
-            url_focus: cx.focus_handle(),
             graphs: HashMap::new(),
             history_scroll: HashMap::new(),
             grid_columns: ColumnLayout::default(),
@@ -405,6 +714,8 @@ impl Workspace {
                 if !can_save {
                     this.state_path = None;
                 }
+                this.shortcuts = state.shortcuts;
+                this.popup_options = state.popup_options;
                 this.recent = state.recent;
                 for path in state.tabs {
                     let id = this.next_id;
@@ -434,12 +745,11 @@ impl Workspace {
         .detach();
     }
 
-    fn persist(&mut self) {
-        let Some(path) = &self.state_path else {
-            return;
-        };
-        let state = Session {
+    fn session_state(&self) -> Session {
+        Session {
             version: 1,
+            popup_options: self.popup_options.clone(),
+            shortcuts: self.shortcuts.clone(),
             tabs: self
                 .tabs
                 .iter()
@@ -451,7 +761,14 @@ impl Workspace {
                 .position(|tab| Some(tab.id()) == self.active)
                 .unwrap_or(0),
             recent: self.recent.clone(),
+        }
+    }
+
+    fn persist(&mut self) {
+        let Some(path) = &self.state_path else {
+            return;
         };
+        let state = self.session_state();
         if let Err(error) = session::save(path, &state) {
             self.error = Some(format!("{error:#}"));
         }
@@ -545,6 +862,7 @@ impl Workspace {
             && self.delete_target.is_none()
             && self.commit_dialog.is_none()
             && self.discard_dialog.is_none()
+            && self.stash_dialog.is_none()
             && self.active
                 == Some(match section {
                     ListFocus::Branches(id) | ListFocus::Files(id) | ListFocus::History(id) => id,
@@ -562,7 +880,171 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        let key = &event.keystroke;
+        if self.shortcut_settings {
+            let key = &event.keystroke;
+            if let Some((id, slot)) = self.shortcut_capture.clone() {
+                if key.key == "escape" {
+                    self.shortcut_capture = None;
+                    self.shortcut_message = None;
+                } else if !["shift", "control", "ctrl", "alt", "cmd", "fn"]
+                    .contains(&key.key.as_str())
+                    && let Some(draft) = &mut self.shortcut_draft
+                {
+                    match draft.set(&id, slot, crate::shortcut::chord(key)) {
+                        Ok(()) => {
+                            self.shortcut_capture = None;
+                            self.shortcut_message = None;
+                        }
+                        Err(error) => self.shortcut_message = Some(error),
+                    }
+                }
+            } else if let Some(action) = self.shortcuts.resolve("modal", key) {
+                if action.key == "escape" {
+                    self.close_shortcuts(window, cx);
+                } else if action.key == "enter" {
+                    self.apply_shortcuts(window, cx);
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let scope = if self.settings.is_some() {
+            "settings-modal"
+        } else if self.commit_dialog.is_some() {
+            "commit-modal"
+        } else if self.discard_dialog.is_some() {
+            "discard-modal"
+        } else if self.stash_dialog.is_some() {
+            "stash-modal"
+        } else if let Some(dialog) = &self.branch_dialog {
+            match dialog.action {
+                BranchAction::ChooseCheckout { .. } => "checkout",
+                BranchAction::Reset { .. } => "reset",
+                _ => "branch",
+            }
+        } else if self.help || self.delete_target.is_some() {
+            "modal"
+        } else {
+            if self
+                .active
+                .and_then(|id| self.start_pages.get(&id))
+                .and_then(|page| page.url_editor.as_ref())
+                .is_some_and(|editor| editor.read(cx).focus.is_focused(window))
+            {
+                "clone"
+            } else {
+                match self.list_focus {
+                    Some(ListFocus::Branches(id))
+                        if self.project().is_some_and(|project| {
+                            project.id == id && project.ref_tab == RefTab::Local
+                        }) =>
+                    {
+                        "local-branches"
+                    }
+                    Some(ListFocus::Branches(_)) => "branches",
+                    Some(ListFocus::History(_)) => "history",
+                    Some(ListFocus::Files(id))
+                        if self.project().is_some_and(|project| {
+                            project.id == id && project.file_tab == FileTab::Stage
+                        }) =>
+                    {
+                        "stage-files"
+                    }
+                    Some(ListFocus::Files(_)) => "files",
+                    Some(ListFocus::Text(_)) => "viewer",
+                    None => "main",
+                }
+            }
+        };
+        let Some(mapped_key) = self.shortcuts.resolve(scope, &event.keystroke) else {
+            return;
+        };
+        let key = &mapped_key;
+        if key.key == "f11" && scope != "modal" {
+            self.open_shortcuts(window, cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
+        if key.key == "tab"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && (self.settings.is_some()
+                || self.branch_dialog.is_some()
+                || self.stash_dialog.is_some()
+                || self.commit_dialog.is_some()
+                || self.help
+                || self.delete_target.is_some()
+                || self.discard_dialog.is_some())
+        {
+            if let Some(settings) = &self.settings {
+                settings
+                    .read(cx)
+                    .focus_next(key.modifiers.shift, window, cx);
+            } else {
+                let mut inputs = Vec::new();
+                let mut blocked = false;
+                if let Some(dialog) = &self.branch_dialog {
+                    if let Some(editor) = &dialog.editor {
+                        blocked = editor.read(cx).is_composing();
+                        inputs.push(editor.read(cx).focus.clone());
+                    }
+                    if matches!(dialog.action, BranchAction::Reset { .. }) {
+                        inputs.push(self.reset_mode_focus.clone());
+                    }
+                    if matches!(dialog.action, BranchAction::Revert { .. })
+                        || matches!(&dialog.action, BranchAction::Delete { plan, .. } if !plan.related.is_empty())
+                    {
+                        inputs.push(self.branch_checks_focus[0].clone());
+                    }
+                    if matches!(dialog.action, BranchAction::Create { .. }) {
+                        inputs.extend(self.branch_checks_focus.iter().cloned());
+                    }
+                } else if let Some(dialog) = &self.stash_dialog {
+                    blocked = dialog.busy;
+                    if let Some(editor) = &dialog.editor {
+                        blocked |= editor.read(cx).is_composing();
+                        inputs.push(editor.read(cx).focus.clone());
+                    }
+                } else if let Some(dialog) = &self.commit_dialog {
+                    blocked = dialog.busy || dialog.editor.read(cx).is_composing();
+                    inputs.push(dialog.editor.read(cx).focus.clone());
+                    inputs.push(self.commit_push_focus.clone());
+                }
+                if !blocked {
+                    crate::popup::focus_next(&inputs, key.modifiers.shift, window);
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if let Some(dialog) = &self.stash_dialog {
+            if dialog.busy {
+                cx.stop_propagation();
+                return;
+            }
+            if dialog
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.read(cx).is_composing())
+            {
+                return;
+            }
+            if key.key == "enter" {
+                self.stash_changes(cx);
+                cx.stop_propagation();
+            } else if key.key == "escape" {
+                self.stash_dialog = None;
+                self.focus.focus(window);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
         if let Some(dialog) = &self.discard_dialog {
             if !dialog.busy && key.modifiers.control && key.key == "s" {
                 self.discard_selected(cx);
@@ -582,8 +1064,19 @@ impl Workspace {
                 cx.stop_propagation();
                 return;
             }
-            if key.modifiers.control && (key.key == "s" || key.key == "p") {
-                self.submit_commit(key.key == "p", cx);
+            if dialog.editor.read(cx).is_composing() {
+                return;
+            }
+            if key.key == "space" && self.commit_push_focus.is_focused(window) {
+                if let Some(dialog) = &mut self.commit_dialog {
+                    dialog.push_after = !dialog.push_after;
+                }
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.modifiers.control && key.key == "s" {
+                self.submit_commit(cx);
                 cx.stop_propagation();
                 return;
             }
@@ -614,6 +1107,125 @@ impl Workspace {
             return;
         }
         if let Some(dialog) = &self.branch_dialog {
+            if key.key == "space"
+                && !dialog
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.read(cx).is_composing())
+                && let Some(index) = self
+                    .branch_checks_focus
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+            {
+                let changed = if let Some(dialog) = &mut self.branch_dialog {
+                    match &mut dialog.action {
+                        BranchAction::Revert { no_commit, .. } if index == 0 => {
+                            *no_commit = !*no_commit;
+                            self.popup_options.revert_no_commit = *no_commit;
+                            true
+                        }
+                        BranchAction::Delete {
+                            plan,
+                            delete_related,
+                        } if index == 0 && !plan.related.is_empty() => {
+                            *delete_related = !*delete_related;
+                            true
+                        }
+                        BranchAction::Create {
+                            remote, checkout, ..
+                        } => {
+                            if index == 0 {
+                                *remote = !*remote;
+                            } else {
+                                *checkout = !*checkout;
+                            }
+                            self.popup_options.branch_remote = *remote;
+                            self.popup_options.branch_checkout = *checkout;
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if changed {
+                    self.persist();
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
+            let Some(dialog) = &self.branch_dialog else {
+                return;
+            };
+            if matches!(dialog.action, BranchAction::ChooseCheckout { .. })
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.shift
+                && !key.modifiers.platform
+                && let Some(index) = candidate_shortcut(&key.key)
+            {
+                self.choose_checkout_candidate(index, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if self.branch_busy {
+                cx.stop_propagation();
+                return;
+            }
+            if let BranchAction::Reset { mode, .. } = &dialog.action {
+                let digit = if !key.modifiers.control
+                    && !key.modifiers.alt
+                    && !key.modifiers.shift
+                    && !key.modifiers.platform
+                {
+                    match key.key.as_str() {
+                        "1" => Some(0),
+                        "2" => Some(1),
+                        "3" => Some(2),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let direction = navigation_key(&key.key);
+                let index = crate::branches::ResetMode::ALL
+                    .iter()
+                    .position(|m| m == mode)
+                    .unwrap_or(0);
+                let next = digit.or_else(|| {
+                    if self.reset_mode_focus.is_focused(window) {
+                        match direction {
+                            "up" | "left" => Some((index + 2) % 3),
+                            "down" | "right" => Some((index + 1) % 3),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                });
+                if let Some(next) = next {
+                    if let Some(dialog) = &mut self.branch_dialog
+                        && let BranchAction::Reset { mode, .. } = &mut dialog.action
+                    {
+                        *mode = crate::branches::ResetMode::ALL[next];
+                    }
+                    self.reset_mode_focus.focus(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if self.reset_mode_focus.is_focused(window) && key.key == "space" {
+                    cx.stop_propagation();
+                    return;
+                }
+            }
+            if matches!(dialog.action, BranchAction::Revert { .. })
+                && self.branch_checks_focus[0].is_focused(window)
+                && key.key == "space"
+            {
+                return;
+            }
             let composing = dialog
                 .editor
                 .as_ref()
@@ -624,7 +1236,11 @@ impl Workspace {
             } else if !composing
                 && (key.key == "enter" || (key.modifiers.control && key.key == "s"))
             {
-                self.submit_branch(cx);
+                if let BranchAction::ChooseCheckout { selected, .. } = dialog.action {
+                    self.choose_checkout_candidate(selected, cx);
+                } else {
+                    self.submit_branch(cx);
+                }
                 cx.stop_propagation();
             }
             return;
@@ -647,7 +1263,18 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.url_focus.is_focused(window) {
+        if let Some(editor) = self
+            .active
+            .and_then(|id| self.start_pages.get(&id))
+            .and_then(|page| page.url_editor.as_ref())
+            && editor.read(cx).focus.is_focused(window)
+        {
+            if key.key == "enter" && !editor.read(cx).is_composing() {
+                if let Some(id) = self.active {
+                    self.start_repository(id, 2, cx);
+                }
+                cx.stop_propagation();
+            }
             return;
         }
         if !key.modifiers.alt
@@ -663,6 +1290,101 @@ impl Workspace {
             return;
         }
         if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
+            if !key.modifiers.shift
+                && let Some(project) = self.project()
+                && let Some(section) = section_focus(
+                    &key.key,
+                    project.id,
+                    project.file_tab == FileTab::History && project.show_commit_detail,
+                )
+            {
+                self.list_focus = Some(section);
+                self.text_drag = false;
+                if let ListFocus::Text(text_key) = section
+                    && self
+                        .text_selection
+                        .as_ref()
+                        .is_none_or(|(selected, _)| *selected != text_key)
+                {
+                    self.text_selection = Some((
+                        text_key,
+                        Selection {
+                            anchor: Position::default(),
+                            cursor: Position::default(),
+                        },
+                    ));
+                }
+                self.focus.focus(window);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+
+            if key.key == "o" && !key.modifiers.shift {
+                if let Some(project) = self.project() {
+                    let id = project.id;
+                    if self.list_focus == Some(ListFocus::History(id)) {
+                        if let Some(commit) = project.commit.clone() {
+                            self.checkout_history_commit(id, commit, cx);
+                        }
+                    } else if self.list_focus == Some(ListFocus::Branches(id)) {
+                        let selected = project
+                            .revision
+                            .as_ref()
+                            .or(project.snapshot.current_branch.as_ref());
+                        let reference = project
+                            .snapshot
+                            .references
+                            .iter()
+                            .find(|reference| {
+                                reference.kind == project.ref_tab
+                                    && Some(&reference.revision) == selected
+                            })
+                            .cloned();
+                        if let Some(reference) = reference {
+                            match reference.kind {
+                                RefTab::Stash => {
+                                    self.restore_stash_reference(id, reference.revision, cx)
+                                }
+                                RefTab::Tag => self.checkout_reference(id, reference.target, cx),
+                                _ => self.checkout_reference(id, reference.revision, cx),
+                            }
+                        }
+                    }
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if matches!(key.key.as_str(), "v" | "m" | "r") && !key.modifiers.shift {
+                self.open_history_operation(&key.key, window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "x" && !key.modifiers.shift {
+                self.open_reset(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "u" && !key.modifiers.shift {
+                self.open_branch_upload(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if key.key == "t" && !key.modifiers.shift {
+                self.open_branch_create(window, cx);
+                if let Some(dialog) = &mut self.branch_dialog
+                    && let BranchAction::Create { commit, .. } = &dialog.action
+                {
+                    dialog.action = BranchAction::Tag {
+                        commit: commit.clone(),
+                    };
+                    if let Some(editor) = &dialog.editor {
+                        editor.update(cx, |editor, _| editor.text_size = 14.);
+                    }
+                }
+                cx.stop_propagation();
+                return;
+            }
             if key.key == "b" && !key.modifiers.shift {
                 self.open_branch_create(window, cx);
                 cx.stop_propagation();
@@ -674,18 +1396,36 @@ impl Workspace {
                 cx.notify();
                 return;
             }
+            if key.key == "s" && !key.modifiers.shift && scope == "stage-files" {
+                self.open_stash(window, cx);
+                cx.stop_propagation();
+                return;
+            }
             if key.key == "f" {
                 self.remote_operation(crate::setup::RemoteOperation::Fetch, cx);
                 cx.stop_propagation();
                 return;
             }
-            if key.key == "c" {
+            if key.key == "c" && scope == "stage-files" {
                 self.open_commit(window, cx);
                 cx.stop_propagation();
                 return;
             }
-            if key.key == "d" {
-                self.open_discard(window, cx);
+            if key.key.eq_ignore_ascii_case("d") {
+                if self
+                    .project()
+                    .is_some_and(|p| self.list_focus == Some(ListFocus::Branches(p.id)))
+                {
+                    if self.project().is_some_and(|p| p.ref_tab == RefTab::Stash) {
+                        if !key.modifiers.shift {
+                            self.open_stash_delete(window, cx);
+                        }
+                    } else {
+                        self.open_reference_delete(window, cx);
+                    }
+                } else if !key.modifiers.shift {
+                    self.open_discard(window, cx);
+                }
                 cx.stop_propagation();
                 return;
             }
@@ -700,6 +1440,11 @@ impl Workspace {
                 return;
             }
         }
+        let nav_key = if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
+            navigation_key(&key.key)
+        } else {
+            key.key.as_str()
+        };
         if let Some(ListFocus::Text(text_key)) = self.list_focus {
             if Some(text_key.0) != self.active {
                 return;
@@ -716,9 +1461,8 @@ impl Workspace {
                         row: lines.len().saturating_sub(1),
                         column: lines.last().map_or(0, |line| line.chars().count()),
                     };
-                } else if ["up", "down", "left", "right", "home", "end"].contains(&key.key.as_str())
-                {
-                    selection.move_cursor(&lines, &key.key, key.modifiers.shift);
+                } else if ["up", "down", "left", "right", "home", "end"].contains(&nav_key) {
+                    selection.move_cursor(&lines, nav_key, key.modifiers.shift);
                     if let Some(scroll) = self.list_scroll.get(&text_key) {
                         scroll.scroll_to_item(selection.cursor.row, ScrollStrategy::Center);
                     }
@@ -750,15 +1494,33 @@ impl Workspace {
             && !key.modifiers.shift
             && (key.key == "space" || key.key_char.as_deref() == Some(" "))
         {
-            self.stage_selected(cx);
+            if let Some(project) = self
+                .project()
+                .filter(|p| self.list_focus == Some(ListFocus::Branches(p.id)))
+            {
+                let selected = project
+                    .revision
+                    .as_ref()
+                    .or(project.snapshot.current_branch.as_ref());
+                let reference = project
+                    .snapshot
+                    .references
+                    .iter()
+                    .find(|reference| {
+                        reference.kind == project.ref_tab && Some(&reference.revision) == selected
+                    })
+                    .cloned();
+                if let Some(reference) = reference {
+                    self.select_reference(reference.revision, reference.target, None, cx);
+                }
+            } else {
+                self.stage_selected(cx);
+            }
             cx.stop_propagation();
             return;
         }
-        if !key.modifiers.control
-            && !key.modifiers.alt
-            && ["up", "down"].contains(&key.key.as_str())
-        {
-            self.navigate(key.key == "down", key.modifiers.shift, cx);
+        if !key.modifiers.control && !key.modifiers.alt && ["up", "down"].contains(&nav_key) {
+            self.navigate(nav_key == "down", key.modifiers.shift, cx);
             cx.stop_propagation();
         }
     }
@@ -787,7 +1549,11 @@ impl Workspace {
                     if let Some(scroll) = self.list_scroll.get(&(id, 10 + kind as u8)) {
                         scroll.scroll_to_item(index, ScrollStrategy::Center);
                     }
-                    self.select_reference(reference.revision, reference.target, None, cx);
+                    if let Some(project) = self.project_mut() {
+                        project.revision = Some(reference.revision);
+                        project.history_target = None;
+                    }
+                    cx.notify();
                 }
             }
             ListFocus::History(project) if project == id => {
@@ -925,11 +1691,11 @@ impl Workspace {
         cx.notify();
     }
 
-    fn submit_commit(&mut self, push_after: bool, cx: &mut Context<Self>) {
+    fn submit_commit(&mut self, cx: &mut Context<Self>) {
         let Some(dialog) = &mut self.commit_dialog else {
             return;
         };
-        if dialog.busy {
+        if dialog.busy || dialog.editor.read(cx).is_composing() {
             return;
         }
         let message = dialog.editor.read(cx).message().to_owned();
@@ -960,7 +1726,7 @@ impl Workspace {
             return;
         };
         dialog.busy = true;
-        dialog.push_after = push_after;
+        let push_after = dialog.push_after;
         dialog.error = None;
         dialog.editor.update(cx, |editor, cx| {
             editor.enabled = false;
@@ -1148,6 +1914,150 @@ impl Workspace {
             error: None,
         });
         self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_stash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.busy() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        if project.loading || project.diff_loading {
+            return;
+        }
+        let id = project.id;
+        let editor = cx.new(|cx| CommitEditor::single_line("", cx));
+        editor.read(cx).focus.focus(window);
+        self.stash_dialog = Some(StashDialog {
+            project_id: id,
+            editor: Some(editor),
+            deletion: None,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn open_stash_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(reference) =
+            project.snapshot.references.iter().find(|r| {
+                r.kind == RefTab::Stash && Some(&r.revision) == project.revision.as_ref()
+            })
+        else {
+            return;
+        };
+        let selector = reference
+            .name
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        self.stash_dialog = Some(StashDialog {
+            project_id: project.id,
+            editor: None,
+            deletion: Some((selector, reference.revision.clone(), reference.name.clone())),
+            busy: false,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn stash_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.stash_dialog else {
+            return;
+        };
+        if dialog.busy || self.pending > 0 {
+            return;
+        }
+        if dialog
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.read(cx).is_composing())
+        {
+            return;
+        }
+        let name = dialog
+            .editor
+            .as_ref()
+            .map(|editor| editor.read(cx).message().trim().to_owned());
+        if name.as_ref().is_some_and(|name| name.is_empty()) {
+            dialog.error = Some("스태시 이름을 입력하세요.".into());
+            cx.notify();
+            return;
+        }
+        let deletion = dialog.deletion.clone();
+        let id = dialog.project_id;
+        let Some(root) = self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .find(|p| p.id == id)
+            .map(|p| p.path.clone())
+        else {
+            return;
+        };
+        if let Some(editor) = &dialog.editor {
+            editor.update(cx, |editor, cx| {
+                editor.enabled = false;
+                cx.notify();
+            });
+        }
+        dialog.busy = true;
+        dialog.error = None;
+        self.pending += 1;
+        let task = cx.background_executor().spawn(async move {
+            let operation = if let Some((selector, commit, _)) = deletion {
+                crate::setup::delete_stash(&root, &selector, &commit)
+            } else {
+                crate::setup::stash_all(&root, name.as_deref().unwrap_or_default())
+            };
+            let refreshed = git::load_stage(&root);
+            (operation, refreshed)
+        });
+        cx.spawn(async move |this, cx| {
+            let (operation, refreshed) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                if !this.tabs.iter().any(|tab| tab.id() == id) {
+                    this.stash_dialog = None;
+                    return;
+                }
+                let mut error = operation.err().map(|error| format!("{error:#}"));
+                match refreshed {
+                    Ok(files) => this.apply_stage_files(id, files, &Default::default(), cx),
+                    Err(failure) => {
+                        error.get_or_insert_with(|| format!("{failure:#}"));
+                    }
+                }
+                if let Some(error) = error {
+                    if let Some(dialog) = &mut this.stash_dialog {
+                        dialog.busy = false;
+                        dialog.error = Some(error);
+                        if let Some(editor) = &dialog.editor {
+                            editor.update(cx, |editor, cx| {
+                                editor.enabled = true;
+                                cx.notify();
+                            });
+                        }
+                    }
+                } else {
+                    this.stash_dialog = None;
+                    this.refresh_after_branch(id, false, None, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1588,6 +2498,78 @@ impl Workspace {
             .and_then(WorkspaceTab::project)
     }
 
+    fn open_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.branch_busy {
+            return;
+        }
+        let Some(project) = self
+            .project()
+            .filter(|p| self.list_focus == Some(ListFocus::History(p.id)))
+        else {
+            return;
+        };
+        let Some(commit) = project.commit.clone() else {
+            return;
+        };
+        self.branch_dialog = Some(BranchDialog {
+            project_id: project.id,
+            path: project.path.clone(),
+            action: BranchAction::Reset {
+                commit,
+                mode: crate::branches::ResetMode::Soft,
+            },
+            editor: None,
+            error: None,
+        });
+        self.reset_mode_focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_history_operation(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self
+            .project()
+            .filter(|p| self.list_focus == Some(ListFocus::History(p.id)))
+        else {
+            return;
+        };
+        let Some(commit) = project.commit.clone() else {
+            return;
+        };
+        let id = project.id;
+        let path = project.path.clone();
+        let action = if key == "v" {
+            BranchAction::Revert {
+                commit: commit.clone(),
+                no_commit: self.popup_options.revert_no_commit,
+            }
+        } else {
+            BranchAction::Integrate {
+                kind: if key == "m" {
+                    crate::branches::IntegrateKind::Merge
+                } else {
+                    crate::branches::IntegrateKind::Rebase
+                },
+                commit,
+            }
+        };
+        self.branch_dialog = Some(BranchDialog {
+            project_id: id,
+            path: path.clone(),
+            action,
+            editor: None,
+            error: None,
+        });
+        if key == "v" {
+            self.branch_checks_focus[0].focus(window);
+        } else {
+            self.focus.focus(window);
+        }
+        cx.notify();
+    }
+
     fn open_branch_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project() else {
             return;
@@ -1602,15 +2584,124 @@ impl Workspace {
             return;
         };
         let (project_id, path) = (project.id, project.path.clone());
-        let editor = cx.new(|cx| CommitEditor::single_line("", cx));
+        let editor = cx.new(|cx| {
+            let mut editor = CommitEditor::single_line("", cx);
+            editor.text_size = 13.;
+            editor
+        });
         editor.read(cx).focus.focus(window);
         self.branch_dialog = Some(BranchDialog {
             project_id,
             path,
-            action: BranchAction::Create { commit },
+            action: BranchAction::Create {
+                commit,
+                remote: self.popup_options.branch_remote,
+                checkout: self.popup_options.branch_checkout,
+            },
             editor: Some(editor),
             error: None,
         });
+        cx.notify();
+    }
+
+    fn open_branch_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() || self.branch_busy {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        if project.ref_tab != RefTab::Local
+            || self.list_focus != Some(ListFocus::Branches(project.id))
+        {
+            return;
+        }
+        let Some(reference) =
+            project.snapshot.references.iter().find(|r| {
+                r.kind == RefTab::Local && Some(&r.revision) == project.revision.as_ref()
+            })
+        else {
+            return;
+        };
+        let (id, path, reference, expected) = (
+            project.id,
+            project.path.clone(),
+            reference.revision.clone(),
+            reference.target.clone(),
+        );
+        let editor = cx.new(|cx| CommitEditor::single_line("origin", cx));
+        editor.read(cx).focus.focus(window);
+        self.branch_dialog = Some(BranchDialog {
+            project_id: id,
+            path,
+            action: BranchAction::Upload {
+                reference,
+                expected,
+            },
+            editor: Some(editor),
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn open_reference_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() || self.branch_busy {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(reference) = project.snapshot.references.iter().find(|reference| {
+            reference.kind == project.ref_tab
+                && Some(&reference.revision) == project.revision.as_ref()
+        }) else {
+            return;
+        };
+        let (id, path, reference, expected) = (
+            project.id,
+            project.path.clone(),
+            reference.revision.clone(),
+            reference.target.clone(),
+        );
+        self.branch_busy = true;
+        self.pending += 1;
+        self.remote_status = Some((id, "삭제할 연결 브랜치 확인 중…"));
+        self.focus.focus(window);
+        let worker_path = path.clone();
+        let task = cx.background_executor().spawn(async move {
+            crate::branches::plan_reference_deletion(&worker_path, &reference, &expected)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.branch_busy = false;
+                this.pending = this.pending.saturating_sub(1);
+                this.remote_status = None;
+                match result {
+                    Ok(plan)
+                        if this.active == Some(id)
+                            && this.tabs.iter().any(|tab| tab.id() == id) =>
+                    {
+                        this.branch_dialog = Some(BranchDialog {
+                            project_id: id,
+                            path,
+                            action: BranchAction::Delete {
+                                plan,
+                                delete_related: false,
+                            },
+                            editor: None,
+                            error: None,
+                        });
+                        this.focus_after_popup = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1635,17 +2726,45 @@ impl Workspace {
         }
         let active = self.active;
         self.active = Some(id);
-        if switched && let Some(project) = self.project_mut() {
-            project.revision = None;
-            project.commit = None;
-            project.ref_tab = RefTab::Local;
-            project.file_tab = FileTab::Stage;
-            project.show_commit_detail = false;
-            self.list_focus = Some(ListFocus::Branches(id));
+        if switched && active == Some(id) {
+            self.focus_after_popup = true;
         }
         self.reload(cx);
         self.active = active;
         self.error = error;
+    }
+
+    fn choose_checkout_candidate(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.branch_busy {
+            return;
+        }
+        let Some(dialog) = &self.branch_dialog else {
+            return;
+        };
+        let BranchAction::ChooseCheckout { candidates, .. } = &dialog.action else {
+            return;
+        };
+        let Some(candidate) = candidates.get(index) else {
+            return;
+        };
+        if self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .any(|project| {
+                project.id == dialog.project_id
+                    && project.snapshot.current_branch.as_deref()
+                        == Some(candidate.reference.as_str())
+            })
+        {
+            return;
+        }
+        if let Some(dialog) = &mut self.branch_dialog
+            && let BranchAction::ChooseCheckout { selected, .. } = &mut dialog.action
+        {
+            *selected = index;
+        }
+        self.submit_branch(cx);
     }
 
     fn submit_branch(&mut self, cx: &mut Context<Self>) {
@@ -1681,11 +2800,70 @@ impl Workspace {
         self.pending += 1;
         self.branch_busy = true;
         self.remote_status = Some((id, "브랜치 작업 중…"));
-        let switched = matches!(action, BranchAction::Track(_));
+        let switched = matches!(
+            action,
+            BranchAction::Track(_) | BranchAction::ChooseCheckout { .. }
+        );
+        let restore_focus = matches!(
+            action,
+            BranchAction::Create { .. }
+                | BranchAction::Tag { .. }
+                | BranchAction::Reset { .. }
+                | BranchAction::Revert { .. }
+                | BranchAction::Integrate { .. }
+        );
         let task = cx.background_executor().spawn(async move {
             match action {
-                BranchAction::Create { commit } => {
-                    crate::branches::create(&path, name.as_deref().unwrap_or_default(), &commit)
+                BranchAction::Create {
+                    commit,
+                    remote,
+                    checkout,
+                } => crate::branches::create_options(
+                    &path,
+                    name.as_deref().unwrap_or_default(),
+                    &commit,
+                    remote,
+                    checkout,
+                ),
+                BranchAction::Tag { commit } => {
+                    crate::branches::create_tag(&path, name.as_deref().unwrap_or_default(), &commit)
+                }
+                BranchAction::Delete {
+                    plan,
+                    delete_related,
+                } => crate::branches::delete_reference_plan(&path, &plan, delete_related),
+                BranchAction::Upload {
+                    reference,
+                    expected,
+                } => crate::branches::publish_branch(
+                    &path,
+                    &reference,
+                    &expected,
+                    name.as_deref().unwrap_or_default(),
+                ),
+                BranchAction::ChooseCheckout {
+                    commit,
+                    candidates,
+                    selected,
+                } => {
+                    let candidate = candidates
+                        .get(selected)
+                        .ok_or_else(|| anyhow::anyhow!("브랜치를 선택하세요."))?;
+                    crate::branches::checkout_commit_branch(
+                        &path,
+                        &candidate.reference,
+                        &commit,
+                        true,
+                    )
+                }
+                BranchAction::Revert { commit, no_commit } => {
+                    crate::branches::revert_commit(&path, &commit, no_commit)
+                }
+                BranchAction::Integrate { kind, commit } => {
+                    crate::branches::integrate_commit(&path, &commit, kind)
+                }
+                BranchAction::Reset { commit, mode, .. } => {
+                    crate::branches::reset_commit(&path, &commit, mode)
                 }
                 BranchAction::Track(target) => crate::branches::checkout(&path, &target, true),
             }
@@ -1699,6 +2877,7 @@ impl Workspace {
                 match result {
                     Ok(()) => {
                         this.branch_dialog = None;
+                        this.focus_after_popup = restore_focus;
                         this.refresh_after_branch(id, switched, None, cx);
                     }
                     Err(error) => {
@@ -1722,6 +2901,131 @@ impl Workspace {
         cx.notify();
     }
 
+    fn restore_stash_reference(&mut self, id: u64, commit: String, cx: &mut Context<Self>) {
+        if self.pending > 0
+            || self.branch_busy
+            || self.branch_dialog.is_some()
+            || self.stash_dialog.is_some()
+        {
+            return;
+        }
+        let Some(project) = self.project().filter(|p| p.id == id) else {
+            return;
+        };
+        let path = project.path.clone();
+        if let Some(project) = self.project_mut() {
+            project.history_target = None;
+        }
+        self.pending += 1;
+        self.branch_busy = true;
+        self.remote_status = Some((id, "스태시 복원 중…"));
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::setup::restore_stash(&path, &commit) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.branch_busy = false;
+                this.remote_status = None;
+                if result.is_ok()
+                    && let Some(project) = this
+                        .tabs
+                        .iter_mut()
+                        .filter_map(WorkspaceTab::project_mut)
+                        .find(|p| p.id == id)
+                {
+                    project.file_tab = FileTab::Stage;
+                    project.show_commit_detail = false;
+                }
+                this.refresh_after_branch(
+                    id,
+                    false,
+                    result.err().map(|error| format!("{error:#}")),
+                    cx,
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn checkout_history_commit(&mut self, id: u64, commit: String, cx: &mut Context<Self>) {
+        if self.pending > 0 || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project().filter(|p| p.id == id) else {
+            return;
+        };
+        let path = project.path.clone();
+        if let Some(project) = self.project_mut() {
+            project.history_target = None;
+        }
+        self.pending += 1;
+        self.branch_busy = true;
+        self.remote_status = Some((id, "체크아웃 브랜치 확인 중…"));
+        let worker_path = path.clone();
+        let worker_commit = commit.clone();
+        let task = cx.background_executor().spawn(async move {
+            let candidates =
+                crate::branches::commit_checkout_candidates(&worker_path, &worker_commit)?;
+            if candidates.is_empty() {
+                crate::branches::checkout_commit(&worker_path, &worker_commit)?;
+                Ok((None, true))
+            } else if candidates.len() == 1 {
+                if crate::branches::is_current_branch(&worker_path, &candidates[0].reference)? {
+                    return Ok((None, false));
+                }
+                crate::branches::checkout_commit_branch(
+                    &worker_path,
+                    &candidates[0].reference,
+                    &worker_commit,
+                    true,
+                )?;
+                Ok((None, true))
+            } else {
+                Ok::<_, anyhow::Error>((Some(candidates), false))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                this.branch_busy = false;
+                this.remote_status = None;
+                if !this.tabs.iter().any(|tab| tab.id() == id) {
+                    return;
+                }
+                match result {
+                    Ok((Some(candidates), _)) => {
+                        this.branch_dialog = Some(BranchDialog {
+                            project_id: id,
+                            path,
+                            action: BranchAction::ChooseCheckout {
+                                commit,
+                                candidates,
+                                selected: 0,
+                            },
+                            editor: None,
+                            error: None,
+                        });
+                    }
+                    Ok((None, true)) => this.refresh_after_branch(id, true, None, cx),
+                    Ok((None, false)) => {}
+                    Err(error) => {
+                        this.refresh_after_branch(id, false, Some(format!("{error:#}")), cx)
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn checkout_reference(&mut self, id: u64, reference: String, cx: &mut Context<Self>) {
         if self.pending > 0 || self.branch_busy || self.branch_dialog.is_some() {
             return;
@@ -1729,6 +3033,9 @@ impl Workspace {
         let Some(project) = self.project().filter(|project| project.id == id) else {
             return;
         };
+        if project.snapshot.current_branch.as_deref() == Some(reference.as_str()) {
+            return;
+        }
         let path = project.path.clone();
         if let Some(project) = self.project_mut() {
             project.history_target = None;
@@ -1738,6 +3045,10 @@ impl Workspace {
         self.branch_busy = true;
         self.remote_status = Some((id, "브랜치 전환 중…"));
         let task = cx.background_executor().spawn(async move {
+            if !reference.starts_with("refs/") {
+                crate::branches::checkout_commit(&worker_path, &reference)?;
+                return Ok(None);
+            }
             let target = crate::branches::prepare_checkout(&worker_path, &reference)?;
             if target.needs_creation {
                 Ok(Some(target))
@@ -1777,6 +3088,7 @@ impl Workspace {
         if self.history_in_progress()
             || self.commit_dialog.is_some()
             || self.discard_dialog.is_some()
+            || self.stash_dialog.is_some()
             || self.delete_target.is_some()
             || self.settings.is_some()
             || self.branch_dialog.is_some()
@@ -1786,7 +3098,8 @@ impl Workspace {
         }
         let path = self.project().map(|project| project.path.clone());
         self.help = false;
-        self.settings = Some(cx.new(|cx| SettingsPanel::new(path, cx)));
+        self.settings =
+            Some(cx.new(|cx| SettingsPanel::new(path, self.popup_options.use_global, cx)));
         self.focus.focus(window);
         cx.notify();
     }
@@ -1798,6 +3111,12 @@ impl Workspace {
             }
             settings.read(cx).cancel();
         }
+        if let Some(settings) = &self.settings
+            && let Some(preference) = settings.read(cx).use_global_preference()
+        {
+            self.popup_options.use_global = Some(preference);
+        }
+        self.persist();
         self.settings = None;
         self.focus.focus(window);
         cx.notify();
@@ -1810,7 +3129,10 @@ impl Workspace {
             .text_xs()
             .text_color(rgb(ACCENT))
             .cursor_pointer()
-            .child("f12 - 세팅")
+            .child(crate::shortcut::hint(
+                "세팅",
+                &self.shortcuts.label("settings"),
+            ))
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
     }
 
@@ -1885,10 +3207,47 @@ impl Workspace {
             || self.delete_target.is_some()
             || self.commit_dialog.is_some()
             || self.discard_dialog.is_some()
+            || self.stash_dialog.is_some()
         {
             self.resize_drag = None;
             self.column_drag = None;
             self.scroll_drag = None;
+            self.text_drag = false;
+            return;
+        }
+        if self.text_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.text_drag = false;
+                return;
+            }
+            if let Some((key, _)) = &self.text_selection
+                && self.active == Some(key.0)
+                && let Some(viewport) = self.viewports.get(key)
+                && let Some(handle) = self.list_scroll.get(key)
+            {
+                let base = handle.0.borrow().base_handle.clone();
+                let offset = base.offset();
+                let max = base.max_offset();
+                let delta = |position: Pixels, start: Pixels, length: Pixels| {
+                    if position < start {
+                        (start - position).min(px(44.))
+                    } else if position > start + length {
+                        -(position - start - length).min(px(44.))
+                    } else {
+                        px(0.)
+                    }
+                };
+                let next = point(
+                    (offset.x + delta(event.position.x, viewport.origin.x, viewport.size.width))
+                        .clamp(-max.width, px(0.)),
+                    (offset.y + delta(event.position.y, viewport.origin.y, viewport.size.height))
+                        .clamp(-max.height, px(0.)),
+                );
+                if next != offset {
+                    base.set_offset(next);
+                    cx.notify();
+                }
+            }
             return;
         }
         if let Some(drag) = self.scroll_drag.clone() {
@@ -1931,6 +3290,9 @@ impl Workspace {
     }
 
     fn resize_end(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.button == MouseButton::Left {
+            self.text_drag = false;
+        }
         if event.button == MouseButton::Left && self.scroll_drag.take().is_some() {
             cx.stop_propagation();
             cx.notify();
@@ -2082,13 +3444,24 @@ impl Workspace {
         if page.busy {
             return;
         }
-        let source = (mode == 2).then(|| page.url.trim().to_owned());
+        let source = (mode == 2).then(|| {
+            page.url_editor
+                .as_ref()
+                .map(|editor| editor.read(cx).message().trim().to_owned())
+                .unwrap_or_default()
+        });
         if source.as_ref().is_some_and(|s| s.is_empty()) {
             page.error = Some("저장소 URL을 입력하세요.".into());
             cx.notify();
             return;
         }
         page.busy = true;
+        if let Some(editor) = &page.url_editor {
+            editor.update(cx, |editor, cx| {
+                editor.enabled = false;
+                cx.notify();
+            });
+        }
         page.error = None;
         let existing = (mode == 1).then(|| {
             cx.prompt_for_paths(PathPromptOptions {
@@ -2145,6 +3518,12 @@ impl Workspace {
                     return;
                 };
                 page.busy = false;
+                if let Some(editor) = &page.url_editor {
+                    editor.update(cx, |editor, cx| {
+                        editor.enabled = true;
+                        cx.notify();
+                    });
+                }
                 match result {
                     Some(Ok(path)) => {
                         this.finish_open(id, path, cx);
@@ -2186,8 +3565,12 @@ impl Workspace {
                         return;
                     }
                     if mode == 2 {
-                        this.start_pages.get_mut(&id).unwrap().clone_form = true;
-                        this.url_focus.focus(window);
+                        let page = this.start_pages.get_mut(&id).unwrap();
+                        page.clone_form = true;
+                        let editor = page
+                            .url_editor
+                            .get_or_insert_with(|| cx.new(|cx| CommitEditor::single_line("", cx)));
+                        editor.read(cx).focus.focus(window);
                         cx.notify();
                     } else {
                         this.start_repository(id, mode, cx);
@@ -2198,65 +3581,18 @@ impl Workspace {
         if page.clone_form {
             content = content
                 .child(div().text_sm().child("저장소 URL"))
-                .child(
-                    div()
-                        .id("clone-url")
-                        .track_focus(&self.url_focus)
-                        .px_3()
-                        .py_2()
-                        .border_1()
-                        .border_color(rgb(if page.select_all { ACCENT } else { LINE }))
-                        .overflow_hidden()
-                        .text_sm()
-                        .child(if page.url.is_empty() {
-                            "https://… 또는 SSH URL".to_owned()
-                        } else {
-                            page.url.clone()
-                        })
-                        .on_click(cx.listener(|this, _, window, _| this.url_focus.focus(window)))
-                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
-                            let Some(page) = this.start_pages.get_mut(&id) else {
-                                return;
-                            };
-                            if page.busy {
-                                return;
-                            }
-                            let key = &event.keystroke;
-                            if key.modifiers.control && key.key == "a" {
-                                page.select_all = true;
-                            } else if key.modifiers.control && key.key == "c" {
-                                if page.select_all {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        page.url.clone(),
-                                    ));
-                                }
-                            } else if key.key == "enter" {
-                                this.start_repository(id, 2, cx);
-                                return;
-                            } else {
-                                let text = if key.modifiers.control && key.key == "v" {
-                                    cx.read_from_clipboard().and_then(|item| item.text())
-                                } else if !key.modifiers.control && !key.modifiers.alt {
-                                    key.key_char.clone()
-                                } else {
-                                    None
-                                };
-                                if key.key == "backspace" || key.key == "delete" || text.is_some() {
-                                    if page.select_all {
-                                        page.url.clear();
-                                        page.select_all = false;
-                                    } else if key.key == "backspace" {
-                                        page.url.pop();
-                                    }
-                                    if let Some(text) = text {
-                                        page.url.push_str(text.trim_matches(['\r', '\n']));
-                                    }
-                                }
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        })),
-                )
+                .when_some(page.url_editor.clone(), |content, editor| {
+                    content.child(
+                        div()
+                            .id("clone-url")
+                            .h(px(36.))
+                            .p_1()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .overflow_hidden()
+                            .child(editor),
+                    )
+                })
                 .child(
                     button("execute-clone", "Clone 실행 · 저장 위치 선택", true).on_click(
                         cx.listener(move |this, _, _, cx| this.start_repository(id, 2, cx)),
@@ -2267,12 +3603,7 @@ impl Workspace {
             content = content.child(empty("처리 중입니다…"));
         }
         if let Some(error) = &page.error {
-            content = content.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xf4a0a8))
-                    .child(error.clone()),
-            );
+            content = content.child(div().text_sm().text_color(rgb(ERROR)).child(error.clone()));
         }
         let key = (id, 40);
         let scroll = page.recent_scroll.clone();
@@ -2345,7 +3676,7 @@ impl Workspace {
         let open_path = path.clone();
         let delete_path = path.clone();
         row.cursor_pointer()
-            .hover(|row| row.bg(rgb(0x263443)))
+            .hover(|row| row.bg(rgb(HOVER)))
             .child(
                 div()
                     .text_sm()
@@ -2377,7 +3708,7 @@ impl Workspace {
                     .items_center()
                     .justify_center()
                     .rounded_sm()
-                    .hover(|icon| icon.bg(rgb(0x54313a)))
+                    .hover(|icon| icon.bg(rgb(DANGER_HOVER)))
                     .child(trash_icon())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
@@ -2411,7 +3742,7 @@ impl Workspace {
         p.diff = Diff::default();
         let task = cx
             .background_executor()
-            .spawn(async move { git::load_initial(&path, commit.as_deref()) });
+            .spawn(async move { git::load_for_refresh(&path, commit.as_deref()) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -2578,6 +3909,7 @@ impl Workspace {
                             && this.list_focus == Some(ListFocus::Branches(id))
                             && !this.branch_busy
                             && this.branch_dialog.is_none()
+                            && this.stash_dialog.is_none()
                         {
                             this.load_more(id, cx);
                         }
@@ -2695,6 +4027,8 @@ impl Workspace {
     fn branch_panel(&mut self, cx: &Context<Self>) -> Div {
         let mut tabs = div()
             .id("reference-tabs")
+            .border_b_1()
+            .border_color(rgb(LINE))
             .flex()
             .gap_1()
             .px_3()
@@ -2773,7 +4107,7 @@ impl Workspace {
             .px_3()
             .min_w_0()
             .overflow_hidden()
-            .text_sm();
+            .text_xs();
         let Some(p) = self
             .tabs
             .iter()
@@ -2801,27 +4135,44 @@ impl Workspace {
             }))
             .text_color(rgb(if current { ACCENT } else { TEXT }))
             .cursor_pointer()
-            .when(!active, |row| row.hover(|s| s.bg(rgb(0x263443))))
-            .child(div().min_w_0().text_ellipsis().child(format!(
-                "{}{}",
-                if current { "● " } else { "⑂ " },
-                reference.name
-            )));
+            .when(!active, |row| row.hover(|s| s.bg(rgb(HOVER))))
+            .gap_2()
+            .child(
+                div()
+                    .size(px(18.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(current, |icon| icon.child(current_branch_dot(18.)))
+                    .when(!current, |icon| {
+                        icon.child(div().text_size(px(18.)).line_height(px(18.)).child("⑂"))
+                    }),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_ellipsis()
+                    .child(reference.name.clone()),
+            );
         row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if this.active != Some(id) {
                 return;
             }
             this.list_focus = Some(ListFocus::Branches(id));
             this.focus.focus(window);
-            if event.click_count() == 2 && kind < 2 {
+            if event.click_count() == 2 && kind == RefTab::Stash.index() {
+                this.restore_stash_reference(id, revision.clone(), cx);
+            } else if event.click_count() == 2 && kind == RefTab::Tag.index() {
+                this.checkout_reference(id, target.clone(), cx);
+            } else if event.click_count() == 2 && kind < 2 {
                 this.checkout_reference(id, revision.clone(), cx);
             } else if event.click_count() == 1 {
-                this.select_reference(
-                    revision.clone(),
-                    target.clone(),
-                    Some(branch_click_interval()),
-                    cx,
-                );
+                if let Some(project) = this.project_mut() {
+                    project.revision = Some(revision.clone());
+                    project.history_target = None;
+                }
+                cx.notify();
             }
         }))
     }
@@ -2830,10 +4181,11 @@ impl Workspace {
         &mut self,
         project_id: u64,
         index: usize,
-        widths: [f32; 5],
+        layout: ([f32; 5], usize),
         window: &Window,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
+        let (widths, graph_lanes) = layout;
         let mut row = div()
             .id(("commit", index))
             .flex()
@@ -2862,47 +4214,74 @@ impl Workspace {
             .entry(index)
             .or_insert_with(|| RowGraph::new(commit));
         row = row
+            .when(
+                p.snapshot.head_commit.as_deref() == Some(commit.id.as_str()),
+                |row| row.font_weight(FontWeight::BOLD),
+            )
             .bg(rgb(if selected { selection_color } else { PANEL }))
-            .when(!selected, |row| row.hover(|s| s.bg(rgb(0x202e3c))))
-            .child(history_view::cell(0, widths[0]).child(graph.render()));
+            .when(!selected, |row| row.hover(|s| s.bg(rgb(HISTORY_HOVER))))
+            .child(history_view::cell(0, widths[0]).child(graph.render(
+                p.snapshot.head_commit.as_deref() == Some(commit.id.as_str()),
+                graph_lanes,
+            )));
         let mut description = div()
             .flex()
             .items_center()
             .gap_1()
             .min_w_0()
             .overflow_hidden();
-        for branch in &commit.branches {
-            description = description.child(
-                div()
-                    .flex_shrink_0()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(SELECT))
-                    .text_color(rgb(ACCENT))
-                    .child(format!(
-                        "{}{}",
-                        if p.snapshot.current_branch.as_deref()
-                            == Some(format!("refs/heads/{branch}").as_str())
-                        {
-                            "● "
-                        } else {
-                            ""
-                        },
-                        branch
-                    )),
-            );
-        }
         for tag in &commit.tags {
             description = description.child(
                 div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::NORMAL)
+                    .h(px(18.))
                     .flex_shrink_0()
                     .px_1()
                     .rounded_sm()
-                    .bg(rgb(0x362b49))
-                    .text_color(rgb(0xd6b4ff))
-                    .child(format!("◇ {tag}")),
+                    .border_1()
+                    .border_color(rgb(TAG_TEXT))
+                    .bg(rgb(TAG_BG))
+                    .text_color(rgb(TAG_TEXT))
+                    .child(reference_badge_icon(true, TAG_TEXT))
+                    .child(tag.clone()),
             );
         }
+        for branch in &commit.branches {
+            let remote = p.snapshot.references.iter().any(|reference| {
+                reference.kind == RefTab::Remote
+                    && reference.name == *branch
+                    && reference.target == commit.id
+            });
+            let tint = if remote { REMOTE_TEXT } else { ACCENT };
+            description = description.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::NORMAL)
+                    .h(px(18.))
+                    .flex_shrink_0()
+                    .px_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(tint))
+                    .bg(rgb(if remote { REMOTE_BG } else { LOCAL_BG }))
+                    .text_color(rgb(tint))
+                    .child(reference_badge_icon(false, tint))
+                    .when(
+                        p.snapshot.current_branch.as_deref()
+                            == Some(format!("refs/heads/{branch}").as_str()),
+                        |badge| badge.child(current_branch_dot(12.)),
+                    )
+                    .child(branch.clone()),
+            );
+        }
+
         description =
             description.child(div().min_w_0().text_ellipsis().child(commit.title.clone()));
         row = row.child(history_view::cell(1, widths[1]).child(description));
@@ -2920,11 +4299,15 @@ impl Workspace {
                     .child(div().min_w_0().text_ellipsis().child(text)),
             );
         }
-        row.on_click(cx.listener(move |this, _, window, cx| {
+        row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if this.active == Some(project_id) {
                 this.list_focus = Some(ListFocus::History(project_id));
                 this.focus.focus(window);
-                this.select_commit(id.clone(), cx);
+                if event.click_count() == 2 {
+                    this.checkout_history_commit(project_id, id.clone(), cx);
+                } else if event.click_count() == 1 {
+                    this.select_commit(id.clone(), cx);
+                }
             }
         }))
     }
@@ -2934,6 +4317,27 @@ impl Workspace {
             .project()
             .map(|p| (p.id, p.snapshot.commits.len()))
             .unwrap_or_default();
+        let graph_lanes = self
+            .project()
+            .map(|p| {
+                p.snapshot
+                    .commits
+                    .iter()
+                    .map(|commit| {
+                        commit
+                            .input_edges
+                            .iter()
+                            .chain(&commit.output_edges)
+                            .flat_map(|edge| [edge.from_lane, edge.to_lane])
+                            .chain(std::iter::once(commit.marker.lane))
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            })
+            .unwrap_or(1);
         let bar_visible = self
             .scroll_visibility(
                 (project_id, 0),
@@ -2956,6 +4360,7 @@ impl Workspace {
         for (i, label) in history_view::COLUMNS.iter().enumerate() {
             headings = headings.child(
                 history_view::cell(i, widths[i])
+                    .when(i != 0, |cell| cell.border_l_1().border_color(rgb(LINE)))
                     .relative()
                     .text_color(rgb(MUTED))
                     .child(*label)
@@ -3014,7 +4419,9 @@ impl Workspace {
                     });
                 }
                 range
-                    .map(|index| this.history_row(project_id, index, widths, window, cx))
+                    .map(|index| {
+                        this.history_row(project_id, index, (widths, graph_lanes), window, cx)
+                    })
                     .collect::<Vec<_>>()
             }),
         )
@@ -3082,7 +4489,14 @@ impl Workspace {
     }
 
     fn files_panel(&mut self, window: &Window, cx: &Context<Self>) -> Div {
-        let mut tabs = div().flex().gap_1().px_3().py_2().flex_shrink_0();
+        let mut tabs = div()
+            .flex()
+            .gap_1()
+            .px_3()
+            .py_2()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(rgb(LINE));
         for (i, tab) in [FileTab::Stage, FileTab::History].into_iter().enumerate() {
             tabs = tabs.child(
                 button(
@@ -3156,8 +4570,8 @@ impl Workspace {
                         }))
                         .text_color(rgb(TEXT))
                         .cursor_pointer()
-                        .when(!detail, |row| row.hover(|s| s.bg(rgb(0x263443))))
-                        .text_sm()
+                        .when(!detail, |row| row.hover(|s| s.bg(rgb(HOVER))))
+                        .text_xs()
                         .h(px(history_view::ROW_HEIGHT))
                         .w_full()
                         .px_3()
@@ -3167,6 +4581,8 @@ impl Workspace {
                         .rounded_none()
                         .border_b_1()
                         .border_color(rgb(LINE))
+                        .gap_1()
+                        .child(commit_icon())
                         .child("커밋상세")
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.list_focus = Some(ListFocus::Files(id));
@@ -3252,7 +4668,7 @@ impl Workspace {
                 PANEL
             }))
             .cursor_pointer()
-            .when(!selected, |row| row.hover(|s| s.bg(rgb(0x263443))))
+            .when(!selected, |row| row.hover(|s| s.bg(rgb(HOVER))))
             .child(
                 div()
                     .text_xs()
@@ -3264,12 +4680,12 @@ impl Workspace {
                             .whitespace_nowrap()
                     })
                     .text_color(rgb(if key.1 == 20 {
-                        if file.staged { 0x80d9a4 } else { 0xf28d95 }
+                        if file.staged { ADDED } else { REMOVED }
                     } else {
                         match file.status.as_str() {
-                            "A" => 0x80d9a4,
-                            "D" => 0xf28d95,
-                            _ => 0xe8c783,
+                            "A" => ADDED,
+                            "D" => REMOVED,
+                            _ => MODIFIED,
                         }
                     }))
                     .child(if key.1 == 20 {
@@ -3282,8 +4698,9 @@ impl Workspace {
                 div()
                     .min_w_0()
                     .text_ellipsis()
+                    .text_size(px(14.))
                     .when(key.1 == 20 && file.staged, |name| {
-                        name.text_color(rgb(0x80d9a4))
+                        name.text_color(rgb(ADDED))
                     })
                     .child(file.label.clone()),
             );
@@ -3352,7 +4769,8 @@ impl Workspace {
             if let Some(rows) = self.detail_items.get_mut(&id)
                 && !rows.measured
             {
-                rows.width = measure_text_width(window, rows.lines.iter().map(String::as_str), 24.);
+                rows.width =
+                    measure_text_width(window, rows.lines.iter().map(String::as_str), 24., true);
                 rows.measured = true;
             }
         } else if !self.diff_measured.contains(&id) && !loading && !error {
@@ -3365,6 +4783,7 @@ impl Workspace {
                     .iter()
                     .map(|line| line.text.as_str()),
                 132.,
+                false,
             );
             self.diff_content_width.insert(id, width);
             self.diff_measured.insert(id);
@@ -3393,25 +4812,31 @@ impl Workspace {
         .font_family("Cascadia Mono")
         .text_xs();
         panel()
-            .child(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .flex_shrink_0()
-                    .child(title),
-            )
+            .when(!title.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .flex_shrink_0()
+                        .child(title),
+                )
+            })
             .when(count == 0, |p| {
-                p.child(empty(if loading {
-                    "조회 중입니다…"
-                } else if error {
-                    "조회하지 못했습니다. 오류 내용을 확인하세요."
-                } else if details {
-                    "표시할 커밋이 없습니다."
-                } else {
-                    "파일을 선택해 변경 내용을 확인하세요."
-                }))
+                p.child(
+                    empty(if loading {
+                        "조회 중입니다…"
+                    } else if error {
+                        "조회하지 못했습니다. 오류 내용을 확인하세요."
+                    } else if details {
+                        "표시할 커밋이 없습니다."
+                    } else {
+                        "파일을 선택해 변경 내용을 확인하세요."
+                    })
+                    .px_4()
+                    .py_2(),
+                )
             })
             .child(self.scroll_frame(
                 key,
@@ -3472,9 +4897,9 @@ impl Workspace {
             return row;
         };
         let (bg, fg) = match line.kind {
-            '+' => (0x16352d, 0x98e7b4),
-            '-' => (0x38232b, 0xf4a0a8),
-            '@' => (0x1b2c3d, 0x82bfe4),
+            '+' => (DIFF_ADD_BG, DIFF_ADD_TEXT),
+            '-' => (DIFF_DELETE_BG, DIFF_DELETE_TEXT),
+            '@' => (DIFF_HEADER_BG, DIFF_HEADER_TEXT),
             _ => (PANEL, TEXT),
         };
         row.bg(rgb(bg))
@@ -3495,7 +4920,14 @@ impl Workspace {
                     .text_color(rgb(MUTED))
                     .child(line.new.map(|v| v.to_string()).unwrap_or_default()),
             )
-            .child(div().w_5().flex_shrink_0().child(line.kind.to_string()))
+            .child(
+                div()
+                    .w_5()
+                    .h(px(22.))
+                    .line_height(px(22.))
+                    .flex_shrink_0()
+                    .child(line.kind.to_string()),
+            )
             .child(self.selectable_line((id, 30), index, line.text.clone(), fg, cx))
     }
 
@@ -3507,6 +4939,18 @@ impl Workspace {
         color: u32,
         cx: &Context<Self>,
     ) -> Div {
+        let bold_len = if key.1 == 31
+            && self.detail_items.get(&key.0).is_some_and(|rows| {
+                row < rows
+                    .lines
+                    .iter()
+                    .position(|line| line.is_empty())
+                    .unwrap_or(rows.lines.len())
+            }) {
+            detail_label_len(&raw)
+        } else {
+            0
+        };
         let selection = self
             .text_selection
             .as_ref()
@@ -3524,22 +4968,12 @@ impl Workspace {
                     |_, _, _| (),
                     move |bounds, _, window, cx| {
                         let displayed = raw.replace('\t', "    ");
-                        let run = TextRun {
-                            len: displayed.len(),
-                            font: font("Cascadia Mono"),
-                            color: rgb(color).into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
+                        let shaped = shape_styled_line(window, &displayed, color, bold_len);
+                        let x_for_column = |column: usize| {
+                            shaped
+                                .unwrapped_layout
+                                .x_for_index(displayed_byte(&raw, column))
                         };
-                        let shaped = window.text_system().shape_line(
-                            displayed.into(),
-                            window.rem_size() * 0.75,
-                            &[run],
-                            None,
-                        );
-                        let x_for_column =
-                            |column: usize| shaped.x_for_index(displayed_byte(&raw, column));
                         if let Some(selection) = &selection {
                             let (start, end) = selection.range();
                             if row >= start.row && row <= end.row && start != end {
@@ -3557,7 +4991,7 @@ impl Workspace {
                                         bounds.origin + point(left, px(0.)),
                                         size((right - left).max(px(0.)), px(22.)),
                                     ),
-                                    rgb(0x345b78),
+                                    rgb(TEXT_SELECTION),
                                 ));
                             }
                             if focused && selection.cursor.row == row {
@@ -3571,7 +5005,9 @@ impl Workspace {
                                 ));
                             }
                         }
-                        shaped.paint(bounds.origin, px(22.), window, cx).ok();
+                        shaped
+                            .paint(bounds.origin, px(22.), TextAlign::Left, None, window, cx)
+                            .ok();
                         let down_view = view.clone();
                         let down_line = shaped.clone();
                         let down_raw = raw.clone();
@@ -3588,6 +5024,7 @@ impl Workspace {
                                         || this.help
                                         || this.commit_dialog.is_some()
                                         || this.discard_dialog.is_some()
+                                        || this.stash_dialog.is_some()
                                         || this.delete_target.is_some()
                                         || this.active != Some(key.0)
                                         || this.tracks.iter().any(|((track_key, _), track)| {
@@ -3600,6 +5037,7 @@ impl Workspace {
                                         return;
                                     }
                                     let byte = down_line
+                                        .unwrapped_layout
                                         .closest_index_for_x(event.position.x - bounds.origin.x);
                                     let position = Position {
                                         row,
@@ -3631,8 +5069,7 @@ impl Workspace {
                         let move_line = shaped.clone();
                         let move_raw = raw.clone();
                         window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase != DispatchPhase::Capture || !bounds.contains(&event.position)
-                            {
+                            if phase != DispatchPhase::Capture {
                                 return;
                             }
                             move_view
@@ -3642,15 +5079,41 @@ impl Workspace {
                                         || this.help
                                         || this.commit_dialog.is_some()
                                         || this.discard_dialog.is_some()
+                                        || this.stash_dialog.is_some()
                                         || this.delete_target.is_some()
-                                        || this.viewports.get(&key).is_none_or(|viewport| {
-                                            !viewport.contains(&event.position)
-                                        })
+                                        || this.settings.is_some()
+                                        || this.branch_dialog.is_some()
+                                        || this.branch_busy
+                                        || this.active != Some(key.0)
                                     {
                                         return;
                                     }
                                     if event.pressed_button != Some(MouseButton::Left) {
                                         this.text_drag = false;
+                                        return;
+                                    }
+                                    let Some(viewport) = this.viewports.get(&key) else {
+                                        return;
+                                    };
+                                    let y = px(clamp_drag_y(
+                                        event.position.y.into(),
+                                        viewport.origin.y.into(),
+                                        viewport.size.height.into(),
+                                    ));
+                                    let count = if key.1 == 31 {
+                                        this.detail_items
+                                            .get(&key.0)
+                                            .map_or(0, |rows| rows.lines.len())
+                                    } else {
+                                        this.tabs
+                                            .iter()
+                                            .filter_map(WorkspaceTab::project)
+                                            .find(|project| project.id == key.0)
+                                            .map_or(0, |project| project.diff.lines.len())
+                                    };
+                                    let above = y < bounds.origin.y;
+                                    let below = y >= bounds.origin.y + bounds.size.height;
+                                    if (above && row != 0) || (below && row + 1 != count) {
                                         return;
                                     }
                                     if let Some((selected_key, selection)) =
@@ -3661,7 +5124,7 @@ impl Workspace {
                                             row,
                                             column: original_column(
                                                 &move_raw,
-                                                move_line.closest_index_for_x(
+                                                move_line.unwrapped_layout.closest_index_for_x(
                                                     event.position.x - bounds.origin.x,
                                                 ),
                                             ),
@@ -3683,6 +5146,10 @@ impl Workspace {
                 .size_full(),
             )
     }
+}
+
+fn clamp_drag_y(y: f32, top: f32, height: f32) -> f32 {
+    y.clamp(top, (top + height - 0.01).max(top))
 }
 
 fn displayed_byte(raw: &str, column: usize) -> usize {
@@ -3757,29 +5224,89 @@ fn page_progress() -> Div {
         )
 }
 
+fn detail_label_len(text: &str) -> usize {
+    text.split_once(':')
+        .filter(|(label, _)| {
+            [
+                "커밋",
+                "상위 항목",
+                "작성자",
+                "작성시간",
+                "커미터",
+                "커밋시간",
+            ]
+            .contains(label)
+        })
+        .map_or(0, |(label, _)| label.len() + 1)
+}
+
+fn styled_runs(text: &str, color: u32, bold_len: usize) -> Vec<TextRun> {
+    let make_run = |len, bold| {
+        let mut face = font("Cascadia Mono");
+        face.weight = if bold {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        TextRun {
+            len,
+            font: face,
+            color: rgb(color).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }
+    };
+    if bold_len > 0 {
+        vec![
+            make_run(bold_len, true),
+            make_run(text.len() - bold_len, false),
+        ]
+    } else {
+        vec![make_run(text.len(), false)]
+    }
+}
+
+fn shape_styled_line(window: &Window, text: &str, color: u32, bold_len: usize) -> WrappedLine {
+    let runs = styled_runs(text, color, bold_len);
+    // shape_line merges equally colored runs before checking their fonts in GPUI 0.2.2.
+    // shape_text compares font IDs and keeps bold labels separate from normal values.
+    window
+        .text_system()
+        .shape_text(
+            text.to_owned().into(),
+            window.rem_size() * 0.75,
+            &runs,
+            None,
+            None,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
 fn measure_text_width<'a>(
     window: &Window,
     lines: impl Iterator<Item = &'a str>,
     padding: f32,
+    bold_labels: bool,
 ) -> f32 {
+    let mut metadata = bold_labels;
     lines
         .map(|line| {
             let text = line.replace('\t', "    ");
             let len = text.len();
-            let run = TextRun {
-                len,
-                font: font("Cascadia Mono"),
-                color: rgb(TEXT).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            f32::from(
-                window
-                    .text_system()
-                    .shape_line(text.into(), window.rem_size() * 0.75, &[run], None)
-                    .x_for_index(len),
-            )
+            if text.is_empty() {
+                metadata = false;
+            }
+            let shaped = shape_styled_line(
+                window,
+                &text,
+                TEXT,
+                if metadata { detail_label_len(&text) } else { 0 },
+            );
+            f32::from(shaped.unwrapped_layout.x_for_index(len))
         })
         .fold(0., f32::max)
         + padding
@@ -3843,12 +5370,12 @@ fn detail_rows(detail: &CommitDetail) -> Vec<String> {
     rows.extend([
         format!("작성자: {} <{}>", detail.author, detail.author_email),
         format!(
-            "작성 시간: {}",
+            "작성시간: {}",
             format_detail_time(detail.author_time, detail.author_offset)
         ),
         format!("커미터: {} <{}>", detail.committer, detail.committer_email),
         format!(
-            "커밋 시간: {}",
+            "커밋시간: {}",
             format_detail_time(detail.commit_time, detail.commit_offset)
         ),
         String::new(),
@@ -3901,7 +5428,7 @@ impl Workspace {
                     .text_sm()
                     .bg(rgb(if active { PANEL } else { BG }))
                     .text_color(rgb(if active { TEXT } else { MUTED }))
-                    .hover(|style| style.bg(rgb(0x202b38)))
+                    .hover(|style| style.bg(rgb(HOVER)))
                     .when(active, |tab| {
                         tab.child(
                             div()
@@ -3925,7 +5452,7 @@ impl Workspace {
                             .rounded_sm()
                             .flex_shrink_0()
                             .text_color(rgb(MUTED))
-                            .hover(|style| style.bg(rgb(0x344153)).text_color(rgb(TEXT)))
+                            .hover(|style| style.bg(rgb(BUTTON_HOVER)).text_color(rgb(TEXT)))
                             .child("×")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -3944,6 +5471,7 @@ impl Workspace {
             );
         }
         let top = div()
+            .border_t_1()
             .flex()
             .h(px(TAB_BAR_HEIGHT))
             .flex_shrink_0()
@@ -3988,7 +5516,7 @@ impl Workspace {
                             .px_4()
                             .py_2()
                             .text_sm()
-                            .text_color(rgb(0xf4a0a8))
+                            .text_color(rgb(ERROR))
                             .child(error),
                     )
                 })
@@ -4005,13 +5533,17 @@ impl Workspace {
                                 .text_xs()
                                 .text_color(rgb(ACCENT))
                                 .cursor_pointer()
-                                .child("? - 도움말")
+                                .child(crate::shortcut::hint(
+                                    "도움말",
+                                    &self.shortcuts.label("help"),
+                                ))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.help = true;
                                     this.focus.focus(window);
                                     cx.notify();
                                 })),
                         )
+                        .child(self.shortcuts_link(cx))
                         .child(self.settings_link(cx)),
                 );
         }
@@ -4172,7 +5704,7 @@ impl Workspace {
                             .text_xs()
                             .text_ellipsis()
                             .text_color(rgb(if self.status_error.is_some() {
-                                0xf4a0a8
+                                ERROR
                             } else {
                                 MUTED
                             }))
@@ -4184,7 +5716,10 @@ impl Workspace {
                             .text_xs()
                             .text_color(rgb(ACCENT))
                             .cursor_pointer()
-                            .child("? - 도움말")
+                            .child(crate::shortcut::hint(
+                                "도움말",
+                                &self.shortcuts.label("help"),
+                            ))
                             .id("show-help")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.help = true;
@@ -4192,6 +5727,7 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
+                    .child(self.shortcuts_link(cx))
                     .child(self.settings_link(cx)),
             )
     }
@@ -4200,7 +5736,8 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_status_error(cx);
-        if window.focused(cx).is_none() {
+        if self.focus_after_popup || window.focused(cx).is_none() {
+            self.focus_after_popup = false;
             self.focus.focus(window);
         }
         let content = self.render_content(window, cx);
@@ -4220,29 +5757,25 @@ impl Render for Workspace {
                 }
             }));
         if busy
+            || self.shortcut_settings
             || self.help
             || self.settings.is_some()
             || self.branch_dialog.is_some()
             || self.delete_target.is_some()
             || self.commit_dialog.is_some()
             || self.discard_dialog.is_some()
+            || self.stash_dialog.is_some()
         {
-            let mut card = div()
-                .id("modal-card")
-                .w(px(500.))
-                .max_w_full()
-                .p_5()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(LINE))
-                .rounded_lg()
-                .on_click(|_, _, cx| cx.stop_propagation());
+            let title;
+            let mut width = 500.;
+            let mut footer: Option<AnyElement> = None;
+            let mut header_action: Option<AnyElement> = None;
+            let mut card = div().flex().flex_col().gap_3().min_w_0().text_sm();
             if busy {
                 let message = if self.branch_busy {
-                    "브랜치 작업 중입니다…"
+                    self.remote_status
+                        .map(|(_, label)| label)
+                        .unwrap_or("작업 중입니다…")
                 } else if self
                     .tabs
                     .iter()
@@ -4253,56 +5786,252 @@ impl Render for Workspace {
                 } else {
                     "커밋 히스토리를 읽는 중입니다…"
                 };
-                card = card
-                    .child(div().text_lg().child("처리 중"))
-                    .child(message)
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(4.))
-                            .overflow_hidden()
-                            .bg(rgb(LINE))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .h_full()
-                                    .w(relative(0.3))
-                                    .bg(rgb(ACCENT))
-                                    .with_animation(
-                                        "workspace-progress",
-                                        Animation::new(std::time::Duration::from_millis(900))
-                                            .repeat(),
-                                        |bar, progress| bar.left(relative(progress * 1.3 - 0.3)),
-                                    ),
-                            ),
-                    );
+                title = "처리 중";
+                card = card.child(message).child(
+                    div()
+                        .relative()
+                        .w_full()
+                        .h(px(4.))
+                        .overflow_hidden()
+                        .bg(rgb(LINE))
+                        .child(
+                            div()
+                                .absolute()
+                                .h_full()
+                                .w(relative(0.3))
+                                .bg(rgb(ACCENT))
+                                .with_animation(
+                                    "workspace-progress",
+                                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                                    |bar, progress| bar.left(relative(progress * 1.3 - 0.3)),
+                                ),
+                        ),
+                );
             } else if let Some(dialog) = &self.branch_dialog {
-                card = card.child(div().text_lg().child(match &dialog.action {
+                title = match &dialog.action {
                     BranchAction::Create { .. } => "브랜치 만들기",
+                    BranchAction::Tag { .. } => "태그 만들기",
+                    BranchAction::Delete { plan, .. } => plan.kind.title(),
+                    BranchAction::Upload { .. } => "브랜치 푸시",
+                    BranchAction::ChooseCheckout { .. } => "체크아웃할 브랜치 선택",
+                    BranchAction::Reset { .. } => "Reset",
+                    BranchAction::Revert { .. } => "Revert",
+                    BranchAction::Integrate { kind, .. } => kind.label(),
                     BranchAction::Track(_) => "로컬 브랜치 만들기",
-                }));
+                };
+                let create = matches!(dialog.action, BranchAction::Create { .. });
+                let minimal = create
+                    || matches!(
+                        dialog.action,
+                        BranchAction::Tag { .. }
+                            | BranchAction::Delete { .. }
+                            | BranchAction::Upload { .. }
+                            | BranchAction::Reset { .. }
+                            | BranchAction::Revert { .. }
+                            | BranchAction::Integrate { .. }
+                    );
+                if create {
+                    card = card.text_size(px(13.));
+                }
                 match &dialog.action {
-                    BranchAction::Create { commit } => {
+                    BranchAction::Create { .. } | BranchAction::Tag { .. } => {
+                        let tag = matches!(dialog.action, BranchAction::Tag { .. });
                         card = card
-                            .child(format!("선택 커밋: {}", &commit[..commit.len().min(12)]))
-                            .child("브랜치명")
+                            .child(if tag { "태그명" } else { "브랜치명" })
                             .when_some(dialog.editor.clone(), |card, editor| {
                                 card.child(
                                     div()
                                         .h(px(36.))
+                                        .overflow_hidden()
                                         .border_1()
                                         .border_color(rgb(LINE))
                                         .p_1()
                                         .child(editor),
                                 )
-                            })
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("브랜치만 생성하고 현재 체크아웃은 유지합니다."),
+                            });
+                    }
+                    // Other actions retain their existing controls.
+                    BranchAction::Delete {
+                        plan,
+                        delete_related,
+                    } => {
+                        use crate::branches::DeleteKind;
+                        card = card.child(match plan.kind {
+                            DeleteKind::Local => "선택한 로컬 브랜치를 삭제할까요?",
+                            DeleteKind::Remote => "선택한 서버의 원격 브랜치를 삭제할까요?",
+                            DeleteKind::Tag => "선택한 태그를 삭제할까요?",
+                        });
+                        if plan.kind != DeleteKind::Tag {
+                            let (relationship, checkbox) = if plan.kind == DeleteKind::Local {
+                                ("원격 브랜치", "원격 브랜치 삭제")
+                            } else {
+                                ("로컬 브랜치", "로컬 브랜치 삭제")
+                            };
+                            let can_delete_related = !plan.related.is_empty();
+                            let names = plan
+                                .related
+                                .iter()
+                                .map(|target| target.label())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            card = card
+                                .child(format!(
+                                    "{relationship}: {}",
+                                    if names.is_empty() { "없음" } else { &names }
+                                ))
+                                .child(
+                                    button("delete-related-branch", "", false)
+                                        .when(can_delete_related, |button| {
+                                            button.track_focus(&self.branch_checks_focus[0])
+                                        })
+                                        .when(
+                                            can_delete_related
+                                                && self.branch_checks_focus[0].is_focused(window),
+                                            |button| button.bg(rgb(SELECT)),
+                                        )
+                                        .when(!can_delete_related, |button| button.opacity(0.45))
+                                        .child(crate::controls::checkbox(*delete_related, checkbox))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if this.branch_busy {
+                                                return;
+                                            }
+                                            if let Some(dialog) = &mut this.branch_dialog
+                                                && let BranchAction::Delete {
+                                                    plan,
+                                                    delete_related,
+                                                } = &mut dialog.action
+                                                && !plan.related.is_empty()
+                                            {
+                                                *delete_related = !*delete_related;
+                                                this.branch_checks_focus[0].focus(window);
+                                                cx.notify();
+                                            }
+                                        })),
+                                );
+                        }
+                    }
+                    BranchAction::Upload { .. } => {
+                        card = card.child("원격 이름").when_some(
+                            dialog.editor.clone(),
+                            |card, editor| {
+                                card.child(div().h(px(36.)).overflow_hidden().child(editor))
+                            },
+                        );
+                    }
+                    BranchAction::ChooseCheckout { candidates, .. } => {
+                        let mut choices = div()
+                            .id("checkout-choices")
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .max_h(px(240.))
+                            .overflow_y_scroll();
+                        for (index, candidate) in candidates.iter().enumerate() {
+                            let label = div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .when(index < 10, |row| {
+                                    row.child(crate::shortcut::badge(
+                                        &self
+                                            .shortcuts
+                                            .label(&format!("checkout-{}", (index + 1) % 10)),
+                                    ))
+                                })
+                                .child(candidate.label.clone());
+                            choices = choices.child(
+                                button(("checkout-choice", index), "", false)
+                                    .child(label)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.choose_checkout_candidate(index, cx)
+                                    })),
                             );
+                        }
+                        card = card.child(choices);
+                    }
+                    BranchAction::Reset { mode, .. } => {
+                        for (index, option) in
+                            crate::branches::ResetMode::ALL.iter().copied().enumerate()
+                        {
+                            let checked = option == *mode;
+                            card = card.child(
+                                button(("reset-radio", index), "", checked)
+                                    .when(checked, |button| {
+                                        button.track_focus(&self.reset_mode_focus)
+                                    })
+                                    .child(crate::controls::radio(
+                                        checked,
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(crate::shortcut::badge(
+                                                &self
+                                                    .shortcuts
+                                                    .label(&format!("reset-{}", index + 1)),
+                                            ))
+                                            .child(option.label()),
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if this.branch_busy {
+                                            return;
+                                        }
+                                        if let Some(dialog) = &mut this.branch_dialog
+                                            && let BranchAction::Reset { mode, .. } =
+                                                &mut dialog.action
+                                        {
+                                            *mode = option;
+                                        }
+                                        this.reset_mode_focus.focus(window);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        card = card.child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(if *mode == crate::branches::ResetMode::Hard {
+                                    ERROR
+                                } else {
+                                    MUTED
+                                }))
+                                .child(mode.description()),
+                        );
+                    }
+                    BranchAction::Revert { no_commit, .. } => {
+                        card = card.child(
+                            button("revert-no-commit", "", false)
+                                .track_focus(&self.branch_checks_focus[0])
+                                .when(self.branch_checks_focus[0].is_focused(window), |button| {
+                                    button.bg(rgb(SELECT))
+                                })
+                                .child(crate::controls::checkbox(*no_commit, "no commit"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if this.branch_busy {
+                                        return;
+                                    }
+                                    if let Some(dialog) = &mut this.branch_dialog
+                                        && let BranchAction::Revert { no_commit, .. } =
+                                            &mut dialog.action
+                                    {
+                                        *no_commit = !*no_commit;
+                                        this.popup_options.revert_no_commit = *no_commit;
+                                    }
+                                    this.branch_checks_focus[0].focus(window);
+                                    this.persist();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    BranchAction::Integrate { kind, .. } => {
+                        card = card.child(match kind {
+                            crate::branches::IntegrateKind::Merge => {
+                                "선택한 커밋의 이력을 현재 체크아웃된 HEAD에 병합할까요?"
+                            }
+                            crate::branches::IntegrateKind::Rebase => {
+                                "현재 브랜치의 고유 커밋들을 선택한 커밋 위에 재배치할까요?"
+                            }
+                        });
                     }
                     BranchAction::Track(target) => {
                         card = card
@@ -4316,57 +6045,195 @@ impl Render for Workspace {
                             ));
                     }
                 }
-                card = card
-                    .when_some(dialog.error.clone(), |card, error| {
-                        card.child(div().text_color(rgb(0xf4a0a8)).child(error))
-                    })
-                    .child(
+                if let BranchAction::Create {
+                    remote, checkout, ..
+                } = &dialog.action
+                {
+                    for (id, label, checked, switching) in [
+                        ("create-remote-option", "원격브랜치 생성", *remote, false),
+                        (
+                            "create-checkout-option",
+                            "새로운 브랜치 체크아웃",
+                            *checkout,
+                            true,
+                        ),
+                    ] {
+                        card = card.child(
+                            button(id, "", false)
+                                .track_focus(&self.branch_checks_focus[usize::from(switching)])
+                                .when(
+                                    self.branch_checks_focus[usize::from(switching)]
+                                        .is_focused(window),
+                                    |button| button.bg(rgb(SELECT)),
+                                )
+                                .py(px(crate::controls::CHECKBOX_PADDING))
+                                .flex()
+                                .items_center()
+                                .text_size(px(13.))
+                                .child(crate::controls::checkbox(checked, label))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.branch_checks_focus[usize::from(switching)].focus(window);
+                                    if let Some(dialog) = &mut this.branch_dialog
+                                        && let BranchAction::Create {
+                                            remote, checkout, ..
+                                        } = &mut dialog.action
+                                    {
+                                        if switching {
+                                            *checkout = !*checkout;
+                                        } else {
+                                            *remote = !*remote;
+                                        }
+                                        if let Some(dialog) = &this.branch_dialog
+                                            && let BranchAction::Create {
+                                                remote, checkout, ..
+                                            } = &dialog.action
+                                        {
+                                            this.popup_options.branch_remote = *remote;
+                                            this.popup_options.branch_checkout = *checkout;
+                                        }
+                                        this.persist();
+                                        cx.notify();
+                                    }
+                                })),
+                        );
+                    }
+                }
+                card = card.when_some(dialog.error.clone(), |card, error| {
+                    card.child(div().text_color(rgb(ERROR)).child(error))
+                });
+                if !matches!(dialog.action, BranchAction::ChooseCheckout { .. }) {
+                    footer = Some(
                         div()
                             .flex()
+                            .flex_row_reverse()
                             .gap_2()
+                            .when(minimal, |footer| footer.justify_end())
                             .child(
-                                button("confirm-branch", "확인 · enter", true)
+                                button("confirm-branch", "확인", true)
+                                    .when(create, |button| button.text_size(px(13.)))
                                     .on_click(cx.listener(|this, _, _, cx| this.submit_branch(cx))),
                             )
-                            .child(button("cancel-branch", "취소 · esc", false).on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_branch_dialog(window, cx)
-                                }),
-                            )),
+                            .when(!minimal, |footer| {
+                                footer.child(
+                                    button(
+                                        "cancel-branch",
+                                        format!("취소 · {}", self.shortcuts.label("cancel")),
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.close_branch_dialog(window, cx),
+                                    )),
+                                )
+                            })
+                            .into_any_element(),
                     );
+                }
             } else if let Some(settings) = &self.settings {
-                card = card
-                    .w(px(760.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_lg().child("세팅"))
-                            .child(
-                                button("close-settings", "닫기 · esc", false)
-                                    .when(!settings.read(cx).can_close(), |button| {
-                                        button.opacity(0.45)
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.close_settings(window, cx)
-                                    })),
-                            ),
+                title = "세팅";
+                width = 760.;
+                header_action = Some(
+                    button(
+                        "close-settings",
+                        format!("취소 · {}", self.shortcuts.label("cancel")),
+                        false,
                     )
-                    .child(settings.clone());
-            } else if let Some(dialog) = &self.discard_dialog {
-                card = card.w(px(640.)).child(div().text_sm().child("선택한 변경사항 폐기"))
-                    .child(format!("{}개 파일의 staged·unstaged 변경을 HEAD로 복원합니다. 신규 파일은 삭제됩니다.",dialog.paths.len()))
-                    .when_some(dialog.error.clone(),|card,error| card.child(div().text_color(rgb(0xf4a0a8)).child(error)))
-                    .when(dialog.busy,|card| card.child("변경사항을 폐기하는 중입니다…"))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child("폐기 : ctrl + s, 취소 : esc"));
-            } else if let Some(dialog) = &self.commit_dialog {
+                    .when(!settings.read(cx).can_close(), |button| {
+                        button.opacity(0.45)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
+                    .into_any_element(),
+                );
+                card = card.child(settings.clone());
+            } else if let Some(dialog) = &self.stash_dialog {
+                title = if dialog.deletion.is_some() {
+                    "Stash 삭제"
+                } else {
+                    "스태시 이름 입력"
+                };
+                width = 640.;
                 card = card
-                    .w(px(640.))
-                    .child(div().text_sm().child("커밋"))
+                    .when_some(dialog.editor.clone(), |card, editor| card.child(editor))
+                    .child(if let Some((_, _, name)) = &dialog.deletion {
+                        format!("{name}\n스태시를 목록에서 영구히 삭제합니다. 현재 파일과 stage 상태는 유지됩니다.")
+                    } else {
+                        "이름을 입력하세요. 모든 tracked 파일의 staged·unstaged 변경과 untracked 파일을 저장합니다. Stage 상태도 보관하며 ignored 파일은 제외합니다.".to_owned()
+                    })
+                    .when_some(dialog.error.clone(), |card, error| card.child(div().text_color(rgb(ERROR)).child(error)));
+                if dialog.busy {
+                    card = card.child(if dialog.deletion.is_some() {
+                        "스태시를 삭제하는 중입니다…"
+                    } else {
+                        "스태시에 저장하는 중입니다…"
+                    });
+                } else {
+                    footer = Some(
+                        (div()
+                            .flex()
+                            .flex_row_reverse()
+                            .gap_2()
+                            .child(
+                                button("confirm-stash", "확인", true)
+                                    .on_click(cx.listener(|this, _, _, cx| this.stash_changes(cx))),
+                            )
+                            .when(dialog.deletion.is_none(), |footer| {
+                                footer.child(
+                                    button(
+                                        "cancel-stash",
+                                        format!("취소 · {}", self.shortcuts.label("cancel")),
+                                        false,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.stash_dialog = None;
+                                            this.focus.focus(window);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            }))
+                        .into_any_element(),
+                    );
+                }
+            } else if let Some(dialog) = &self.discard_dialog {
+                title = "선택한 변경사항 폐기";
+                width = 640.;
+                card = card
+                    .child(format!("{}개 파일의 staged·unstaged 변경을 HEAD로 복원합니다. 신규 파일은 삭제됩니다.", dialog.paths.len()))
+                    .when_some(dialog.error.clone(), |card, error| card.child(div().text_color(rgb(ERROR)).child(error)))
+                    .when(dialog.busy, |card| card.child("변경사항을 폐기하는 중입니다…"));
+                footer = Some(
+                    button("confirm-discard", "확인", true)
+                        .when(dialog.busy, |button| button.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| this.discard_selected(cx)))
+                        .into_any_element(),
+                );
+            } else if let Some(dialog) = &self.commit_dialog {
+                title = "커밋";
+                width = 640.;
+                card = card
+                    .child(div().text_color(rgb(MUTED)).child("커밋메시지"))
                     .child(dialog.editor.clone())
+                    .child(
+                        button("commit-push-option", "", false)
+                            .track_focus(&self.commit_push_focus)
+                            .when(self.commit_push_focus.is_focused(window), |button| {
+                                button.bg(rgb(SELECT))
+                            })
+                            .when(dialog.busy, |button| button.opacity(0.45))
+                            .child(crate::controls::checkbox(dialog.push_after, "커밋 후 푸시"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(dialog) = &mut this.commit_dialog
+                                    && !dialog.busy
+                                    && !dialog.editor.read(cx).is_composing()
+                                {
+                                    dialog.push_after = !dialog.push_after;
+                                    this.commit_push_focus.focus(window);
+                                    cx.notify();
+                                }
+                            })),
+                    )
                     .when_some(dialog.error.clone(), |card, error| {
-                        card.child(div().text_color(rgb(0xf4a0a8)).child(error))
+                        card.child(div().text_color(rgb(ERROR)).child(error))
                     })
                     .when(dialog.busy, |card| {
                         card.child(if dialog.push_after {
@@ -4374,21 +6241,22 @@ impl Render for Workspace {
                         } else {
                             "커밋하는 중입니다…"
                         })
-                    })
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("커밋 : ctrl + s, 커밋 후 푸시 : ctrl + p, 취소 : esc"),
-                    );
+                    });
+                footer = Some(
+                    button("confirm-commit", "확인", true)
+                        .when(dialog.busy, |button| button.opacity(0.45))
+                        .on_click(cx.listener(|this, _, _, cx| this.submit_commit(cx)))
+                        .into_any_element(),
+                );
             } else if let Some(path) = &self.delete_target
                 && !self.delete_confirm
             {
+                title = "최근 저장소 관리";
                 card = card
-                    .child(div().text_lg().child("최근 저장소 관리"))
                     .child(session::display_path(path))
-                    .child("목록에서만 제거하거나 저장소 폴더를 삭제할 수 있습니다.")
-                    .child(
+                    .child("목록에서만 제거하거나 저장소 폴더를 삭제할 수 있습니다.");
+                footer =
+                    Some(
                         div()
                             .flex()
                             .gap_2()
@@ -4412,30 +6280,68 @@ impl Render for Workspace {
                                     this.delete_target = None;
                                     cx.notify();
                                 }),
-                            )),
+                            ))
+                            .into_any_element(),
                     );
             } else if let Some(path) = &self.delete_target {
+                title = "저장소 삭제";
                 card = card
-                    .child(div().text_lg().child("저장소 삭제"))
                     .child(session::display_path(path))
-                    .child("미커밋 파일을 포함한 저장소 폴더 전체를 휴지통으로 이동합니다.")
-                    .child(
+                    .child("미커밋 파일을 포함한 저장소 폴더 전체를 휴지통으로 이동합니다.");
+                footer = Some(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(button("cancel-delete", "취소", false).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.delete_target = None;
+                                cx.notify();
+                            },
+                        )))
+                        .child(
+                            button("confirm-delete", "휴지통으로 이동", true)
+                                .on_click(cx.listener(|this, _, _, cx| this.delete_repository(cx))),
+                        )
+                        .into_any_element(),
+                );
+            } else {
+                title = if self.shortcut_settings {
+                    "단축키 설정"
+                } else {
+                    "도움말"
+                };
+                width = 820.;
+                card = card.child(self.shortcuts_table(self.shortcut_settings, cx));
+                if self.shortcut_settings {
+                    footer = Some(
                         div()
                             .flex()
                             .gap_2()
-                            .child(button("cancel-delete", "취소", false).on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.delete_target = None;
+                            .child(button("reset-shortcuts", "기본값 복원", false).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.shortcut_draft =
+                                        Some(crate::shortcut::Bindings::default());
+                                    this.shortcut_capture = None;
+                                    this.shortcut_message = None;
                                     cx.notify();
-                                },
-                            )))
-                            .child(button("confirm-delete", "휴지통으로 이동", true).on_click(
-                                cx.listener(|this, _, _, cx| this.delete_repository(cx)),
-                            )),
+                                }),
+                            ))
+                            .child(button("confirm-shortcuts", "확인", true).on_click(
+                                cx.listener(|this, _, window, cx| this.apply_shortcuts(window, cx)),
+                            ))
+                            .into_any_element(),
                     );
-            } else {
-                card = card.child(shortcut_help(window));
+                }
             }
+            let card = crate::popup::frame(
+                title,
+                width,
+                card,
+                footer,
+                header_action,
+                window.viewport_size().height,
+                self.shortcut_settings.then_some(640.),
+            );
             root = root.child(
                 div()
                     .id("modal-backdrop")
@@ -4445,7 +6351,7 @@ impl Render for Workspace {
                     .items_center()
                     .justify_center()
                     .occlude()
-                    .bg(rgba(0x000000a0))
+                    .bg(rgba(BACKDROP))
                     .text_color(rgb(TEXT))
                     .font_family("Segoe UI")
                     .text_sm()
@@ -4475,11 +6381,17 @@ impl Render for Workspace {
                                 .discard_dialog
                                 .as_ref()
                                 .is_some_and(|dialog| dialog.busy)
+                            && !this.stash_dialog.as_ref().is_some_and(|dialog| dialog.busy)
                         {
                             this.help = false;
+                            this.shortcut_settings = false;
+                            this.shortcut_draft = None;
+                            this.shortcut_capture = None;
+                            this.shortcut_message = None;
                             this.delete_target = None;
                             this.commit_dialog = None;
                             this.discard_dialog = None;
+                            this.stash_dialog = None;
                             this.focus.focus(window);
                             cx.notify();
                         }
@@ -4495,6 +6407,29 @@ impl Render for Workspace {
 #[cfg(test)]
 mod detail_tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn ijkl_and_checkout_digit_shortcuts_map_correctly() {
+        assert_eq!(navigation_key("i"), "up");
+        assert_eq!(navigation_key("j"), "left");
+        assert_eq!(navigation_key("K"), "down");
+        assert_eq!(navigation_key("l"), "right");
+        assert_eq!(navigation_key("up"), "up");
+        assert_eq!(candidate_shortcut("1"), Some(0));
+        assert_eq!(candidate_shortcut("9"), Some(8));
+        assert_eq!(candidate_shortcut("0"), Some(9));
+        assert_eq!(candidate_shortcut("10"), None);
+    }
+
+    #[::core::prelude::v1::test]
+    fn numeric_shortcuts_map_to_sections_and_current_viewer() {
+        assert_eq!(section_focus("1", 7, false), Some(ListFocus::Branches(7)));
+        assert_eq!(section_focus("2", 7, false), Some(ListFocus::History(7)));
+        assert_eq!(section_focus("3", 7, false), Some(ListFocus::Files(7)));
+        assert_eq!(section_focus("4", 7, false), Some(ListFocus::Text((7, 30))));
+        assert_eq!(section_focus("4", 7, true), Some(ListFocus::Text((7, 31))));
+        assert_eq!(section_focus("5", 7, false), None);
+    }
 
     #[::core::prelude::v1::test]
     fn opening_repository_replaces_only_the_origin_empty_tab_in_place() {
@@ -4553,6 +6488,40 @@ mod detail_tests {
         assert_eq!(tabs[1].project().unwrap().path, path);
     }
 
+    #[::core::prelude::v1::test]
+    fn text_drag_clamps_vertical_position_to_viewport() {
+        assert_eq!(clamp_drag_y(5., 10., 100.), 10.);
+        assert_eq!(clamp_drag_y(60., 10., 100.), 60.);
+        assert!(clamp_drag_y(150., 10., 100.) < 110.);
+        assert!(clamp_drag_y(150., 10., 100.) > 109.);
+        assert_eq!(clamp_drag_y(150., 10., 0.), 10.);
+    }
+
+    #[::core::prelude::v1::test]
+    fn metadata_labels_only_cover_prefixes() {
+        for label in [
+            "커밋",
+            "상위 항목",
+            "작성자",
+            "작성시간",
+            "커미터",
+            "커밋시간",
+        ] {
+            assert_eq!(
+                detail_label_len(&format!("{label}: value")),
+                label.len() + 1
+            );
+        }
+        assert_eq!(detail_label_len("제목: message"), 0);
+        assert_eq!(detail_label_len(""), 0);
+        let text = "작성자: 이름";
+        let runs = styled_runs(text, TEXT, detail_label_len(text));
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].font.weight, FontWeight::BOLD);
+        assert_eq!(runs[1].font.weight, FontWeight::NORMAL);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+    }
+
     fn detail(parents: &[&str]) -> CommitDetail {
         CommitDetail {
             id: "commit-id".into(),
@@ -4579,8 +6548,8 @@ mod detail_tests {
                 .iter()
                 .any(|line| line == "부모:" || line == "상위 항목:" || line == "커밋 메시지")
         );
-        assert!(rows.contains(&"작성 시간: 1970-01-01 09:00:00".into()));
-        assert!(rows.contains(&"커밋 시간: 1969-12-31 20:00:00".into()));
+        assert!(rows.contains(&"작성시간: 1970-01-01 09:00:00".into()));
+        assert!(rows.contains(&"커밋시간: 1969-12-31 20:00:00".into()));
         assert_eq!(&rows[rows.len() - 4..], ["제목", "", "본문", ""]);
     }
 

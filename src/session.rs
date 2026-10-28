@@ -2,9 +2,22 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PopupOptions {
+    pub branch_remote: bool,
+    pub branch_checkout: bool,
+    pub revert_no_commit: bool,
+    pub use_global: Option<bool>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub shortcuts: crate::shortcut::Bindings,
     pub version: u8,
+    #[serde(default)]
+    pub popup_options: PopupOptions,
     pub tabs: Vec<Option<PathBuf>>,
     pub active: usize,
     pub recent: Vec<PathBuf>,
@@ -14,6 +27,8 @@ impl Default for Session {
     fn default() -> Self {
         Self {
             version: 1,
+            shortcuts: crate::shortcut::Bindings::default(),
+            popup_options: PopupOptions::default(),
             tabs: vec![None],
             active: 0,
             recent: Vec::new(),
@@ -96,6 +111,18 @@ pub fn restore_paths(state: &mut Session, arguments: Vec<PathBuf>) -> Vec<String
     errors
 }
 
+pub fn save_shortcuts(
+    path: &Path,
+    state: &mut Session,
+    draft: &crate::shortcut::Bindings,
+) -> Result<()> {
+    let mut updated = state.clone();
+    updated.shortcuts = draft.clone();
+    save(path, &updated)?;
+    state.shortcuts = updated.shortcuts;
+    Ok(())
+}
+
 pub fn save(path: &Path, state: &Session) -> Result<()> {
     let parent = path.parent().context("상태 저장 경로가 잘못되었습니다.")?;
     std::fs::create_dir_all(parent)?;
@@ -126,6 +153,32 @@ pub fn remember(recent: &mut Vec<PathBuf>, path: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shortcuts_confirmation_saves_all_groups_and_keeps_state_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.json");
+        let mut state = Session::default();
+        save(&path, &state).unwrap();
+        let mut draft = state.shortcuts.clone();
+        draft.set("refresh", 0, "alt-z".into()).unwrap();
+        draft.set("viewer-copy", 0, "alt-c".into()).unwrap();
+        assert!(state.shortcuts.0.is_empty());
+        assert!(load(&path).unwrap().shortcuts.0.is_empty());
+        save_shortcuts(&path, &mut state, &draft).unwrap();
+        assert_eq!(state.shortcuts.0, draft.0);
+        assert_eq!(load(&path).unwrap().shortcuts.0, draft.0);
+        let before = state.shortcuts.0.clone();
+        let blocker = temp.path().join("file");
+        std::fs::write(&blocker, "blocking directory creation").unwrap();
+        let defaults = crate::shortcut::Bindings::default();
+        assert!(save_shortcuts(&blocker.join("session.json"), &mut state, &defaults).is_err());
+        assert_eq!(state.shortcuts.0, before);
+        assert_eq!(load(&path).unwrap().shortcuts.0, before);
+        save_shortcuts(&path, &mut state, &defaults).unwrap();
+        assert!(state.shortcuts.0.is_empty());
+        assert!(load(&path).unwrap().shortcuts.0.is_empty());
+    }
+
     #[test]
     fn empty_active_tab_does_not_validate_inactive_repositories() {
         let temp = tempfile::tempdir().unwrap();
@@ -202,9 +255,33 @@ mod tests {
         remember(&mut state.recent, "other".into());
         remember(&mut state.recent, "한글 repo".into());
         remember(&mut state.recent, "other".into());
+        state.popup_options.branch_remote = true;
+        state.popup_options.branch_checkout = true;
+        state.popup_options.revert_no_commit = true;
+        state.popup_options.use_global = Some(false);
+        state.shortcuts.set("refresh", 0, "alt-z".into()).unwrap();
         save(&path, &state).unwrap();
         save(&path, &state).unwrap();
         let restored = load(&path).unwrap();
+        assert_eq!(restored.shortcuts.0, state.shortcuts.0);
+        assert!(
+            serde_json::from_str::<Session>(
+                r#"{"version":1,"tabs":[null],"active":0,"recent":[]}"#
+            )
+            .unwrap()
+            .shortcuts
+            .0
+            .is_empty()
+        );
+        assert_eq!(restored.popup_options, state.popup_options);
+        assert_eq!(
+            serde_json::from_str::<Session>(
+                r#"{"version":1,"tabs":[null],"active":0,"recent":[]}"#
+            )
+            .unwrap()
+            .popup_options,
+            PopupOptions::default()
+        );
         assert_eq!(restored.tabs, state.tabs);
         assert_eq!(restored.active, 1);
         assert_eq!(

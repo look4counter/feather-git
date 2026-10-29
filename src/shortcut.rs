@@ -134,11 +134,13 @@ pub fn subsections(group: &str) -> &'static [&'static str] {
 pub fn in_subsection(command: &Command, subsection: &str) -> bool {
     match command.group {
         "브랜치" => match command.id.as_str() {
-            "branch-upload" => subsection == "Local",
+            "branch-upstream" => subsection == "Local",
             "branch-delete-server" => subsection == "Remote",
             _ => subsections(command.group).contains(&subsection),
         },
-        "파일목록" => subsection == "Stage",
+        "파일목록" => {
+            subsection == "Stage" || (command.id == "files-tree" && subsection == "History")
+        }
         _ => subsection.is_empty(),
     }
 }
@@ -225,11 +227,11 @@ pub fn commands() -> Vec<Command> {
             "space",
         ),
         (
-            "branch-upload",
+            "branch-upstream",
             "브랜치",
             "local-branches",
-            "브랜치 푸시",
-            "u",
+            "원격 브랜치 연결",
+            "r",
         ),
         (
             "branch-checkout",
@@ -266,6 +268,7 @@ pub fn commands() -> Vec<Command> {
             "o",
         ),
         ("files-all", "파일목록", "files", "전체 선택", "ctrl-a"),
+        ("files-tree", "파일목록", "files", "트리 모드 전환", "`"),
         (
             "files-stage",
             "파일목록",
@@ -298,16 +301,22 @@ pub fn commands() -> Vec<Command> {
         ),
         ("viewer-all", "뷰어", "viewer", "전체 선택", "ctrl-a"),
         ("viewer-copy", "뷰어", "viewer", "복사", "ctrl-c"),
+        (
+            "viewer-toggle-line",
+            "뷰어",
+            "viewer",
+            "현재 변경 줄 체크 / 해제",
+            "space",
+        ),
+        (
+            "viewer-stage-lines",
+            "뷰어",
+            "viewer",
+            "선택한 줄 Stage",
+            "enter",
+        ),
     ] {
-        add(
-            id,
-            group,
-            scope,
-            name,
-            if id == "branch-upload" { "u" } else { key },
-            key,
-            "",
-        );
+        add(id, group, scope, name, key, key, "");
     }
     for (id, name, key, second) in [
         ("confirm", "확인", "enter", "ctrl-s"),
@@ -378,7 +387,8 @@ pub fn chord(key: &Keystroke) -> String {
     value
 }
 
-const DIALOG_SCOPES: [&str; 10] = [
+const DIALOG_SCOPES: [&str; 11] = [
+    "upstream",
     "dialog",
     "modal",
     "branch",
@@ -406,9 +416,11 @@ fn applies(command_scope: &str, scope: &str) -> bool {
                 "stage-files",
                 "viewer",
                 "reset",
+                "upstream",
             ]
             .contains(&scope))
-        || (command_scope == "toggle" && ["branch", "reset", "commit-modal"].contains(&scope))
+        || (command_scope == "toggle"
+            && ["branch", "reset", "commit-modal", "upstream"].contains(&scope))
         || (command_scope == "*"
             && [
                 "branches",
@@ -433,6 +445,7 @@ fn overlap(a: &str, b: &str) -> bool {
         "viewer",
         "modal",
         "branch",
+        "upstream",
         "checkout",
         "reset",
         "stash-modal",
@@ -531,6 +544,52 @@ impl Bindings {
 #[cfg(test)]
 mod binding_tests {
     use super::*;
+    #[::core::prelude::v1::test]
+    fn tree_toggle_is_scoped_to_both_file_tabs_and_can_be_remapped() {
+        let mut bindings = Bindings::default();
+        for scope in ["files", "stage-files"] {
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("`").unwrap())
+                        .unwrap()
+                ),
+                "`"
+            );
+        }
+        for scope in [
+            "main",
+            "branches",
+            "history",
+            "viewer",
+            "commit-modal",
+            "settings-modal",
+            "clone",
+        ] {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("`").unwrap())
+                    .is_none()
+            );
+        }
+        bindings.set("files-tree", 0, "alt-y".into()).unwrap();
+        for scope in ["files", "stage-files"] {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("`").unwrap())
+                    .is_none()
+            );
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("alt-y").unwrap())
+                        .unwrap()
+                ),
+                "`"
+            );
+        }
+        assert!(bindings.set("files-all", 1, "alt-y".into()).is_err());
+    }
     #[::core::prelude::v1::test]
     fn remaps_both_slots_and_disables_old_keys() {
         let mut bindings = Bindings::default();
@@ -787,13 +846,16 @@ mod binding_tests {
             assert!(in_subsection(jump, subsection));
         }
         assert_eq!(commands.iter().filter(|c| c.id == jump.id).count(), 1);
-        let upload = commands.iter().find(|c| c.id == "branch-upload").unwrap();
+        let upload = commands.iter().find(|c| c.id == "branch-upstream").unwrap();
         assert!(in_subsection(upload, "Local"));
         assert!(!in_subsection(upload, "Remote"));
-        assert!(
-            !commands
+        assert_eq!(
+            commands
                 .iter()
-                .any(|c| c.group == "파일목록" && in_subsection(c, "History"))
+                .filter(|c| c.group == "파일목록" && in_subsection(c, "History"))
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["files-tree"]
         );
         let mut bindings = Bindings::default();
         for command in commands
@@ -823,21 +885,49 @@ mod binding_tests {
     }
 
     #[::core::prelude::v1::test]
-    fn local_branch_push_uses_u_and_branch_shortcuts_override_common_keys() {
+    fn local_upstream_replaces_push_and_branch_shortcuts_override_common_keys() {
         let mut bindings = Bindings::default();
         let definition = commands()
             .into_iter()
-            .find(|c| c.id == "branch-upload")
+            .find(|c| c.id == "branch-upstream")
             .unwrap();
-        assert_eq!(definition.name, "브랜치 푸시");
-        assert_eq!(definition.defaults, ["u", ""]);
+        assert_eq!(definition.name, "원격 브랜치 연결");
+        assert_eq!(definition.defaults, ["r", ""]);
+        assert!(!commands().iter().any(|c| c.id == "branch-upload"));
+        bindings
+            .0
+            .insert("branch-upload".into(), ["u".into(), "alt-z".into()]);
+        assert!(
+            bindings
+                .resolve("local-branches", &Keystroke::parse("u").unwrap())
+                .is_none()
+        );
+        assert!(
+            bindings
+                .resolve("local-branches", &Keystroke::parse("alt-z").unwrap())
+                .is_none()
+        );
+        for scope in ["branches", "files", "viewer", "main"] {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("r").unwrap())
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            bindings
+                .resolve("history", &Keystroke::parse("r").unwrap())
+                .unwrap()
+                .key,
+            "r"
+        );
         assert_eq!(
             chord(
                 &bindings
-                    .resolve("local-branches", &Keystroke::parse("u").unwrap())
+                    .resolve("local-branches", &Keystroke::parse("r").unwrap())
                     .unwrap()
             ),
-            "u"
+            "r"
         );
         for scope in [
             "local-branches",
@@ -857,14 +947,14 @@ mod binding_tests {
                 "shift-p"
             );
         }
-        bindings.set("branch-upload", 0, "f5".into()).unwrap();
+        bindings.set("branch-upstream", 0, "f5".into()).unwrap();
         assert_eq!(
             chord(
                 &bindings
                     .resolve("local-branches", &Keystroke::parse("f5").unwrap())
                     .unwrap()
             ),
-            "u"
+            "r"
         );
         assert_eq!(
             chord(
@@ -876,14 +966,14 @@ mod binding_tests {
         );
         bindings.set("refresh", 1, "f5".into()).unwrap_err();
         bindings.set("branch-delete", 1, "f5".into()).unwrap_err();
-        bindings.set("branch-upload", 0, "alt-u".into()).unwrap();
+        bindings.set("branch-upstream", 0, "alt-u".into()).unwrap();
         bindings.set("refresh", 1, "alt-u".into()).unwrap();
         assert_eq!(
             bindings
                 .resolve("local-branches", &Keystroke::parse("alt-u").unwrap())
                 .unwrap()
                 .key,
-            "u"
+            "r"
         );
         assert_eq!(
             bindings
@@ -928,5 +1018,79 @@ mod binding_tests {
                 }
             }
         }
+    }
+
+    #[::core::prelude::v1::test]
+    fn viewer_line_shortcuts_remap_both_slots_without_changing_other_scopes() {
+        let mut bindings = Bindings::default();
+        for (id, default, custom, alternate) in [
+            ("viewer-toggle-line", "space", "alt-y", "ctrl-alt-y"),
+            ("viewer-stage-lines", "enter", "alt-z", "ctrl-alt-z"),
+        ] {
+            let command = commands()
+                .into_iter()
+                .find(|command| command.id == id)
+                .unwrap();
+            assert_eq!(command.group, "뷰어");
+            assert_eq!(
+                bindings
+                    .resolve("viewer", &Keystroke::parse(default).unwrap())
+                    .unwrap()
+                    .key,
+                default
+            );
+            bindings.set(id, 0, custom.into()).unwrap();
+            bindings.set(id, 1, alternate.into()).unwrap();
+            assert!(
+                bindings
+                    .resolve("viewer", &Keystroke::parse(default).unwrap())
+                    .is_none()
+            );
+            for key in [custom, alternate] {
+                assert_eq!(
+                    bindings
+                        .resolve("viewer", &Keystroke::parse(key).unwrap())
+                        .unwrap()
+                        .key,
+                    default
+                );
+                for scope in [
+                    "main",
+                    "files",
+                    "stage-files",
+                    "history",
+                    "branches",
+                    "commit-modal",
+                    "branch",
+                ] {
+                    assert!(
+                        bindings
+                            .resolve(scope, &Keystroke::parse(key).unwrap())
+                            .is_none()
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            bindings
+                .resolve("stage-files", &Keystroke::parse("space").unwrap())
+                .unwrap()
+                .key,
+            "space"
+        );
+        assert_eq!(
+            bindings
+                .resolve("branch", &Keystroke::parse("enter").unwrap())
+                .unwrap()
+                .key,
+            "enter"
+        );
+        assert_eq!(
+            bindings
+                .resolve("commit-modal", &Keystroke::parse("enter").unwrap())
+                .unwrap()
+                .key,
+            "s"
+        );
     }
 }

@@ -284,3 +284,56 @@ stage-files는 활성 저장소의 Stage 파일목록에만 해당한다. files 
 ## 브랜치 키 우선순위
 
 branch-upload의 저장 ID는 유지하고 기본 슬롯만 shift-p로 변경한다. local-branches는 실제 활성 저장소 Local 참조 포커스다. 정의의 group이 브랜치이면 공통보다 높은 해석 우선순위를 갖는다. 우선순위는 저장 설정에 새 필드를 추가하지 않는다.
+## 팝업 입력 드래그 상태 (US86)
+
+새 영속 데이터나 개체는 없다. 공통 카드의 내부 누름이 배경의 GPUI 클릭 대기 상태로 전이되지 않게 한다. 내부 입력 선택과 포커스 상태는 기존 모델을 따른다.
+
+## 커밋 줄바꿈 상태 (US87)
+
+새 개체나 저장 데이터는 없다. 기존 커밋 대화상자의 진행 상태·편집기 포커스와 선택 영역을 사용한다.
+
+## 파일 트리 상태 (US88)
+
+FileRow는 파일 원본 인덱스 또는 폴더 원시 경로와 접힘 상태를 표현한다. 실행 중 공통 bool 모드와 프로젝트/Stage·History 키별 접힌 경로 집합을 UI에서 보관한다. 가시 인덱스 배열은 파일 선택/탐색 순서를 정의하며 실제 파일 데이터와 선택 키는 유지한다.
+
+## 폴더 작업 상태 (US89)
+
+US88의 접힘 필드/집합을 제거한다. 폴더 행은 원시 경로만 가진다. UI의 선택 폴더는 목록 키와 원시 경로의 선택값이며 파일 선택과 상호 배타적이다. 폴더 작업 맵은 하위 원시 파일 경로별 한 항목과 공통 목표 Stage bool을 가진다.
+
+## upstream 연결 계획 (US90)
+
+UpstreamPlan은 Local 전체 참조·예상 해시·현재 upstream·후보 배열을 가진다. UpstreamCandidate는 전체 원격 추적 참조·표시 이름·예상 해시와 원격명/서버 브랜치 매핑을 보관한다. UI Connect는 계획과 선택 인덱스를 가진다. 새 영속 포맷 없이 Git의 기존 upstream 설정을 사용한다.
+
+## 라디오 포커스 (US91)
+
+기존 Connect.selected와 후보 배열을 유지하며 Workspace에 라디오 그룹 FocusHandle만 추가한다. Local 표시 삭제는 UpstreamPlan.reference의 실행 대상 데이터에 영향을 주지 않는다.
+
+## Merge 복구 상태 (US92)
+
+MergeState는 root, marker_modified, head, current_branch, merge_heads, conflicts를 가진다. 같은 작업 판정은 정규화한 저장소 경로/MERGE_HEAD 수정 시각/HEAD/현재 브랜치/병합 대상의 일치로 수행하며 conflicts는 Stage 후 변할 수 있다. Snapshot.merge는 진행 중일 때만 존재한다. BranchAction의 MergeControl은 확인 시점의 MergeState와 완료/중단 종류를 보관한다. Unmerged 파일은 stage=false/status=U로 한 번만 나타난다.
+
+## Rebase 상태 (US93)
+
+RebaseState는 정규화한 root·backend·orig-head 수정 시각·원래 HEAD/브랜치/브랜치 끝·onto·현재 HEAD·현재 커밋·단계/전체·미해결 경로를 가진다. same_session은 저장소/방식/원래 대상/기반을, same_operation은 현재 단계까지 비교한다. Stage 후 conflicts만 갱신 가능하다. Snapshot.rebase와 merge는 구분하며 공통 진행 여부를 UI 가드에서 사용한다. BranchAction.RebaseControl은 확인 시점 상태와 Continue/Abort/Skip을 보관한다.
+
+## Revert 상태 (US94)
+
+RevertState는 root·현재 head/branch·sequence_head·세션 시각·현재 대상/대상 시각·todo 원문/대기 개수·opts 원문·선택적 no_commit·충돌 경로를 가진다. 같은 세션과 같은 단계 판정은 원시 상태를 비교하며 Stage로 conflicts만 바뀔 수 있다. Snapshot.revert를 추가한다. 확인 액션은 상태와 Continue/Abort/Skip 및 옵션 미상 시의 no_commit 선택을 보관한다.
+
+## Stash 복구 상태 (US95)
+
+StashRestoreState는 세션 ID/저장소/원본 Stash/HEAD/브랜치·개정/적용 중 여부/실패 안내·미병합 경로를 가진다. 전용 메타데이터는 스키마 버전·경로별 원본 유무/권한/해시·원본 인덱스 해시·인덱스 항목·변경 경로·부모 디렉터리 상태를 기록한다. 경로는 원시 바이트, 백업 이름은 숫자 인덱스만 사용한다. Snapshot.stash_restore와 unmerged를 추가한다. 완료/취소는 세션 ID/개정과 실제 저장소 상태를 검증한다.
+
+원본 Stage 객체는 복구 전용 Git 참조에 트리로 고정해 정리 작업에도 보존한다. 원본 인덱스와 별도로 분할 인덱스를 해제한 전체 사본을 보관하며, 공유 인덱스가 사라지면 검증한 전체 사본으로 복구한다. Windows Git에 전달하는 인덱스 경로는 확장 경로 접두사를 제거한다.
+
+## US96 충돌 구간
+
+충돌 구간은 시작 줄·전체 바이트 범위·현재 내용 범위·들어오는 내용 범위로 구성한다. 충돌 미리보기는 원문과 구간 목록을 보관한다. 선택은 현재/들어오는/양쪽이며 양쪽 순서는 현재 다음 들어오는 내용이다. 하나 적용 후 원문이 바뀌므로 모든 구간을 재조회한다.
+
+## US97 표시 행·부분 Stage
+
+충돌 동작 행은 충돌 구간 번호만 보관하고 원문 좌표는 없다. 바로 다음 행은 원래 마커와 좌표다. 부분 Stage 미리보기는 인덱스 이전 원문·작업 파일 이후 원문을 보관한다. 줄 선택은 프로젝트 ID/미리보기 세대에 귀속된 표시 행 집합이며 추가/삭제만 유효하다. 재조회·파일 전환으로 세대가 바뀌면 선택을 폐기한다. 구간은 헤더 다음부터 다음 헤더 직전까지의 추가/삭제 행 집합이다.
+
+## US98 커서와 충돌 구간
+
+충돌 구간은 시작 줄과 종료 줄을 포함한다. 현재 대상은 Diff 표시 행의 작업 파일 new 줄 번호로 구간을 조회한 결과이며 별도 저장하지 않는다. 좌표 없는 삭제/헤더 줄은 대상 없음이다. 합성 충돌 동작 행과 관련 필드는 제거한다. 커서는 기존 프로젝트별 Selection.cursor를 사용하고 파일/미리보기 변경 시 초기화한다.

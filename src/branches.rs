@@ -259,6 +259,7 @@ fn validate_operation(path: &Path, commit: &str) -> Result<()> {
 
 pub fn revert_commit(path: &Path, commit: &str, no_commit: bool) -> Result<()> {
     validate_operation(path, commit)?;
+    let selection = format!("{commit}^!");
     execute(
         path,
         &[
@@ -268,9 +269,12 @@ pub fn revert_commit(path: &Path, commit: &str, no_commit: bool) -> Result<()> {
             } else {
                 "--no-edit"
             },
-            commit,
+            &selection,
         ],
     )?;
+    if no_commit {
+        execute(path, &["revert", "--quit"])?;
+    }
     Ok(())
 }
 
@@ -291,6 +295,193 @@ pub fn integrate_commit(path: &Path, commit: &str, kind: IntegrateKind) -> Resul
             kind.label(),
             String::from_utf8_lossy(&output.stderr).trim(),
             String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeControl {
+    Continue,
+    Abort,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevertControl {
+    Continue,
+    Abort,
+    Skip,
+}
+
+impl RevertControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "되돌리기 계속",
+            Self::Abort => "되돌리기 중단",
+            Self::Skip => "현재 되돌리기 건너뛰기",
+        }
+    }
+}
+
+pub fn control_revert(
+    path: &Path,
+    expected: &feather_git::model::RevertState,
+    action: RevertControl,
+    no_commit: bool,
+) -> Result<()> {
+    let current = feather_git::git::revert_state(path)?
+        .context("진행 중인 Revert가 없습니다. 새로고침하세요.")?;
+    if !current.same_operation(expected) {
+        bail!("Revert 대상이나 옵션/현재 브랜치가 변경되었습니다. 창을 다시 여세요.");
+    }
+    let argument = match action {
+        RevertControl::Continue => {
+            if !current.conflicts.is_empty() {
+                bail!("미해결 충돌 파일이 남아 있습니다. 수정 후 Stage하세요.");
+            }
+            if current.no_commit.is_some_and(|stored| stored != no_commit) {
+                bail!("시작할 때 선택한 커밋 여부를 유지해야 합니다.");
+            }
+            if no_commit {
+                if current.pending_count > 1 {
+                    bail!(
+                        "여러 커밋의 no commit Revert는 자동 계속을 지원하지 않습니다. 현재 상태와 Stage 내용은 유지됩니다."
+                    );
+                }
+                "--quit"
+            } else {
+                "--continue"
+            }
+        }
+        RevertControl::Abort => "--abort",
+        RevertControl::Skip => "--skip",
+    };
+    let output = command(path)
+        .env("GIT_EDITOR", "true")
+        .args(["revert", argument])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if action != RevertControl::Abort
+        && let Some(next) = feather_git::git::revert_state(path)?
+        && next.same_session(&current)
+        && !next.same_operation(&current)
+        && !next.conflicts.is_empty()
+    {
+        return Ok(());
+    }
+    bail!(
+        "{} 실패: {}{}",
+        action.label(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebaseControl {
+    Continue,
+    Abort,
+    Skip,
+}
+
+impl RebaseControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "리베이스 계속",
+            Self::Abort => "리베이스 중단",
+            Self::Skip => "커밋 건너뛰기",
+        }
+    }
+}
+
+pub fn control_rebase(
+    path: &Path,
+    expected: &feather_git::model::RebaseState,
+    action: RebaseControl,
+) -> Result<()> {
+    let current = feather_git::git::rebase_state(path)?
+        .context("진행 중인 Rebase가 없습니다. 새로고침하세요.")?;
+    if !current.same_operation(expected)
+        || (current.branch.starts_with("refs/heads/")
+            && current.branch_tip.as_deref() != Some(current.original_head.as_str()))
+    {
+        bail!("Rebase 단계나 대상 브랜치가 변경되었습니다. 창을 다시 여세요.");
+    }
+    if action == RebaseControl::Continue && !current.conflicts.is_empty() {
+        bail!("미해결 충돌 파일이 남아 있습니다. 수정 후 Stage하세요.");
+    }
+    let output = command(path)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .args([
+            "rebase",
+            match action {
+                RebaseControl::Continue => "--continue",
+                RebaseControl::Abort => "--abort",
+                RebaseControl::Skip => "--skip",
+            },
+        ])
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    if action != RebaseControl::Abort
+        && let Some(next) = feather_git::git::rebase_state(path)?
+        && next.same_session(&current)
+        && !next.same_operation(&current)
+        && !next.conflicts.is_empty()
+    {
+        return Ok(());
+    }
+    bail!(
+        "{} 실패: {}{}",
+        action.label(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+impl MergeControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "병합 완료",
+            Self::Abort => "병합 중단",
+        }
+    }
+}
+
+pub fn control_merge(
+    path: &Path,
+    expected: &feather_git::model::MergeState,
+    action: MergeControl,
+) -> Result<()> {
+    let current = feather_git::git::merge_state(path)?
+        .context("진행 중인 Merge가 없습니다. 새로고침하세요.")?;
+    if !current.same_operation(expected) {
+        bail!("병합 대상이나 현재 브랜치가 변경되었습니다. 창을 다시 여세요.");
+    }
+    if action == MergeControl::Continue && !current.conflicts.is_empty() {
+        bail!("미해결 충돌 파일이 남아 있습니다. 수정 후 Stage하세요.");
+    }
+    let output = command(path)
+        .env("GIT_EDITOR", "true")
+        .env("GIT_MERGE_AUTOEDIT", "no")
+        .args([
+            "merge",
+            match action {
+                MergeControl::Continue => "--continue",
+                MergeControl::Abort => "--abort",
+            },
+        ])
+        .output()?;
+    if !output.status.success() {
+        bail!(
+            "{} 실패: {}{}",
+            action.label(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
         );
     }
     Ok(())
@@ -483,6 +674,131 @@ impl DeleteKind {
 pub struct RemoteDeletion {
     pub remote: String,
     pub destination: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamCandidate {
+    pub reference: String,
+    pub label: String,
+    pub expected: String,
+    pub mapping: RemoteDeletion,
+}
+
+#[derive(Clone)]
+pub struct UpstreamPlan {
+    pub reference: String,
+    pub expected: String,
+    pub current: String,
+    pub candidates: Vec<UpstreamCandidate>,
+}
+
+pub fn plan_upstream(path: &Path, reference: &str, expected: &str) -> Result<UpstreamPlan> {
+    let local = reference
+        .strip_prefix("refs/heads/")
+        .context("Local 브랜치를 선택하세요.")?;
+    validate_name(path, local)?;
+    if ![40, 64].contains(&expected.len())
+        || !expected.bytes().all(|b| b.is_ascii_hexdigit())
+        || execute(path, &["rev-parse", "--verify", reference])? != expected
+    {
+        bail!("Local 브랜치가 변경되었습니다. 창을 다시 여세요.");
+    }
+    let mut mappings = Vec::new();
+    for remote in execute(path, &["remote"])?.lines() {
+        let output = command(path)
+            .args(["config", "--get-all", &format!("remote.{remote}.fetch")])
+            .output()?;
+        if output.status.success() {
+            for spec in String::from_utf8(output.stdout)?.lines() {
+                mappings.push((remote.to_owned(), spec.to_owned()));
+            }
+        }
+    }
+    let rows = execute(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)%09%(symref)%09%(objecttype)%09%(upstream)%09END",
+        ],
+    )?;
+    let mut current = String::new();
+    let mut candidates = Vec::new();
+    for row in rows.lines() {
+        let fields: Vec<_> = row.split('\t').collect();
+        if fields.len() != 6 {
+            continue;
+        }
+        if fields[0] == reference {
+            current = fields[4].into();
+        }
+        if fields[0].starts_with("refs/heads/") || !fields[2].is_empty() || fields[3] != "commit" {
+            continue;
+        }
+        let mut matches: Vec<_> = mappings
+            .iter()
+            .filter_map(|(remote, spec)| {
+                refspec_source(spec, fields[0])
+                    .filter(|source| source.starts_with("refs/heads/"))
+                    .map(|source| (remote.clone(), source))
+            })
+            .collect();
+        matches.sort();
+        matches.dedup();
+        if matches.len() != 1 {
+            continue;
+        }
+        let (remote, destination) = matches.remove(0);
+        candidates.push(UpstreamCandidate {
+            reference: fields[0].into(),
+            label: format!(
+                "{remote}/{}",
+                destination
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(&destination)
+            ),
+            expected: fields[1].into(),
+            mapping: RemoteDeletion {
+                remote,
+                destination,
+            },
+        });
+    }
+    candidates.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.reference.cmp(&b.reference))
+    });
+    Ok(UpstreamPlan {
+        reference: reference.into(),
+        expected: expected.into(),
+        current,
+        candidates,
+    })
+}
+
+pub fn connect_upstream(path: &Path, plan: &UpstreamPlan, selected: usize) -> Result<()> {
+    let candidate = plan
+        .candidates
+        .get(selected)
+        .context("연결할 원격 브랜치를 선택하세요.")?;
+    let refreshed = plan_upstream(path, &plan.reference, &plan.expected)?;
+    if refreshed.current != plan.current || !refreshed.candidates.contains(candidate) {
+        bail!("원격 브랜치 또는 연결 설정이 변경되었습니다. 창을 다시 여세요.");
+    }
+    let local = plan
+        .reference
+        .strip_prefix("refs/heads/")
+        .context("Local 브랜치를 선택하세요.")?;
+    execute(
+        path,
+        &[
+            "branch",
+            &format!("--set-upstream-to={}", candidate.reference),
+            "--",
+            local,
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -870,6 +1186,154 @@ mod tests {
     }
 
     #[test]
+    fn upstream_connects_selected_local_without_checkout_push_or_worktree_changes() {
+        let repo = repository();
+        let path = repo.path();
+        let head = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["remote", "add", "origin", "unused-origin"]);
+        git(path, &["remote", "add", "backup", "unused-backup"]);
+        git(path, &["branch", "topic"]);
+        git(path, &["update-ref", "refs/remotes/origin/main", &head]);
+        git(path, &["update-ref", "refs/remotes/backup/other", &head]);
+        git(
+            path,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        std::fs::write(path.join("file.txt"), "unsaved").unwrap();
+        let index = std::fs::read(path.join(".git/index")).unwrap();
+        let plan = plan_upstream(path, "refs/heads/topic", &head).unwrap();
+        assert!(plan.current.is_empty());
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["backup/other", "origin/main"]
+        );
+        connect_upstream(path, &plan, 0).unwrap();
+        assert_eq!(git(path, &["config", "branch.topic.remote"]), "backup");
+        assert_eq!(
+            git(path, &["config", "branch.topic.merge"]),
+            "refs/heads/other"
+        );
+        let plan = plan_upstream(path, "refs/heads/topic", &head).unwrap();
+        assert_eq!(plan.current, "refs/remotes/backup/other");
+        connect_upstream(path, &plan, 1).unwrap();
+        assert_eq!(git(path, &["config", "branch.topic.remote"]), "origin");
+        let plan = plan_upstream(path, "refs/heads/main", &head).unwrap();
+        connect_upstream(path, &plan, 0).unwrap();
+        assert_eq!(git(path, &["config", "branch.main.remote"]), "backup");
+        assert_eq!(git(path, &["branch", "--show-current"]), "main");
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(path, &["rev-parse", "refs/heads/topic"]), head);
+        assert_eq!(git(path, &["rev-parse", "refs/remotes/backup/other"]), head);
+        assert_eq!(std::fs::read(path.join(".git/index")).unwrap(), index);
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "unsaved"
+        );
+    }
+
+    #[test]
+    fn upstream_excludes_ambiguous_mappings_and_rejects_deleted_local_without_config_writes() {
+        let repo = repository();
+        let path = repo.path();
+        let head = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["remote", "add", "one", "unused-one"]);
+        git(path, &["remote", "add", "two", "unused-two"]);
+        git(
+            path,
+            &["config", "remote.one.fetch", "+refs/heads/*:refs/shared/*"],
+        );
+        git(
+            path,
+            &["config", "remote.two.fetch", "+refs/heads/*:refs/shared/*"],
+        );
+        git(path, &["update-ref", "refs/shared/topic", &head]);
+        git(path, &["branch", "local"]);
+        let empty = plan_upstream(path, "refs/heads/local", &head).unwrap();
+        assert!(empty.candidates.is_empty());
+        let before = std::fs::read(path.join(".git/config")).unwrap();
+        assert!(connect_upstream(path, &empty, 0).is_err());
+        assert_eq!(std::fs::read(path.join(".git/config")).unwrap(), before);
+        git(
+            path,
+            &["config", "remote.two.fetch", "+refs/heads/*:refs/other/*"],
+        );
+        let plan = plan_upstream(path, "refs/heads/local", &head).unwrap();
+        assert_eq!(plan.candidates.len(), 1);
+        git(path, &["branch", "-d", "local"]);
+        let before = std::fs::read(path.join(".git/config")).unwrap();
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        assert_eq!(std::fs::read(path.join(".git/config")).unwrap(), before);
+    }
+
+    #[test]
+    fn upstream_supports_custom_fetch_mapping_and_rejects_stale_or_missing_targets() {
+        let repo = repository();
+        let path = repo.path();
+        let head = git(path, &["rev-parse", "HEAD"]);
+        assert!(
+            plan_upstream(path, "refs/heads/main", &head)
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        git(path, &["remote", "add", "custom", "unused"]);
+        git(
+            path,
+            &[
+                "config",
+                "remote.custom.fetch",
+                "+refs/heads/server/*:refs/custom/*",
+            ],
+        );
+        git(path, &["update-ref", "refs/custom/nested/topic", &head]);
+        let plan = plan_upstream(path, "refs/heads/main", &head).unwrap();
+        assert_eq!(plan.candidates[0].label, "custom/server/nested/topic");
+        connect_upstream(path, &plan, 0).unwrap();
+        assert_eq!(
+            git(path, &["config", "branch.main.merge"]),
+            "refs/heads/server/nested/topic"
+        );
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        let plan = plan_upstream(path, "refs/heads/main", &head).unwrap();
+        git(
+            path,
+            &[
+                "config",
+                "remote.custom.fetch",
+                "+refs/heads/changed/*:refs/custom/*",
+            ],
+        );
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        git(
+            path,
+            &[
+                "config",
+                "remote.custom.fetch",
+                "+refs/heads/server/*:refs/custom/*",
+            ],
+        );
+        let plan = plan_upstream(path, "refs/heads/main", &head).unwrap();
+        git(path, &["commit", "--allow-empty", "-m", "new"]);
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        let new_head = git(path, &["rev-parse", "HEAD"]);
+        let plan = plan_upstream(path, "refs/heads/main", &new_head).unwrap();
+        git(path, &["update-ref", "refs/custom/nested/topic", &new_head]);
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        let plan = plan_upstream(path, "refs/heads/main", &new_head).unwrap();
+        git(path, &["update-ref", "-d", "refs/custom/nested/topic"]);
+        assert!(connect_upstream(path, &plan, 0).is_err());
+        assert!(plan_upstream(path, "refs/remotes/custom/topic", &new_head).is_err());
+        assert!(connect_upstream(path, &plan, 10).is_err());
+    }
+
+    #[test]
     fn local_deletion_uses_upstream_and_optionally_deletes_the_server_branch() {
         for include_related in [false, true] {
             let (repo, bare, hash) = deletion_repository();
@@ -1087,6 +1551,289 @@ mod tests {
     }
 
     #[test]
+    fn revert_conflict_continue_preserves_commit_mode_and_prior_staged_changes() {
+        for no_commit in [false, true] {
+            let (repo, head, target) = conflicted_revert(no_commit, no_commit);
+            let path = repo.path();
+            let state = feather_git::git::revert_state(path).unwrap().unwrap();
+            assert_eq!(state.no_commit, Some(no_commit));
+            assert_eq!(state.target, target);
+            assert_eq!(state.pending_count, 1);
+            assert_eq!(state.conflicts, vec![b"file.txt".to_vec()]);
+            assert_eq!(
+                feather_git::git::load_initial(path, None).unwrap().revert,
+                Some(state.clone())
+            );
+            assert!(control_revert(path, &state, RevertControl::Continue, no_commit).is_err());
+            resolve_rebase_file(path, "file.txt", "resolved revert");
+            assert!(control_revert(path, &state, RevertControl::Continue, !no_commit).is_err());
+            control_revert(path, &state, RevertControl::Continue, no_commit).unwrap();
+            assert!(feather_git::git::revert_state(path).unwrap().is_none());
+            assert_eq!(git(path, &["rev-parse", "HEAD"]) == head, no_commit);
+            if no_commit {
+                assert_eq!(git(path, &["show", ":file.txt"]), "resolved revert");
+                assert_eq!(git(path, &["show", ":prior.txt"]), "prior staged");
+                assert_eq!(
+                    git(path, &["diff", "--cached", "--name-only"]),
+                    "file.txt\nprior.txt"
+                );
+            } else {
+                assert_eq!(git(path, &["rev-parse", "HEAD^"]), head);
+                assert_eq!(git(path, &["show", "HEAD:file.txt"]), "resolved revert");
+                assert!(git(path, &["log", "-1", "--format=%s"]).starts_with("Revert"));
+            }
+        }
+    }
+
+    fn conflicted_revert(
+        no_commit: bool,
+        prior_staged: bool,
+    ) -> (tempfile::TempDir, String, String) {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["config", "core.autocrlf", "false"]);
+        std::fs::write(path.join("file.txt"), "target").unwrap();
+        git(path, &["commit", "-am", "target"]);
+        let target = git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("file.txt"), "later").unwrap();
+        git(path, &["commit", "-am", "later"]);
+        let head = git(path, &["rev-parse", "HEAD"]);
+        if prior_staged {
+            std::fs::write(path.join("prior.txt"), "prior staged").unwrap();
+            git(path, &["add", "prior.txt"]);
+        }
+        assert!(revert_commit(path, &target, no_commit).is_err());
+        (repo, head, target)
+    }
+
+    #[test]
+    fn revert_abort_and_skip_restore_clean_single_operation_without_new_commit() {
+        for no_commit in [false, true] {
+            for action in [RevertControl::Abort, RevertControl::Skip] {
+                let (repo, head, _) = conflicted_revert(no_commit, false);
+                let path = repo.path();
+                let state = feather_git::git::revert_state(path).unwrap().unwrap();
+                control_revert(path, &state, action, no_commit).unwrap();
+                assert!(feather_git::git::revert_state(path).unwrap().is_none());
+                assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+                assert_eq!(
+                    std::fs::read_to_string(path.join("file.txt")).unwrap(),
+                    "later"
+                );
+                assert!(git(path, &["status", "--porcelain"]).is_empty());
+                assert!(control_revert(path, &state, action, no_commit).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn revert_failed_commit_preserves_resolution_for_retry_and_rejects_stale_options() {
+        let (repo, head, _) = conflicted_revert(false, false);
+        let path = repo.path();
+        let state = feather_git::git::revert_state(path).unwrap().unwrap();
+        let mut stale = state.clone();
+        stale.root = path.join("other");
+        assert!(control_revert(path, &stale, RevertControl::Abort, false).is_err());
+        stale = state.clone();
+        stale.session_modified += std::time::Duration::from_secs(1);
+        assert!(control_revert(path, &stale, RevertControl::Skip, false).is_err());
+        stale = state.clone();
+        stale.todo.push_str("\n# changed");
+        assert!(control_revert(path, &stale, RevertControl::Abort, false).is_err());
+        let opts = path.join(".git/sequencer/opts");
+        git(
+            path,
+            &[
+                "config",
+                "--file",
+                opts.to_str().unwrap(),
+                "options.no-commit",
+                "true",
+            ],
+        );
+        assert!(control_revert(path, &state, RevertControl::Continue, false).is_err());
+        std::fs::write(opts, &state.options).unwrap();
+        resolve_rebase_file(path, "file.txt", "saved resolution");
+        git(path, &["config", "user.name", ""]);
+        assert!(control_revert(path, &state, RevertControl::Continue, false).is_err());
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        let current = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert!(current.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "saved resolution"
+        );
+        git(path, &["config", "user.name", "Test"]);
+        control_revert(path, &current, RevertControl::Continue, false).unwrap();
+        assert!(feather_git::git::revert_state(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn external_single_revert_requires_explicit_commit_mode_and_supports_no_commit() {
+        for no_commit in [false, true] {
+            let (repo, head, target) = conflicted_revert(false, false);
+            let path = repo.path();
+            let first = feather_git::git::revert_state(path).unwrap().unwrap();
+            control_revert(path, &first, RevertControl::Abort, false).unwrap();
+            let output = command(path)
+                .args([
+                    "revert",
+                    if no_commit {
+                        "--no-commit"
+                    } else {
+                        "--no-edit"
+                    },
+                    &target,
+                ])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let state = feather_git::git::revert_state(path).unwrap().unwrap();
+            assert_eq!(state.no_commit, None);
+            assert_eq!(state.pending_count, 1);
+            resolve_rebase_file(path, "file.txt", "external resolution");
+            control_revert(path, &state, RevertControl::Continue, no_commit).unwrap();
+            assert!(feather_git::git::revert_state(path).unwrap().is_none());
+            assert_eq!(git(path, &["rev-parse", "HEAD"]) == head, no_commit);
+        }
+    }
+
+    #[test]
+    fn revert_sequence_continues_to_next_conflict_without_finishing_early() {
+        let (repo, head, _, _) = conflicted_revert_sequence(false);
+        let path = repo.path();
+        let first = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert_eq!(first.pending_count, 2);
+        resolve_rebase_file(path, "file.txt", "resolved first");
+        control_revert(path, &first, RevertControl::Continue, false).unwrap();
+        let second = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert!(second.same_session(&first) && !second.same_operation(&first));
+        assert_eq!(second.pending_count, 1);
+        assert_eq!(second.conflicts, vec![b"second.txt".to_vec()]);
+        assert!(control_revert(path, &first, RevertControl::Skip, false).is_err());
+        resolve_rebase_file(path, "second.txt", "resolved second");
+        control_revert(path, &second, RevertControl::Continue, false).unwrap();
+        assert!(feather_git::git::revert_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD~2"]), head);
+        assert_eq!(git(path, &["show", "HEAD:file.txt"]), "resolved first");
+        assert_eq!(git(path, &["show", "HEAD:second.txt"]), "resolved second");
+    }
+
+    fn conflicted_revert_sequence(no_commit: bool) -> (tempfile::TempDir, String, String, String) {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["config", "core.autocrlf", "false"]);
+        std::fs::write(path.join("second.txt"), "base").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base"]);
+        std::fs::write(path.join("file.txt"), "target first").unwrap();
+        git(path, &["commit", "-am", "target first"]);
+        let first = git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("second.txt"), "target second").unwrap();
+        git(path, &["commit", "-am", "target second"]);
+        let second = git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("file.txt"), "later first").unwrap();
+        std::fs::write(path.join("second.txt"), "later second").unwrap();
+        git(path, &["commit", "-am", "later"]);
+        let head = git(path, &["rev-parse", "HEAD"]);
+        let output = command(path)
+            .args([
+                "revert",
+                if no_commit {
+                    "--no-commit"
+                } else {
+                    "--no-edit"
+                },
+                &first,
+                &second,
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        (repo, head, first, second)
+    }
+
+    #[test]
+    fn multi_commit_no_commit_revert_refuses_automatic_continue_without_mutation() {
+        let (repo, head, _, _) = conflicted_revert_sequence(true);
+        let path = repo.path();
+        let state = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert_eq!(state.no_commit, Some(true));
+        resolve_rebase_file(path, "file.txt", "saved resolution");
+        let before_index = std::fs::read(path.join(".git/index")).unwrap();
+        let before_state = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert!(control_revert(path, &state, RevertControl::Continue, true).is_err());
+        assert_eq!(
+            feather_git::git::revert_state(path).unwrap(),
+            Some(before_state)
+        );
+        assert_eq!(
+            std::fs::read(path.join(".git/index")).unwrap(),
+            before_index
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "saved resolution"
+        );
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn revert_in_linked_worktree_is_isolated_from_other_operations() {
+        let (repo, head, target) = conflicted_revert(false, false);
+        let worktree = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("linked");
+        git(
+            repo.path(),
+            &["worktree", "add", "--detach", path.to_str().unwrap(), &head],
+        );
+        assert!(revert_commit(&path, &target, true).is_err());
+        let state = feather_git::git::revert_state(&path).unwrap().unwrap();
+        assert_eq!(state.current_branch, None);
+        assert_eq!(state.no_commit, Some(true));
+        assert!(
+            feather_git::git::load_initial(&path, None)
+                .unwrap()
+                .revert
+                .is_some()
+        );
+        control_revert(&path, &state, RevertControl::Abort, true).unwrap();
+        assert!(feather_git::git::revert_state(&path).unwrap().is_none());
+        assert!(
+            feather_git::git::revert_state(repo.path())
+                .unwrap()
+                .is_some()
+        );
+        let rebase = conflicted_rebase("merge").0;
+        assert!(
+            feather_git::git::revert_state(rebase.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn revert_state_excludes_cherry_pick_and_merge_conflicts() {
+        let (repo, _, target) = conflicted_revert(false, false);
+        let path = repo.path();
+        let state = feather_git::git::revert_state(path).unwrap().unwrap();
+        control_revert(path, &state, RevertControl::Abort, false).unwrap();
+        let output = command(path)
+            .args(["cherry-pick", &target])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(path.join(".git/CHERRY_PICK_HEAD").exists());
+        assert!(feather_git::git::revert_state(path).unwrap().is_none());
+        let merge = conflicted_merge().0;
+        assert!(
+            feather_git::git::revert_state(merge.path())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn revert_commit_respects_no_commit_and_rejects_invalid_targets() {
         for no_commit in [false, true] {
             let repo = repository();
@@ -1097,6 +1844,7 @@ mod tests {
             let target = git(path, &["rev-parse", "HEAD"]);
             assert!(revert_commit(path, "--hard", no_commit).is_err());
             revert_commit(path, &target, no_commit).unwrap();
+            assert!(feather_git::git::revert_state(path).unwrap().is_none());
             assert!(!path.join("added.txt").exists());
             assert_eq!(git(path, &["rev-parse", "HEAD"]) == target, no_commit);
             assert_eq!(
@@ -1127,6 +1875,395 @@ mod tests {
                 .contains("진행 중")
         );
         assert_eq!(std::fs::read(path.join("file.txt")).unwrap(), before);
+    }
+
+    #[test]
+    fn rebase_continues_through_two_conflicts_and_finishes_only_after_last_commit() {
+        let (repo, original, onto) = conflicted_rebase("merge");
+        let path = repo.path();
+        let first = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert_eq!(first.original_head, original);
+        assert_eq!((first.step, first.total), (Some(1), Some(2)));
+        assert!(first.current_commit.is_some());
+        assert_eq!(first.conflicts, vec![b"file.txt".to_vec()]);
+        assert!(feather_git::git::merge_state(path).unwrap().is_none());
+        assert_eq!(
+            feather_git::git::load_initial(path, None).unwrap().rebase,
+            Some(first.clone())
+        );
+        assert!(control_rebase(path, &first, RebaseControl::Continue).is_err());
+        resolve_rebase_file(path, "file.txt", "resolved one");
+        control_rebase(path, &first, RebaseControl::Continue).unwrap();
+        let second = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert!(second.same_session(&first) && !second.same_operation(&first));
+        assert_eq!((second.step, second.total), (Some(2), Some(2)));
+        assert_ne!(second.current_commit, first.current_commit);
+        assert_eq!(second.conflicts, vec![b"second.txt".to_vec()]);
+        assert!(control_rebase(path, &first, RebaseControl::Abort).is_err());
+        resolve_rebase_file(path, "second.txt", "resolved two");
+        control_rebase(path, &second, RebaseControl::Continue).unwrap();
+        assert!(feather_git::git::rebase_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["branch", "--show-current"]), "topic");
+        assert_eq!(git(path, &["rev-parse", "HEAD~2"]), onto);
+        assert_eq!(git(path, &["show", "HEAD:file.txt"]), "resolved one");
+        assert_eq!(git(path, &["show", "HEAD:second.txt"]), "resolved two");
+        assert!(control_rebase(path, &second, RebaseControl::Continue).is_err());
+    }
+
+    fn conflicted_rebase(backend: &str) -> (tempfile::TempDir, String, String) {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["config", "core.autocrlf", "false"]);
+        git(path, &["config", "rebase.backend", backend]);
+        std::fs::write(path.join("second.txt"), "base\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base"]);
+        git(path, &["switch", "-c", "topic"]);
+        std::fs::write(path.join("file.txt"), "topic one\n").unwrap();
+        git(path, &["commit", "-am", "topic one"]);
+        std::fs::write(path.join("second.txt"), "topic two\n").unwrap();
+        git(path, &["commit", "-am", "topic two"]);
+        let original = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["switch", "main"]);
+        std::fs::write(path.join("file.txt"), "main one\n").unwrap();
+        std::fs::write(path.join("second.txt"), "main two\n").unwrap();
+        git(path, &["commit", "-am", "main"]);
+        let onto = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["switch", "topic"]);
+        assert!(integrate_commit(path, &onto, IntegrateKind::Rebase).is_err());
+        (repo, original, onto)
+    }
+
+    fn resolve_rebase_file(path: &Path, name: &str, text: &str) {
+        std::fs::write(path.join(name), text).unwrap();
+        crate::setup::toggle_files(
+            path,
+            &std::collections::BTreeMap::from([(name.as_bytes().to_vec(), true)]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rebase_abort_restores_original_branch_and_rejects_stale_session_or_branch_tip() {
+        let (repo, original, onto) = conflicted_rebase("merge");
+        let path = repo.path();
+        let state = feather_git::git::rebase_state(path).unwrap().unwrap();
+        let mut stale = state.clone();
+        stale.step = Some(5);
+        assert!(control_rebase(path, &stale, RebaseControl::Skip).is_err());
+        stale = state.clone();
+        stale.root = path.join("other");
+        assert!(control_rebase(path, &stale, RebaseControl::Abort).is_err());
+        stale = state.clone();
+        stale.marker_modified += std::time::Duration::from_secs(1);
+        assert!(control_rebase(path, &stale, RebaseControl::Abort).is_err());
+        stale = state.clone();
+        stale.onto = original.clone();
+        assert!(control_rebase(path, &stale, RebaseControl::Abort).is_err());
+        git(path, &["update-ref", "refs/heads/topic", &onto]);
+        assert!(control_rebase(path, &state, RebaseControl::Abort).is_err());
+        git(path, &["update-ref", "refs/heads/topic", &original]);
+        control_rebase(path, &state, RebaseControl::Abort).unwrap();
+        assert!(feather_git::git::rebase_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), original);
+        assert_eq!(git(path, &["branch", "--show-current"]), "topic");
+        assert_eq!(git(path, &["show", "HEAD:file.txt"]), "topic one");
+        assert!(git(path, &["status", "--porcelain"]).is_empty());
+        assert!(control_rebase(path, &state, RebaseControl::Abort).is_err());
+    }
+
+    #[test]
+    fn rebase_skip_omits_current_commit_and_can_pause_on_next_conflict() {
+        let (repo, _, onto) = conflicted_rebase("merge");
+        let path = repo.path();
+        let first = feather_git::git::rebase_state(path).unwrap().unwrap();
+        control_rebase(path, &first, RebaseControl::Skip).unwrap();
+        let second = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert_eq!(second.step, Some(2));
+        assert_eq!(second.conflicts, vec![b"second.txt".to_vec()]);
+        resolve_rebase_file(path, "second.txt", "kept second");
+        control_rebase(path, &second, RebaseControl::Continue).unwrap();
+        assert!(feather_git::git::rebase_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD^"]), onto);
+        assert_eq!(git(path, &["show", "HEAD:file.txt"]), "main one");
+        assert_eq!(git(path, &["show", "HEAD:second.txt"]), "kept second");
+    }
+
+    #[test]
+    fn rebase_apply_backend_supports_continue_and_abort() {
+        let (repo, original, _) = conflicted_rebase("apply");
+        let path = repo.path();
+        let first = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert_eq!(first.backend, "rebase-apply");
+        assert_eq!((first.step, first.total), (Some(1), Some(2)));
+        resolve_rebase_file(path, "file.txt", "apply resolution");
+        control_rebase(path, &first, RebaseControl::Continue).unwrap();
+        let second = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert_eq!(second.step, Some(2));
+        assert!(!second.conflicts.is_empty());
+        control_rebase(path, &second, RebaseControl::Abort).unwrap();
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), original);
+        assert!(feather_git::git::rebase_state(path).unwrap().is_none());
+    }
+
+    #[test]
+    fn rebase_continue_failure_keeps_resolution_for_retry() {
+        let (repo, _, _) = conflicted_rebase("merge");
+        let path = repo.path();
+        let state = feather_git::git::rebase_state(path).unwrap().unwrap();
+        resolve_rebase_file(path, "file.txt", "saved resolution");
+        git(path, &["config", "user.name", ""]);
+        assert!(control_rebase(path, &state, RebaseControl::Continue).is_err());
+        let current = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert!(current.same_operation(&state) && current.conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "saved resolution"
+        );
+        git(path, &["config", "user.name", "Test"]);
+        control_rebase(path, &current, RebaseControl::Continue).unwrap();
+        let next = feather_git::git::rebase_state(path).unwrap().unwrap();
+        assert_eq!(next.step, Some(2));
+        control_rebase(path, &next, RebaseControl::Abort).unwrap();
+    }
+
+    #[test]
+    fn git_am_conflict_is_not_exposed_as_rebase() {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["switch", "-c", "patch"]);
+        std::fs::write(path.join("file.txt"), "patch change").unwrap();
+        git(path, &["commit", "-am", "patch"]);
+        let patch = git(path, &["format-patch", "-1", "--stdout"]);
+        git(path, &["switch", "main"]);
+        std::fs::write(path.join("file.txt"), "main change").unwrap();
+        git(path, &["commit", "-am", "main"]);
+        let patch_path = repo.path().join("incoming.patch");
+        std::fs::write(&patch_path, patch).unwrap();
+        let output = command(path)
+            .args(["am", patch_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(path.join(".git/rebase-apply/applying").exists());
+        assert!(feather_git::git::rebase_state(path).unwrap().is_none());
+        assert!(
+            feather_git::git::load_initial(path, None)
+                .unwrap()
+                .rebase
+                .is_none()
+        );
+        git(path, &["am", "--abort"]);
+    }
+
+    #[test]
+    fn rebase_in_linked_worktree_is_isolated_from_original_worktree() {
+        let (repo, original, onto) = conflicted_rebase("merge");
+        let worktree = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("linked");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                path.to_str().unwrap(),
+                &original,
+            ],
+        );
+        assert!(integrate_commit(&path, &onto, IntegrateKind::Rebase).is_err());
+        let state = feather_git::git::rebase_state(&path).unwrap().unwrap();
+        assert!(
+            feather_git::git::load_initial(&path, None)
+                .unwrap()
+                .rebase
+                .is_some()
+        );
+        control_rebase(&path, &state, RebaseControl::Abort).unwrap();
+        assert!(feather_git::git::rebase_state(&path).unwrap().is_none());
+        assert!(
+            feather_git::git::rebase_state(repo.path())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]), original);
+    }
+
+    #[test]
+    fn merge_conflicts_can_be_staged_and_completed_with_both_parents() {
+        let (repo, head, target) = conflicted_merge();
+        let path = repo.path();
+        let state = feather_git::git::merge_state(path).unwrap().unwrap();
+        assert_eq!(state.conflicts, vec![b"file.txt".to_vec()]);
+        let snapshot = feather_git::git::load_initial(path, None).unwrap();
+        assert_eq!(snapshot.merge, Some(state.clone()));
+        let conflicts: Vec<_> = snapshot
+            .stage
+            .iter()
+            .filter(|file| file.status == "U")
+            .collect();
+        assert_eq!(conflicts.len(), 1);
+        assert!(!conflicts[0].staged);
+        let diff = feather_git::git::diff(path, conflicts[0]).unwrap();
+        assert!(diff.lines.iter().any(|line| line.text.contains("<<<<<<<")));
+        let before = std::fs::read(path.join("file.txt")).unwrap();
+        assert!(control_merge(path, &state, MergeControl::Continue).is_err());
+        assert_eq!(std::fs::read(path.join("file.txt")).unwrap(), before);
+        std::fs::write(path.join("file.txt"), "resolved\n").unwrap();
+        crate::setup::toggle_files(
+            path,
+            &std::collections::BTreeMap::from([(b"file.txt".to_vec(), true)]),
+        )
+        .unwrap();
+        assert!(
+            feather_git::git::merge_state(path)
+                .unwrap()
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+        control_merge(path, &state, MergeControl::Continue).unwrap();
+        assert!(feather_git::git::merge_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD^1"]), head);
+        assert_eq!(git(path, &["rev-parse", "HEAD^2"]), target);
+        assert_eq!(git(path, &["show", "HEAD:file.txt"]), "resolved");
+        assert!(control_merge(path, &state, MergeControl::Continue).is_err());
+    }
+
+    fn conflicted_merge() -> (tempfile::TempDir, String, String) {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["switch", "-c", "topic"]);
+        std::fs::write(path.join("file.txt"), "topic\n").unwrap();
+        git(path, &["commit", "-am", "topic"]);
+        let target = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["switch", "main"]);
+        std::fs::write(path.join("file.txt"), "main\n").unwrap();
+        git(path, &["commit", "-am", "main"]);
+        let head = git(path, &["rev-parse", "HEAD"]);
+        assert!(integrate_commit(path, &target, IntegrateKind::Merge).is_err());
+        (repo, head, target)
+    }
+
+    #[test]
+    fn merge_abort_restores_head_and_worktree_and_rejects_stale_state() {
+        let (repo, head, _) = conflicted_merge();
+        let path = repo.path();
+        let state = feather_git::git::merge_state(path).unwrap().unwrap();
+        let mut stale = state.clone();
+        stale.root = path.join("other");
+        assert!(control_merge(path, &stale, MergeControl::Abort).is_err());
+        stale = state.clone();
+        stale.marker_modified += std::time::Duration::from_secs(1);
+        assert!(control_merge(path, &stale, MergeControl::Abort).is_err());
+        stale = state.clone();
+        stale.current_branch = Some("refs/heads/elsewhere".into());
+        assert!(control_merge(path, &stale, MergeControl::Abort).is_err());
+        stale = state.clone();
+        stale.head = state.merge_heads[0].clone();
+        assert!(control_merge(path, &stale, MergeControl::Abort).is_err());
+        stale = state.clone();
+        stale.merge_heads = vec![head.clone()];
+        assert!(control_merge(path, &stale, MergeControl::Abort).is_err());
+        control_merge(path, &state, MergeControl::Abort).unwrap();
+        assert!(feather_git::git::merge_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "main\n"
+        );
+        assert!(git(path, &["status", "--porcelain"]).is_empty());
+        assert!(control_merge(path, &state, MergeControl::Abort).is_err());
+    }
+
+    #[test]
+    fn merge_delete_resolution_can_be_staged_and_completed() {
+        let repo = repository();
+        let path = repo.path();
+        git(path, &["switch", "-c", "topic"]);
+        std::fs::write(path.join("file.txt"), "topic").unwrap();
+        git(path, &["commit", "-am", "topic"]);
+        let target = git(path, &["rev-parse", "HEAD"]);
+        git(path, &["switch", "main"]);
+        git(path, &["rm", "file.txt"]);
+        git(path, &["commit", "-m", "delete"]);
+        assert!(integrate_commit(path, &target, IntegrateKind::Merge).is_err());
+        let state = feather_git::git::merge_state(path).unwrap().unwrap();
+        let files = feather_git::git::load_stage(path).unwrap();
+        assert_eq!(files.iter().filter(|file| file.status == "U").count(), 1);
+        std::fs::remove_file(path.join("file.txt")).unwrap();
+        crate::setup::toggle_files(
+            path,
+            &std::collections::BTreeMap::from([(b"file.txt".to_vec(), true)]),
+        )
+        .unwrap();
+        assert!(
+            !feather_git::git::load_stage(path)
+                .unwrap()
+                .iter()
+                .any(|file| file.status == "U")
+        );
+        control_merge(path, &state, MergeControl::Continue).unwrap();
+        assert!(feather_git::git::merge_state(path).unwrap().is_none());
+        assert_eq!(git(path, &["rev-parse", "HEAD^2"]), target);
+        assert!(!path.join("file.txt").exists());
+    }
+
+    #[test]
+    fn merge_control_works_in_linked_worktree_without_affecting_other_worktree() {
+        let (repo, head, target) = conflicted_merge();
+        let worktree = tempfile::tempdir().unwrap();
+        let path = worktree.path().join("linked");
+        git(
+            repo.path(),
+            &["worktree", "add", "--detach", path.to_str().unwrap(), &head],
+        );
+        assert!(path.join(".git").is_file());
+        assert!(integrate_commit(&path, &target, IntegrateKind::Merge).is_err());
+        let state = feather_git::git::merge_state(&path).unwrap().unwrap();
+        assert_eq!(state.current_branch, None);
+        assert_eq!(state.conflicts.len(), 1);
+        assert!(
+            feather_git::git::load_initial(&path, None)
+                .unwrap()
+                .merge
+                .is_some()
+        );
+        control_merge(&path, &state, MergeControl::Abort).unwrap();
+        assert!(feather_git::git::merge_state(&path).unwrap().is_none());
+        assert!(
+            feather_git::git::merge_state(repo.path())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[test]
+    fn merge_continue_failure_preserves_resolved_state_for_retry() {
+        let (repo, head, _) = conflicted_merge();
+        let path = repo.path();
+        let state = feather_git::git::merge_state(path).unwrap().unwrap();
+        std::fs::write(path.join("file.txt"), "resolved").unwrap();
+        crate::setup::toggle_files(
+            path,
+            &std::collections::BTreeMap::from([(b"file.txt".to_vec(), true)]),
+        )
+        .unwrap();
+        git(path, &["config", "user.name", ""]);
+        assert!(control_merge(path, &state, MergeControl::Continue).is_err());
+        let current = feather_git::git::merge_state(path).unwrap().unwrap();
+        assert!(current.same_operation(&state) && current.conflicts.is_empty());
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "resolved"
+        );
+        git(path, &["config", "user.name", "Test"]);
+        control_merge(path, &state, MergeControl::Continue).unwrap();
+        assert!(feather_git::git::merge_state(path).unwrap().is_none());
     }
 
     #[test]

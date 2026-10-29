@@ -58,9 +58,9 @@ enum BranchAction {
         plan: crate::branches::DeletePlan,
         delete_related: bool,
     },
-    Upload {
-        reference: String,
-        expected: String,
+    Connect {
+        plan: crate::branches::UpstreamPlan,
+        selected: usize,
     },
     ChooseCheckout {
         commit: String,
@@ -78,6 +78,23 @@ enum BranchAction {
     Integrate {
         kind: crate::branches::IntegrateKind,
         commit: String,
+    },
+    MergeControl {
+        state: MergeState,
+        action: crate::branches::MergeControl,
+    },
+    RebaseControl {
+        state: RebaseState,
+        action: crate::branches::RebaseControl,
+    },
+    RevertControl {
+        state: RevertState,
+        action: crate::branches::RevertControl,
+        no_commit: bool,
+    },
+    StashControl {
+        state: StashRestoreState,
+        cancel: bool,
     },
     Track(crate::branches::CheckoutTarget),
 }
@@ -215,6 +232,8 @@ pub struct Workspace {
     branch_checks_focus: [FocusHandle; 2],
     commit_push_focus: FocusHandle,
     reset_mode_focus: FocusHandle,
+    upstream_scroll: ScrollHandle,
+    upstream_focus: FocusHandle,
     list_focus: Option<ListFocus>,
     text_selection: Option<(ListKey, Selection)>,
     text_drag: bool,
@@ -241,9 +260,12 @@ pub struct Workspace {
     diff_measured: HashSet<u64>,
     scroll_drag: Option<ScrollDrag>,
     file_items: HashMap<ListKey, Vec<FileRow>>,
+    file_tree: bool,
+    selected_folder: Option<(ListKey, Vec<u8>)>,
     detail_items: HashMap<u64, TextRows>,
     diff_width_row: HashMap<u64, usize>,
     diff_content_width: HashMap<u64, f32>,
+    partial_selection: HashMap<u64, (u64, std::collections::BTreeSet<usize>)>,
 }
 
 fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Stateful<Div> {
@@ -656,8 +678,11 @@ impl Workspace {
             branch_checks_focus: [cx.focus_handle(), cx.focus_handle()],
             commit_push_focus: cx.focus_handle(),
             reset_mode_focus: cx.focus_handle(),
+            upstream_scroll: ScrollHandle::new(),
+            upstream_focus: cx.focus_handle(),
             list_focus: None,
             text_selection: None,
+            partial_selection: HashMap::new(),
             text_drag: false,
             tabs: Vec::new(),
             tabs_scroll: ScrollHandle::new(),
@@ -682,6 +707,8 @@ impl Workspace {
             diff_measured: HashSet::new(),
             scroll_drag: None,
             file_items: HashMap::new(),
+            file_tree: false,
+            selected_folder: None,
             detail_items: HashMap::new(),
             diff_width_row: HashMap::new(),
             diff_content_width: HashMap::new(),
@@ -921,6 +948,7 @@ impl Workspace {
             match dialog.action {
                 BranchAction::ChooseCheckout { .. } => "checkout",
                 BranchAction::Reset { .. } => "reset",
+                BranchAction::Connect { .. } => "upstream",
                 _ => "branch",
             }
         } else if self.help || self.delete_target.is_some() {
@@ -957,6 +985,20 @@ impl Workspace {
                 }
             }
         };
+        let input = &event.keystroke;
+        if input.key == "enter"
+            && input.modifiers.shift
+            && !input.modifiers.control
+            && !input.modifiers.alt
+            && !input.modifiers.platform
+            && let Some(dialog) = &self.commit_dialog
+            && dialog.editor.read(cx).focus.is_focused(window)
+        {
+            if dialog.busy {
+                cx.stop_propagation();
+            }
+            return;
+        }
         let Some(mapped_key) = self.shortcuts.resolve(scope, &event.keystroke) else {
             return;
         };
@@ -995,7 +1037,11 @@ impl Workspace {
                     if matches!(dialog.action, BranchAction::Reset { .. }) {
                         inputs.push(self.reset_mode_focus.clone());
                     }
+                    if matches!(dialog.action, BranchAction::Connect { .. }) {
+                        inputs.push(self.upstream_focus.clone());
+                    }
                     if matches!(dialog.action, BranchAction::Revert { .. })
+                        || matches!(&dialog.action, BranchAction::RevertControl { state, action: crate::branches::RevertControl::Continue, .. } if state.no_commit.is_none())
                         || matches!(&dialog.action, BranchAction::Delete { plan, .. } if !plan.related.is_empty())
                     {
                         inputs.push(self.branch_checks_focus[0].clone());
@@ -1124,6 +1170,14 @@ impl Workspace {
                             self.popup_options.revert_no_commit = *no_commit;
                             true
                         }
+                        BranchAction::RevertControl {
+                            state,
+                            action: crate::branches::RevertControl::Continue,
+                            no_commit,
+                        } if index == 0 && state.no_commit.is_none() => {
+                            *no_commit = !*no_commit;
+                            true
+                        }
                         BranchAction::Delete {
                             plan,
                             delete_related,
@@ -1172,6 +1226,34 @@ impl Workspace {
             if self.branch_busy {
                 cx.stop_propagation();
                 return;
+            }
+            if let BranchAction::Connect { plan, selected } = &dialog.action {
+                if key.key == "space" {
+                    if !plan.candidates.is_empty() {
+                        self.upstream_focus.focus(window);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                let next = match key.key.as_str() {
+                    "up" if !plan.candidates.is_empty() => Some(selected.saturating_sub(1)),
+                    "down" if !plan.candidates.is_empty() => {
+                        Some((selected + 1).min(plan.candidates.len() - 1))
+                    }
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    if let Some(dialog) = &mut self.branch_dialog
+                        && let BranchAction::Connect { selected, .. } = &mut dialog.action
+                    {
+                        *selected = next;
+                    }
+                    self.upstream_scroll.scroll_to_item(next);
+                    self.upstream_focus.focus(window);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
             }
             if let BranchAction::Reset { mode, .. } = &dialog.action {
                 let digit = if !key.modifiers.control
@@ -1290,6 +1372,25 @@ impl Workspace {
             return;
         }
         if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
+            if self
+                .project()
+                .is_some_and(|project| project.snapshot.integration_active())
+                && ["c", "s", "o", "d", "b", "t", "x", "v", "m", "r", "p"]
+                    .contains(&key.key.as_str())
+            {
+                self.error = Some("진행 중인 작업이나 미해결 충돌이 있습니다. 파일을 수정하고 Stage한 뒤 진행 표시줄에서 완료하거나 취소하세요.".into());
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.key == "`" && !key.modifiers.shift && ["files", "stage-files"].contains(&scope) {
+                self.file_tree = !self.file_tree;
+                self.selected_folder = None;
+                self.rebuild_file_rows(true);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if !key.modifiers.shift
                 && let Some(project) = self.project()
                 && let Some(section) = section_focus(
@@ -1355,6 +1456,11 @@ impl Workspace {
                 cx.stop_propagation();
                 return;
             }
+            if key.key == "r" && !key.modifiers.shift && scope == "local-branches" {
+                self.open_branch_upstream(window, cx);
+                cx.stop_propagation();
+                return;
+            }
             if matches!(key.key.as_str(), "v" | "m" | "r") && !key.modifiers.shift {
                 self.open_history_operation(&key.key, window, cx);
                 cx.stop_propagation();
@@ -1362,11 +1468,6 @@ impl Workspace {
             }
             if key.key == "x" && !key.modifiers.shift {
                 self.open_reset(window, cx);
-                cx.stop_propagation();
-                return;
-            }
-            if key.key == "u" && !key.modifiers.shift {
-                self.open_branch_upload(window, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -1449,6 +1550,27 @@ impl Workspace {
             if Some(text_key.0) != self.active {
                 return;
             }
+            if text_key.1 == 30
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.shift
+                && !key.modifiers.platform
+                && let Some(project) = self.project()
+            {
+                let (id, generation) = (project.id, project.diff_generation);
+                if key.key == "space" {
+                    if let Some(row) = self.diff_cursor_row(id) {
+                        self.toggle_partial_line(id, generation, row, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+                if key.key == "enter" {
+                    self.stage_partial(id, generation, None, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+            }
             let lines = self.text_lines(text_key);
             if let Some((selection_key, selection)) = &mut self.text_selection
                 && *selection_key == text_key
@@ -1474,6 +1596,7 @@ impl Workspace {
         }
         if key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform && key.key == "a"
         {
+            self.selected_folder = None;
             if let Some(ListFocus::Files(id)) = self.list_focus
                 && self.active == Some(id)
                 && let Some(project) = self.project_mut()
@@ -1578,22 +1701,38 @@ impl Workspace {
             ListFocus::Files(project) if project == id => {
                 let history = p.file_tab == FileTab::History;
                 let offset = usize::from(history);
+                let key = (id, if history { 21 } else { 20 });
+                let order: Vec<_> = self
+                    .file_items
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(FileRow::file_index)
+                    .collect();
+                let rows: Vec<_> = self
+                    .file_items
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|row| !extend || row.file_index().is_some())
+                    .cloned()
+                    .collect();
                 let current = if history && p.show_commit_detail {
                     Some(0)
-                } else {
-                    p.selected_file.map(|index| index + offset)
-                };
-                let key = (
-                    id,
-                    if p.file_tab == FileTab::History {
-                        21
-                    } else {
-                        20
-                    },
-                );
-                if let Some(index) =
-                    text_selection::adjacent(current, p.files().len() + offset, down)
+                } else if let Some((folder_key, path)) = &self.selected_folder
+                    && *folder_key == key
+                    && !extend
                 {
+                    rows.iter().position(|row| matches!(row, FileRow::Folder { path: candidate } if candidate == path)).map(|position| position + offset)
+                } else {
+                    p.selected_file
+                        .and_then(|index| {
+                            rows.iter()
+                                .position(|item| item.file_index() == Some(index))
+                        })
+                        .map(|position| position + offset)
+                };
+                if let Some(index) = text_selection::adjacent(current, rows.len() + offset, down) {
                     if current == Some(index) {
                         return;
                     }
@@ -1602,7 +1741,23 @@ impl Workspace {
                         cx.notify();
                         return;
                     }
-                    let index = index - offset;
+                    let item = &rows[index - offset];
+                    if let FileRow::Folder { path } = item {
+                        self.select_file_folder(key, path.clone());
+                        if let Some(row) = self
+                            .file_items
+                            .get(&key)
+                            .and_then(|all| all.iter().position(|row| row == item))
+                            && let Some(scroll) = self.list_scroll.get(&key)
+                        {
+                            scroll.scroll_to_item(row, ScrollStrategy::Center);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    let Some(index) = item.file_index() else {
+                        return;
+                    };
                     if let Some(row) = self
                         .file_items
                         .get(&key)
@@ -1612,8 +1767,9 @@ impl Workspace {
                         scroll.scroll_to_item(row, ScrollStrategy::Center);
                     }
                     if !history && let Some(project) = self.project_mut() {
-                        project.stage_selection.click(
+                        project.stage_selection.click_visible(
                             &project.snapshot.stage,
+                            &order,
                             index,
                             extend,
                             false,
@@ -1785,7 +1941,14 @@ impl Workspace {
         {
             return;
         }
-        let changes = p.stage_selection.changes(&p.snapshot.stage);
+        let changes = if let Some((key, directory)) = &self.selected_folder
+            && *key == (p.id, 20)
+            && self.file_tree
+        {
+            directory_stage_changes(&p.snapshot.stage, directory)
+        } else {
+            p.stage_selection.changes(&p.snapshot.stage)
+        };
         if changes.is_empty() {
             return;
         }
@@ -1822,6 +1985,182 @@ impl Workspace {
         cx.notify();
     }
 
+    fn diff_cursor_row(&self, id: u64) -> Option<usize> {
+        self.text_selection
+            .as_ref()
+            .filter(|(key, _)| *key == (id, 30))
+            .map(|(_, selection)| selection.cursor.row)
+    }
+
+    fn resolve_conflict(
+        &mut self,
+        id: u64,
+        generation: u64,
+        choice: feather_git::conflict::Choice,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(p) = self.project().filter(|p| {
+            p.id == id && p.diff_generation == generation && p.file_tab == FileTab::Stage
+        }) else {
+            return;
+        };
+        let Some(file) = p
+            .selected_file
+            .and_then(|index| p.files().get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(preview) = p.diff.conflict.clone() else {
+            return;
+        };
+        let Some(region) = self
+            .diff_cursor_row(id)
+            .and_then(|row| p.diff.conflict_at_row(row))
+        else {
+            return;
+        };
+        if file.status != "U" || file.staged {
+            return;
+        }
+        let root = p.path.clone();
+        self.pending += 1;
+        self.error = None;
+        let task = cx.background_executor().spawn(async move {
+            let operation =
+                feather_git::conflict::apply(&root, &file.path, &preview, region, choice);
+            (operation, git::load_stage(&root))
+        });
+        cx.spawn(async move |this, cx| {
+            let (operation, refreshed) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                match refreshed {
+                    Ok(files) => this.apply_stage_files(id, files, &Default::default(), cx),
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                if let Err(error) = operation {
+                    this.error = Some(format!("{error:#}"));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn toggle_partial_line(
+        &mut self,
+        id: u64,
+        generation: u64,
+        row: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        if !self.project().is_some_and(|p| {
+            p.id == id
+                && p.diff_generation == generation
+                && p.file_tab == FileTab::Stage
+                && p.diff.partial.is_some()
+                && p.diff
+                    .lines
+                    .get(row)
+                    .is_some_and(|line| matches!(line.kind, '+' | '-'))
+        }) {
+            return;
+        }
+        let entry = self
+            .partial_selection
+            .entry(id)
+            .or_insert_with(|| (generation, Default::default()));
+        if entry.0 != generation {
+            *entry = (generation, Default::default());
+        }
+        if !entry.1.remove(&row) {
+            entry.1.insert(row);
+        }
+        cx.notify();
+    }
+
+    fn stage_partial(
+        &mut self,
+        id: u64,
+        generation: u64,
+        hunk: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(p) = self.project().filter(|p| {
+            p.id == id && p.diff_generation == generation && p.file_tab == FileTab::Stage
+        }) else {
+            return;
+        };
+        let Some(file) = p
+            .selected_file
+            .and_then(|index| p.files().get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(preview) = p.diff.partial.clone() else {
+            return;
+        };
+        let rows = match hunk {
+            Some(header) => feather_git::partial_stage::hunk_rows(&p.diff.lines, header),
+            None => self
+                .partial_selection
+                .get(&id)
+                .filter(|(selected_generation, _)| *selected_generation == generation)
+                .map(|(_, rows)| rows.iter().copied().collect())
+                .unwrap_or_default(),
+        };
+        if rows.is_empty() {
+            return;
+        }
+        let root = p.path.clone();
+        let lines = p.diff.lines.clone();
+        let raw_path = file.path.clone();
+        self.pending += 1;
+        self.error = None;
+        self.partial_selection.remove(&id);
+        let task = cx.background_executor().spawn(async move {
+            let operation =
+                feather_git::partial_stage::apply(&root, &file, &preview, &lines, &rows);
+            (operation, git::load_stage(&root))
+        });
+        cx.spawn(async move |this, cx| {
+            let (operation, refreshed) = task.await;
+            this.update(cx, |this, cx| {
+                this.pending = this.pending.saturating_sub(1);
+                match refreshed {
+                    Ok(files) => {
+                        let staged = !files
+                            .iter()
+                            .any(|file| file.path == raw_path && !file.staged);
+                        let targets = std::collections::BTreeMap::from([(raw_path, staged)]);
+                        this.apply_stage_files(id, files, &targets, cx);
+                    }
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                if let Err(error) = operation {
+                    this.error = Some(format!("{error:#}"));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn apply_stage_files(
         &mut self,
         id: u64,
@@ -1829,6 +2168,10 @@ impl Workspace {
         targets: &std::collections::BTreeMap<Vec<u8>, bool>,
         cx: &mut Context<Self>,
     ) {
+        let folder_selected = self
+            .selected_folder
+            .as_ref()
+            .is_some_and(|(key, _)| *key == (id, 20));
         let Some(p) = self
             .tabs
             .iter_mut()
@@ -1845,8 +2188,48 @@ impl Workspace {
             None
         };
         p.snapshot.stage = files;
+        p.snapshot.unmerged = p
+            .snapshot
+            .stage
+            .iter()
+            .filter(|file| file.status == "U")
+            .map(|file| file.path.clone())
+            .collect();
+        if let Some(stash) = &mut p.snapshot.stash_restore {
+            stash.conflicts = p.snapshot.unmerged.clone();
+        }
+        if let Some(merge) = &mut p.snapshot.merge {
+            merge.conflicts = p
+                .snapshot
+                .stage
+                .iter()
+                .filter(|file| file.status == "U")
+                .map(|file| file.path.clone())
+                .collect();
+        }
+        if let Some(rebase) = &mut p.snapshot.rebase {
+            rebase.conflicts = p
+                .snapshot
+                .stage
+                .iter()
+                .filter(|file| file.status == "U")
+                .map(|file| file.path.clone())
+                .collect();
+        }
+        if let Some(revert) = &mut p.snapshot.revert {
+            revert.conflicts = p
+                .snapshot
+                .stage
+                .iter()
+                .filter(|file| file.status == "U")
+                .map(|file| file.path.clone())
+                .collect();
+        }
         p.error = None;
         p.stage_selection.restore(&p.snapshot.stage, targets);
+        if folder_selected {
+            p.stage_selection.clear();
+        }
         let selected = primary
             .and_then(|(path, staged)| {
                 let staged = targets.get(&path).copied().unwrap_or(staged);
@@ -1864,12 +2247,19 @@ impl Workspace {
         if show_stage {
             p.selected_file = selected;
         }
-        self.file_items
-            .insert((id, 20), file_rows(&p.snapshot.stage, false));
+        self.file_items.insert(
+            (id, 20),
+            display_file_rows(&p.snapshot.stage, self.file_tree),
+        );
         if show_stage {
             if let Some(index) = selected {
-                if let Some(scroll) = self.list_scroll.get(&(id, 20)) {
-                    scroll.scroll_to_item(index, ScrollStrategy::Center);
+                if let Some(row) = self
+                    .file_items
+                    .get(&(id, 20))
+                    .and_then(|rows| rows.iter().position(|row| row.file_index() == Some(index)))
+                    && let Some(scroll) = self.list_scroll.get(&(id, 20))
+                {
+                    scroll.scroll_to_item(row, ScrollStrategy::Center);
                 }
                 self.select_project_file(id, index, cx);
             } else if let Some(p) = self
@@ -2498,6 +2888,122 @@ impl Workspace {
             .and_then(WorkspaceTab::project)
     }
 
+    fn open_merge_control(
+        &mut self,
+        action: crate::branches::MergeControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(state) = project.snapshot.merge.clone() else {
+            return;
+        };
+        if action == crate::branches::MergeControl::Continue && !state.conflicts.is_empty() {
+            return;
+        }
+        self.branch_dialog = Some(BranchDialog {
+            project_id: project.id,
+            path: project.path.clone(),
+            action: BranchAction::MergeControl { state, action },
+            editor: None,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_rebase_control(
+        &mut self,
+        action: crate::branches::RebaseControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(state) = project.snapshot.rebase.clone() else {
+            return;
+        };
+        if action == crate::branches::RebaseControl::Continue && !state.conflicts.is_empty() {
+            return;
+        }
+        self.branch_dialog = Some(BranchDialog {
+            project_id: project.id,
+            path: project.path.clone(),
+            action: BranchAction::RebaseControl { state, action },
+            editor: None,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_revert_control(
+        &mut self,
+        action: crate::branches::RevertControl,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(state) = project.snapshot.revert.clone() else {
+            return;
+        };
+        if action == crate::branches::RevertControl::Continue && !state.conflicts.is_empty() {
+            return;
+        }
+        let no_commit = state.no_commit.unwrap_or(true);
+        self.branch_dialog = Some(BranchDialog {
+            project_id: project.id,
+            path: project.path.clone(),
+            action: BranchAction::RevertControl {
+                state,
+                action,
+                no_commit,
+            },
+            editor: None,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn open_stash_control(&mut self, cancel: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let Some(state) = project.snapshot.stash_restore.clone() else {
+            return;
+        };
+        if state.applying || (!cancel && !state.conflicts.is_empty()) {
+            return;
+        }
+        self.branch_dialog = Some(BranchDialog {
+            project_id: project.id,
+            path: project.path.clone(),
+            action: BranchAction::StashControl { state, cancel },
+            editor: None,
+            error: None,
+        });
+        self.focus.focus(window);
+        cx.notify();
+    }
+
     fn open_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.pending > 0 || self.branch_busy {
             return;
@@ -2604,7 +3110,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_branch_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_branch_upstream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy() || self.branch_busy {
             return;
         }
@@ -2616,11 +3122,14 @@ impl Workspace {
         {
             return;
         }
-        let Some(reference) =
-            project.snapshot.references.iter().find(|r| {
-                r.kind == RefTab::Local && Some(&r.revision) == project.revision.as_ref()
-            })
-        else {
+        let Some(reference) = project.snapshot.references.iter().find(|r| {
+            r.kind == RefTab::Local
+                && Some(&r.revision)
+                    == project
+                        .revision
+                        .as_ref()
+                        .or(project.snapshot.current_branch.as_ref())
+        }) else {
             return;
         };
         let (id, path, reference, expected) = (
@@ -2629,18 +3138,49 @@ impl Workspace {
             reference.revision.clone(),
             reference.target.clone(),
         );
-        let editor = cx.new(|cx| CommitEditor::single_line("origin", cx));
-        editor.read(cx).focus.focus(window);
-        self.branch_dialog = Some(BranchDialog {
-            project_id: id,
-            path,
-            action: BranchAction::Upload {
-                reference,
-                expected,
-            },
-            editor: Some(editor),
-            error: None,
+        self.branch_busy = true;
+        self.pending += 1;
+        self.remote_status = Some((id, "연결할 원격 브랜치 확인 중…"));
+        self.focus.focus(window);
+        let worker_path = path.clone();
+        let task = cx.background_executor().spawn(async move {
+            crate::branches::plan_upstream(&worker_path, &reference, &expected)
         });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.branch_busy = false;
+                this.pending = this.pending.saturating_sub(1);
+                this.remote_status = None;
+                match result {
+                    Ok(plan)
+                        if this.active == Some(id)
+                            && this.tabs.iter().any(|tab| tab.id() == id) =>
+                    {
+                        let selected = plan
+                            .candidates
+                            .iter()
+                            .position(|candidate| candidate.reference == plan.current)
+                            .unwrap_or(0);
+                        this.upstream_scroll = ScrollHandle::new();
+                        this.upstream_scroll.scroll_to_item(selected);
+                        this.branch_dialog = Some(BranchDialog {
+                            project_id: id,
+                            path,
+                            action: BranchAction::Connect { plan, selected },
+                            editor: None,
+                            error: None,
+                        });
+                        this.focus_after_popup = true;
+                    }
+                    Ok(_) => {}
+                    Err(error) => this.error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -2768,12 +3308,29 @@ impl Workspace {
     }
 
     fn submit_branch(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.branch_dialog.as_ref().map(|dialog| &dialog.action),
+            Some(
+                BranchAction::MergeControl { .. }
+                    | BranchAction::RebaseControl { .. }
+                    | BranchAction::RevertControl { .. }
+                    | BranchAction::StashControl { .. }
+            )
+        ) && self.busy()
+        {
+            return;
+        }
         if self.pending > 0 || self.branch_busy {
             return;
         }
         let Some(dialog) = &mut self.branch_dialog else {
             return;
         };
+        if let BranchAction::Connect { plan, selected } = &dialog.action
+            && plan.candidates.get(*selected).is_none()
+        {
+            return;
+        }
         if dialog
             .editor
             .as_ref()
@@ -2811,6 +3368,11 @@ impl Workspace {
                 | BranchAction::Reset { .. }
                 | BranchAction::Revert { .. }
                 | BranchAction::Integrate { .. }
+                | BranchAction::Connect { .. }
+                | BranchAction::MergeControl { .. }
+                | BranchAction::RebaseControl { .. }
+                | BranchAction::RevertControl { .. }
+                | BranchAction::StashControl { .. }
         );
         let task = cx.background_executor().spawn(async move {
             match action {
@@ -2832,15 +3394,9 @@ impl Workspace {
                     plan,
                     delete_related,
                 } => crate::branches::delete_reference_plan(&path, &plan, delete_related),
-                BranchAction::Upload {
-                    reference,
-                    expected,
-                } => crate::branches::publish_branch(
-                    &path,
-                    &reference,
-                    &expected,
-                    name.as_deref().unwrap_or_default(),
-                ),
+                BranchAction::Connect { plan, selected } => {
+                    crate::branches::connect_upstream(&path, &plan, selected)
+                }
                 BranchAction::ChooseCheckout {
                     commit,
                     candidates,
@@ -2861,6 +3417,24 @@ impl Workspace {
                 }
                 BranchAction::Integrate { kind, commit } => {
                     crate::branches::integrate_commit(&path, &commit, kind)
+                }
+                BranchAction::MergeControl { state, action } => {
+                    crate::branches::control_merge(&path, &state, action)
+                }
+                BranchAction::RebaseControl { state, action } => {
+                    crate::branches::control_rebase(&path, &state, action)
+                }
+                BranchAction::RevertControl {
+                    state,
+                    action,
+                    no_commit,
+                } => crate::branches::control_revert(&path, &state, action, no_commit),
+                BranchAction::StashControl { state, cancel } => {
+                    if cancel {
+                        feather_git::stash_recovery::cancel(&path, &state)
+                    } else {
+                        feather_git::stash_recovery::complete(&path, &state)
+                    }
                 }
                 BranchAction::Reset { commit, mode, .. } => {
                     crate::branches::reset_commit(&path, &commit, mode)
@@ -3151,6 +3725,13 @@ impl Workspace {
         self.list_scroll.retain(|(project, _), _| *project != id);
         self.tracks.retain(|((project, _), _), _| *project != id);
         self.file_items.retain(|(project, _), _| *project != id);
+        if self
+            .selected_folder
+            .as_ref()
+            .is_some_and(|(key, _)| key.0 == id)
+        {
+            self.selected_folder = None;
+        }
         self.detail_items.remove(&id);
         self.diff_width_row.remove(&id);
         self.diff_content_width.remove(&id);
@@ -3758,6 +4339,50 @@ impl Workspace {
                 p.history_loading = false;
                 match result {
                     Ok(snapshot) => {
+                        let entering =
+                            snapshot.integration_active() && !p.snapshot.integration_active();
+                        let advanced = snapshot
+                            .rebase
+                            .as_ref()
+                            .zip(p.snapshot.rebase.as_ref())
+                            .is_some_and(|(next, previous)| !next.same_operation(previous))
+                            || snapshot
+                                .revert
+                                .as_ref()
+                                .zip(p.snapshot.revert.as_ref())
+                                .is_some_and(|(next, previous)| !next.same_operation(previous));
+                        let integration_dialog_failed =
+                            this.branch_dialog.as_ref().is_some_and(|dialog| {
+                                dialog.project_id == id
+                                    && match &dialog.action {
+                                        BranchAction::Integrate {
+                                            kind: crate::branches::IntegrateKind::Merge,
+                                            ..
+                                        } => snapshot.merge.is_some(),
+                                        BranchAction::Integrate {
+                                            kind: crate::branches::IntegrateKind::Rebase,
+                                            ..
+                                        } => snapshot.rebase.is_some(),
+                                        BranchAction::Revert { .. } => snapshot
+                                            .revert
+                                            .as_ref()
+                                            .is_some_and(|state| !state.conflicts.is_empty()),
+                                        _ => false,
+                                    }
+                            });
+                        if entering || integration_dialog_failed || advanced {
+                            p.file_tab = FileTab::Stage;
+                            p.show_commit_detail = false;
+                            if this.active == Some(id) {
+                                this.list_focus = Some(ListFocus::Files(id));
+                                this.selected_folder = None;
+                                this.focus_after_popup = true;
+                            }
+                        }
+                        if integration_dialog_failed {
+                            this.branch_dialog = None;
+                            this.error = None;
+                        }
                         if !snapshot
                             .commit_detail
                             .as_ref()
@@ -3776,8 +4401,8 @@ impl Workspace {
                         {
                             p.revision = None;
                         }
-                        let stage = file_rows(&snapshot.stage, false);
-                        let history = file_rows(&snapshot.history, false);
+                        let stage = display_file_rows(&snapshot.stage, this.file_tree);
+                        let history = display_file_rows(&snapshot.history, this.file_tree);
                         let details = snapshot
                             .commit_detail
                             .as_ref()
@@ -3809,6 +4434,7 @@ impl Workspace {
     }
 
     fn select_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        self.selected_folder = None;
         self.text_selection = None;
         let Some(p) = self.project_mut() else { return };
         p.history_target = None;
@@ -3851,8 +4477,10 @@ impl Workspace {
                 p.loading = false;
                 match result {
                     Ok(selection) => {
-                        this.file_items
-                            .insert((id, 21), file_rows(&selection.history, false));
+                        this.file_items.insert(
+                            (id, 21),
+                            display_file_rows(&selection.history, this.file_tree),
+                        );
                         this.detail_items
                             .insert(id, TextRows::new(detail_rows(&selection.detail)));
                         p.snapshot.history = selection.history;
@@ -3932,6 +4560,14 @@ impl Workspace {
     }
 
     fn select_project_file(&mut self, project_id: u64, index: usize, cx: &mut Context<Self>) {
+        self.partial_selection.remove(&project_id);
+        if self
+            .selected_folder
+            .as_ref()
+            .is_some_and(|(key, _)| key.0 == project_id)
+        {
+            self.selected_folder = None;
+        }
         if self.active == Some(project_id) {
             self.text_selection = None;
         }
@@ -3999,6 +4635,12 @@ impl Workspace {
                         this.diff_content_width
                             .insert(id, columns as f32 * 8. + 132.);
                         p.diff = diff;
+                        if this.active == Some(id)
+                            && this.list_focus == Some(ListFocus::Text((id, 30)))
+                            && !p.diff.lines.is_empty()
+                        {
+                            this.text_selection = Some(((id, 30), Selection::default()));
+                        }
                     }
                     Err(err) => p.error = Some(format!("{err:#}")),
                 }
@@ -4011,6 +4653,7 @@ impl Workspace {
     }
 
     fn show_detail(&mut self) {
+        self.selected_folder = None;
         self.text_selection = None;
         if let Some(p) = self.project_mut() {
             p.show_commit_detail = true;
@@ -4488,6 +5131,41 @@ impl Workspace {
             )
     }
 
+    fn select_file_folder(&mut self, key: ListKey, path: Vec<u8>) {
+        self.selected_folder = Some((key, path));
+        self.text_selection = None;
+        if let Some(project) = self.project_mut() {
+            project.stage_selection.clear();
+            project.selected_file = None;
+            project.show_commit_detail = false;
+            project.diff = Diff::default();
+            project.diff_generation += 1;
+            project.diff_loading = false;
+        }
+    }
+
+    fn rebuild_file_rows(&mut self, reset_scroll: bool) {
+        for project in self.tabs.iter().filter_map(WorkspaceTab::project) {
+            for (kind, files) in [
+                (20, &project.snapshot.stage),
+                (21, &project.snapshot.history),
+            ] {
+                let key = (project.id, kind);
+                self.file_items
+                    .insert(key, display_file_rows(files, self.file_tree));
+            }
+        }
+        for (key, scroll) in &self.list_scroll {
+            if reset_scroll && [20, 21].contains(&key.1) {
+                scroll
+                    .0
+                    .borrow()
+                    .base_handle
+                    .set_offset(point(px(0.), px(0.)));
+            }
+        }
+    }
+
     fn files_panel(&mut self, window: &Window, cx: &Context<Self>) -> Div {
         let mut tabs = div()
             .flex()
@@ -4510,6 +5188,7 @@ impl Workspace {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.text_selection = None;
+                    this.selected_folder = None;
                     if let Some(p) = this.project_mut() {
                         p.file_tab = tab;
                         p.stage_selection.clear();
@@ -4559,6 +5238,10 @@ impl Workspace {
         .min_h_0();
         panel()
             .child(tabs)
+            .when(!history && self.project().is_some_and(|project| project.snapshot.integration_active()), |panel| {
+                panel.child(div().px_3().py_2().text_xs().text_color(rgb(MUTED))
+                    .child("DiffViewer에서 충돌 구간별 내용을 선택하거나 외부 편집기로 수정한 뒤 Space로 Stage하세요. 삭제로 해결할 수도 있습니다."))
+            })
             .when(history, |panel| {
                 panel.child(
                     div()
@@ -4640,7 +5323,41 @@ impl Workspace {
                 .text_color(rgb(MUTED))
                 .child("STAGED · 스테이징");
         }
-        let FileRow::File(file_index) = *item else {
+        if let FileRow::Folder { path } = item {
+            let depth = path.iter().filter(|byte| **byte == b'/').count();
+            let label = String::from_utf8_lossy(
+                path.rsplit(|byte| *byte == b'/').next().unwrap_or_default(),
+            )
+            .into_owned();
+            let path = path.clone();
+            let selected =
+                self.selected_folder
+                    .as_ref()
+                    .is_some_and(|(selected_key, selected_path)| {
+                        *selected_key == key && *selected_path == path
+                    });
+            return row
+                .pl(px(12. + depth as f32 * 16.))
+                .text_color(rgb(MUTED))
+                .bg(rgb(if selected {
+                    self.selection_color(ListFocus::Files(key.0), window)
+                } else {
+                    PANEL
+                }))
+                .cursor_pointer()
+                .when(!selected, |row| row.hover(|style| style.bg(rgb(HOVER))))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.active != Some(key.0) {
+                        return;
+                    }
+                    this.list_focus = Some(ListFocus::Files(key.0));
+                    this.focus.focus(window);
+                    this.select_file_folder(key, path.clone());
+                    cx.notify();
+                }));
+        }
+        let FileRow::File(file_index) = item.clone() else {
             unreachable!()
         };
         let Some(p) = self
@@ -4659,6 +5376,10 @@ impl Workspace {
         let Some(file) = files.get(file_index) else {
             return row;
         };
+        if self.file_tree {
+            let depth = file.path.iter().filter(|byte| **byte == b'/').count();
+            row = row.pl(px(12. + depth as f32 * 16.));
+        }
         let selected = (key.1 == 20 && p.stage_selection.contains(file))
             || (key.1 != 20 && p.selected_file == Some(file_index));
         row = row
@@ -4679,7 +5400,9 @@ impl Workspace {
                             .font_family("Cascadia Mono")
                             .whitespace_nowrap()
                     })
-                    .text_color(rgb(if key.1 == 20 {
+                    .text_color(rgb(if file.status == "U" {
+                        ERROR
+                    } else if key.1 == 20 {
                         if file.staged { ADDED } else { REMOVED }
                     } else {
                         match file.status.as_str() {
@@ -4702,17 +5425,44 @@ impl Workspace {
                     .when(key.1 == 20 && file.staged, |name| {
                         name.text_color(rgb(ADDED))
                     })
-                    .child(file.label.clone()),
+                    .child(if self.file_tree {
+                        String::from_utf8_lossy(
+                            file.path
+                                .rsplit(|byte| *byte == b'/')
+                                .next()
+                                .unwrap_or_default(),
+                        )
+                        .into_owned()
+                    } else {
+                        file.label.clone()
+                    }),
             );
+        row = row.when(key.1 == 20 && file.status == "U", |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(ERROR))
+                    .flex_shrink_0()
+                    .child("충돌"),
+            )
+        });
         row.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             if this.active == Some(key.0) {
                 this.list_focus = Some(ListFocus::Files(key.0));
                 this.focus.focus(window);
                 if key.1 == 20 {
                     let modifiers = event.modifiers();
+                    let order: Vec<_> = this
+                        .file_items
+                        .get(&key)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(FileRow::file_index)
+                        .collect();
                     let selected = this.project_mut().and_then(|project| {
-                        project.stage_selection.click(
+                        project.stage_selection.click_visible(
                             &project.snapshot.stage,
+                            &order,
                             file_index,
                             modifiers.shift,
                             modifiers.control,
@@ -4765,6 +5515,31 @@ impl Workspace {
         } else {
             p.diff.note.clone()
         };
+        let generation = p.diff_generation;
+        let partial = !details
+            && !loading
+            && !error
+            && p.file_tab == FileTab::Stage
+            && p.diff.partial.is_some();
+        let conflicts = !details
+            && !loading
+            && !error
+            && p.file_tab == FileTab::Stage
+            && p.diff.conflict.is_some();
+        let conflict_region = self
+            .diff_cursor_row(id)
+            .and_then(|row| p.diff.conflict_at_row(row));
+        let conflict_count = p
+            .diff
+            .conflict
+            .as_ref()
+            .map_or(0, |preview| preview.regions.len());
+        let selected_count = self
+            .partial_selection
+            .get(&id)
+            .filter(|(selected_generation, _)| *selected_generation == generation)
+            .map_or(0, |(_, rows)| rows.len());
+        let blocked = self.busy() || self.branch_busy || self.branch_dialog.is_some();
         if details {
             if let Some(rows) = self.detail_items.get_mut(&id)
                 && !rows.measured
@@ -4792,6 +5567,12 @@ impl Workspace {
             self.detail_items.get(&id).map_or(24., |r| r.width)
         } else {
             self.diff_content_width.get(&id).copied().unwrap_or(132.)
+        };
+        let content_width = if !details && self.project().is_some_and(|p| p.diff.partial.is_some())
+        {
+            (content_width + 24.).max(620.)
+        } else {
+            content_width
         };
         let scroll = self.scroll_handle(key);
         let list = uniform_list(
@@ -4822,6 +5603,70 @@ impl Workspace {
                         .flex_shrink_0()
                         .child(title),
                 )
+            })
+            .when(partial, |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .child(format!("변경 줄 {selected_count}개 선택"))
+                        .child(
+                            button(
+                                "stage-selected-lines",
+                                format!(
+                                    "선택한 줄 Stage · {}",
+                                    self.shortcuts.label("viewer-stage-lines")
+                                ),
+                                selected_count > 0 && !blocked,
+                            )
+                            .when(selected_count == 0 || blocked, |button| button.opacity(0.4))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| this.stage_partial(id, generation, None, cx),
+                            )),
+                        )
+                        .child(div().text_color(rgb(MUTED)).child(format!(
+                            "{}: 현재 줄 체크/해제",
+                            self.shortcuts.label("viewer-toggle-line")
+                        ))),
+                )
+            })
+            .when(conflicts, |panel| {
+                use feather_git::conflict::Choice;
+                let disabled = blocked || conflict_region.is_none();
+                let label = conflict_region.map_or_else(
+                    || "충돌 구간 안에 커서를 놓으세요.".to_owned(),
+                    |region| format!("충돌 {} / {conflict_count}", region + 1),
+                );
+                let mut toolbar = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .child(label);
+                for (key, label, choice) in [
+                    ("conflict-current", "현재 변경 사용", Choice::Current),
+                    ("conflict-incoming", "들어오는 변경 사용", Choice::Incoming),
+                    ("conflict-both", "양쪽 모두 사용", Choice::Both),
+                ] {
+                    toolbar = toolbar.child(
+                        button(key, label, !disabled)
+                            .when(disabled, |button| button.opacity(0.4))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.resolve_conflict(id, generation, choice, cx)
+                            })),
+                    );
+                }
+                panel.child(toolbar)
             })
             .when(count == 0, |p| {
                 p.child(
@@ -4887,13 +5732,15 @@ impl Workspace {
                 .px_3()
                 .child(self.selectable_line((id, 31), index, text, TEXT, cx));
         }
-        let Some(line) = self
+        let Some(project) = self
             .tabs
             .iter()
             .filter_map(WorkspaceTab::project)
             .find(|p| p.id == id)
-            .and_then(|p| p.diff.lines.get(index))
         else {
+            return row;
+        };
+        let Some(line) = project.diff.lines.get(index) else {
             return row;
         };
         let (bg, fg) = match line.kind {
@@ -4902,8 +5749,42 @@ impl Workspace {
             '@' => (DIFF_HEADER_BG, DIFF_HEADER_TEXT),
             _ => (PANEL, TEXT),
         };
+        let generation = project.diff_generation;
+        let partial = project.file_tab == FileTab::Stage && project.diff.partial.is_some();
+        let blocked = self.busy() || self.branch_busy || self.branch_dialog.is_some();
+        let checked = self
+            .partial_selection
+            .get(&id)
+            .is_some_and(|(selected_generation, rows)| {
+                *selected_generation == generation && rows.contains(&index)
+            });
         row.bg(rgb(bg))
             .text_color(rgb(fg))
+            .when(partial, |row| {
+                row.child(
+                    div()
+                        .w(px(24.))
+                        .h(px(22.))
+                        .flex_shrink_0()
+                        .text_center()
+                        .when(matches!(line.kind, '+' | '-'), |cell| {
+                            cell.child(
+                                div()
+                                    .id(("partial-line", index))
+                                    .cursor_pointer()
+                                    .text_color(rgb(if checked { ACCENT } else { MUTED }))
+                                    .when(blocked, |cell| cell.opacity(0.4))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_partial_line(id, generation, index, cx)
+                                    }))
+                                    .child(if checked { "☑" } else { "☐" }),
+                            )
+                        }),
+                )
+            })
             .child(
                 div()
                     .w(px(48.))
@@ -4928,6 +5809,25 @@ impl Workspace {
                     .flex_shrink_0()
                     .child(line.kind.to_string()),
             )
+            .when(partial && line.kind == '@', |row| {
+                row.child(
+                    div()
+                        .id(("partial-hunk", index))
+                        .px_2()
+                        .h(px(22.))
+                        .line_height(px(22.))
+                        .flex_shrink_0()
+                        .cursor_pointer()
+                        .text_color(rgb(ACCENT))
+                        .hover(|style| style.bg(rgb(HOVER)))
+                        .when(blocked, |button| button.opacity(0.4))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.stage_partial(id, generation, Some(index), cx)
+                        }))
+                        .child("이 구간 Stage"),
+                )
+            })
             .child(self.selectable_line((id, 30), index, line.text.clone(), fg, cx))
     }
 
@@ -5145,6 +6045,14 @@ impl Workspace {
                 )
                 .size_full(),
             )
+    }
+}
+
+fn display_file_rows(files: &[FileChange], tree: bool) -> Vec<FileRow> {
+    if tree {
+        file_tree_rows(files)
+    } else {
+        file_rows(files, false)
     }
 }
 
@@ -5397,6 +6305,269 @@ fn format_detail_time(seconds: i64, offset: i32) -> String {
 }
 
 impl Workspace {
+    fn show_conflict_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_folder = None;
+        if let Some(project) = self.project_mut() {
+            project.file_tab = FileTab::Stage;
+            project.show_commit_detail = false;
+            project.selected_file = None;
+            project.stage_selection.clear();
+            project.diff = Diff::default();
+            project.diff_generation += 1;
+            project.diff_loading = false;
+            self.list_focus = Some(ListFocus::Files(project.id));
+        }
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn stash_banner(&self, cx: &Context<Self>) -> Div {
+        let Some(project) = self.project() else {
+            return div();
+        };
+        let state = project.snapshot.stash_restore.as_ref();
+        let count = state.map_or(project.snapshot.unmerged.len(), |state| {
+            state.conflicts.len()
+        });
+        let label = match state {
+            Some(state) if state.applying => {
+                "Stash 복원 결과를 확인해야 합니다. 적용 중 상태를 자동으로 종료하지 않습니다."
+                    .to_owned()
+            }
+            Some(_) => format!("Stash 복원 결과 확인 · 미해결 충돌 {count}개 · 원본 Stash 유지"),
+            None => format!(
+                "미해결 충돌 {count}개 · DiffViewer에서 선택하거나 외부 편집 후 Stage하세요. 복원 전 백업이 없어 자동 취소할 수 없습니다."
+            ),
+        };
+        let blocked = self.busy() || self.branch_busy || state.is_some_and(|state| state.applying);
+        div()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(
+                button("stash-files", "해결 파일 보기", false).on_click(
+                    cx.listener(|this, _, window, cx| this.show_conflict_files(window, cx)),
+                ),
+            )
+            .when(state.is_some(), |banner| {
+                banner
+                    .child(
+                        button("stash-recovery-finish", "해결 완료", count == 0 && !blocked)
+                            .when(count != 0 || blocked, |button| button.opacity(0.4))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_stash_control(false, window, cx)
+                            })),
+                    )
+                    .child(
+                        button("stash-recovery-cancel", "복원 취소", false)
+                            .when(blocked, |button| button.opacity(0.4))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_stash_control(true, window, cx)
+                            })),
+                    )
+            })
+    }
+
+    fn integration_banner(&self, cx: &Context<Self>) -> Div {
+        let Some(project) = self.project() else {
+            return div();
+        };
+        if project.snapshot.stash_restore.is_some()
+            || (project.snapshot.merge.is_none()
+                && project.snapshot.rebase.is_none()
+                && project.snapshot.revert.is_none())
+        {
+            return self.stash_banner(cx);
+        }
+        let (conflicts, label) = if let Some(revert) = &project.snapshot.revert {
+            let mode = match revert.no_commit {
+                Some(true) => " · 커밋 없음",
+                Some(false) => "",
+                None => " · 커밋 옵션 확인 필요",
+            };
+            (
+                revert.conflicts.len(),
+                format!(
+                    "Revert 진행 중{mode} · {} · 미해결 충돌 {}개",
+                    revert.target.chars().take(8).collect::<String>(),
+                    revert.conflicts.len()
+                ),
+            )
+        } else if let Some(rebase) = &project.snapshot.rebase {
+            let progress = rebase
+                .step
+                .zip(rebase.total)
+                .map(|(step, total)| format!(" · {step}/{total}단계"))
+                .unwrap_or_default();
+            let commit = rebase
+                .current_commit
+                .as_ref()
+                .map(|id| format!(" · {}", id.chars().take(8).collect::<String>()))
+                .unwrap_or_default();
+            (
+                rebase.conflicts.len(),
+                format!(
+                    "Rebase 진행 중{progress}{commit} · 미해결 충돌 {}개",
+                    rebase.conflicts.len()
+                ),
+            )
+        } else if let Some(merge) = &project.snapshot.merge {
+            (
+                merge.conflicts.len(),
+                format!("Merge 진행 중 · 미해결 충돌 {}개", merge.conflicts.len()),
+            )
+        } else {
+            return div();
+        };
+        let rebase = project.snapshot.rebase.is_some();
+        let revert = project.snapshot.revert.is_some();
+        let blocked = self.busy() || self.branch_busy;
+        let ready = conflicts == 0 && !blocked;
+        div()
+            .px_3()
+            .py_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(
+                button("merge-files", "해결 파일 보기", false).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.selected_folder = None;
+                        if let Some(project) = this.project_mut() {
+                            project.file_tab = FileTab::Stage;
+                            this.list_focus = Some(ListFocus::Files(project.id));
+                        }
+                        this.focus.focus(window);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                button(
+                    "merge-continue",
+                    if revert {
+                        "되돌리기 계속"
+                    } else if rebase {
+                        "리베이스 계속"
+                    } else {
+                        "병합 완료"
+                    },
+                    ready,
+                )
+                .when(!ready, |button| button.opacity(0.4))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this
+                        .project()
+                        .is_some_and(|project| project.snapshot.revert.is_some())
+                    {
+                        this.open_revert_control(
+                            crate::branches::RevertControl::Continue,
+                            window,
+                            cx,
+                        )
+                    } else if this
+                        .project()
+                        .is_some_and(|project| project.snapshot.rebase.is_some())
+                    {
+                        this.open_rebase_control(
+                            crate::branches::RebaseControl::Continue,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        this.open_merge_control(crate::branches::MergeControl::Continue, window, cx)
+                    }
+                })),
+            )
+            .when(rebase || revert, |banner| {
+                banner.child(
+                    button(
+                        "rebase-skip",
+                        if revert {
+                            "되돌리기 건너뛰기"
+                        } else {
+                            "커밋 건너뛰기"
+                        },
+                        false,
+                    )
+                    .when(blocked, |button| button.opacity(0.4))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if this
+                            .project()
+                            .is_some_and(|project| project.snapshot.revert.is_some())
+                        {
+                            this.open_revert_control(
+                                crate::branches::RevertControl::Skip,
+                                window,
+                                cx,
+                            )
+                        } else {
+                            this.open_rebase_control(
+                                crate::branches::RebaseControl::Skip,
+                                window,
+                                cx,
+                            )
+                        }
+                    })),
+                )
+            })
+            .child(
+                button(
+                    "merge-abort",
+                    if revert {
+                        "되돌리기 중단"
+                    } else if rebase {
+                        "리베이스 중단"
+                    } else {
+                        "병합 중단"
+                    },
+                    false,
+                )
+                .when(blocked, |button| button.opacity(0.4))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this
+                        .project()
+                        .is_some_and(|project| project.snapshot.revert.is_some())
+                    {
+                        this.open_revert_control(crate::branches::RevertControl::Abort, window, cx)
+                    } else if this
+                        .project()
+                        .is_some_and(|project| project.snapshot.rebase.is_some())
+                    {
+                        this.open_rebase_control(crate::branches::RebaseControl::Abort, window, cx)
+                    } else {
+                        this.open_merge_control(crate::branches::MergeControl::Abort, window, cx)
+                    }
+                })),
+            )
+    }
+
     fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let mut projects = div()
             .id("project-tabs")
@@ -5686,6 +6857,11 @@ impl Workspace {
             .text_color(rgb(TEXT))
             .font_family("Segoe UI")
             .child(top)
+            .when(
+                self.project()
+                    .is_some_and(|project| project.snapshot.integration_active()),
+                |root| root.child(self.integration_banner(cx)),
+            )
             .child(body)
             .child(
                 div()
@@ -5738,7 +6914,12 @@ impl Render for Workspace {
         self.update_status_error(cx);
         if self.focus_after_popup || window.focused(cx).is_none() {
             self.focus_after_popup = false;
-            self.focus.focus(window);
+            if matches!(self.branch_dialog.as_ref().map(|dialog| &dialog.action), Some(BranchAction::Connect { plan, .. }) if !plan.candidates.is_empty())
+            {
+                self.upstream_focus.focus(window);
+            } else {
+                self.focus.focus(window);
+            }
         }
         let content = self.render_content(window, cx);
         let busy = self.history_in_progress() || self.branch_busy;
@@ -5812,11 +6993,21 @@ impl Render for Workspace {
                     BranchAction::Create { .. } => "브랜치 만들기",
                     BranchAction::Tag { .. } => "태그 만들기",
                     BranchAction::Delete { plan, .. } => plan.kind.title(),
-                    BranchAction::Upload { .. } => "브랜치 푸시",
+                    BranchAction::Connect { .. } => "원격 브랜치 연결",
                     BranchAction::ChooseCheckout { .. } => "체크아웃할 브랜치 선택",
                     BranchAction::Reset { .. } => "Reset",
                     BranchAction::Revert { .. } => "Revert",
                     BranchAction::Integrate { kind, .. } => kind.label(),
+                    BranchAction::MergeControl { action, .. } => action.label(),
+                    BranchAction::RebaseControl { action, .. } => action.label(),
+                    BranchAction::RevertControl { action, .. } => action.label(),
+                    BranchAction::StashControl { cancel, .. } => {
+                        if *cancel {
+                            "Stash 복원 취소"
+                        } else {
+                            "Stash 해결 완료"
+                        }
+                    }
                     BranchAction::Track(_) => "로컬 브랜치 만들기",
                 };
                 let create = matches!(dialog.action, BranchAction::Create { .. });
@@ -5825,10 +7016,14 @@ impl Render for Workspace {
                         dialog.action,
                         BranchAction::Tag { .. }
                             | BranchAction::Delete { .. }
-                            | BranchAction::Upload { .. }
+                            | BranchAction::Connect { .. }
                             | BranchAction::Reset { .. }
                             | BranchAction::Revert { .. }
                             | BranchAction::Integrate { .. }
+                            | BranchAction::MergeControl { .. }
+                            | BranchAction::RebaseControl { .. }
+                            | BranchAction::RevertControl { .. }
+                            | BranchAction::StashControl { .. }
                     );
                 if create {
                     card = card.text_size(px(13.));
@@ -5910,13 +7105,63 @@ impl Render for Workspace {
                                 );
                         }
                     }
-                    BranchAction::Upload { .. } => {
-                        card = card.child("원격 이름").when_some(
-                            dialog.editor.clone(),
-                            |card, editor| {
-                                card.child(div().h(px(36.)).overflow_hidden().child(editor))
-                            },
-                        );
+                    BranchAction::Connect { plan, selected } => {
+                        let mut choices = div()
+                            .id("upstream-choices")
+                            .flex()
+                            .flex_col()
+                            .when(!plan.candidates.is_empty(), |list| {
+                                list.h(px(plan.candidates.len().min(8) as f32 * 30.))
+                            })
+                            .max_h((window.viewport_size().height - px(220.)).max(px(30.)))
+                            .flex_shrink_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.upstream_scroll);
+                        if plan.candidates.is_empty() {
+                            choices = choices
+                                .child("연결할 원격 브랜치가 없습니다. Fetch 후 다시 시도하세요.");
+                        }
+                        for (index, candidate) in plan.candidates.iter().enumerate() {
+                            let label = if candidate.reference == plan.current {
+                                format!("{} · 현재 연결", candidate.label)
+                            } else {
+                                candidate.label.clone()
+                            };
+                            choices = choices.child(
+                                button(("upstream-choice", index), "", *selected == index)
+                                    .h(px(30.))
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .flex_shrink_0()
+                                    .py_0()
+                                    .when(*selected == index, |row| {
+                                        row.track_focus(&self.upstream_focus)
+                                    })
+                                    .child(
+                                        crate::controls::radio(
+                                            *selected == index,
+                                            div().flex_1().min_w_0().text_ellipsis().child(label),
+                                        )
+                                        .min_w_0()
+                                        .w_full(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        if this.branch_busy {
+                                            return;
+                                        }
+                                        if let Some(dialog) = &mut this.branch_dialog
+                                            && let BranchAction::Connect { selected, .. } =
+                                                &mut dialog.action
+                                        {
+                                            *selected = index;
+                                        }
+                                        this.upstream_focus.focus(window);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        card = card.child(choices);
                     }
                     BranchAction::ChooseCheckout { candidates, .. } => {
                         let mut choices = div()
@@ -6033,6 +7278,54 @@ impl Render for Workspace {
                             }
                         });
                     }
+                    BranchAction::MergeControl { action, .. } => {
+                        card = card.child(match action {
+                            crate::branches::MergeControl::Continue => "Stage된 내용으로 병합을 완료할까요? 기본 병합 메시지로 커밋합니다.",
+                            crate::branches::MergeControl::Abort => "병합을 중단할까요? 현재 충돌 해결 내용이 사라질 수 있습니다. 병합 전 미커밋 변경은 완전히 복원되지 않을 수 있습니다.",
+                        });
+                    }
+                    BranchAction::RebaseControl { action, .. } => {
+                        card = card.child(match action {
+                            crate::branches::RebaseControl::Continue => "Stage된 해결 내용으로 리베이스를 계속할까요? 원래 커밋 메시지를 사용하며 다음 커밋에서 다시 충돌할 수 있습니다.",
+                            crate::branches::RebaseControl::Abort => "리베이스를 중단하고 시작 전 상태로 돌아갈까요? 현재 충돌 해결 내용이 사라질 수 있습니다.",
+                            crate::branches::RebaseControl::Skip => "현재 커밋을 건너뛸까요? 이 커밋의 변경과 현재 충돌 해결 내용이 제외되고 다음 커밋으로 진행합니다.",
+                        });
+                    }
+                    BranchAction::RevertControl {
+                        state,
+                        action,
+                        no_commit,
+                    } => {
+                        card = card.child(match action {
+                            crate::branches::RevertControl::Continue if *no_commit => "커밋을 만들지 않고 되돌리기 해결을 완료할까요? 현재 해결 결과와 기존 Stage 내용을 남깁니다.",
+                            crate::branches::RevertControl::Continue => "Stage된 해결 내용으로 되돌리기를 계속할까요? 기본 메시지로 새 Revert 커밋을 만듭니다.",
+                            crate::branches::RevertControl::Abort => "되돌리기를 중단할까요? 현재 해결 내용과 미커밋/Stage 변경이 사라질 수 있습니다.",
+                            crate::branches::RevertControl::Skip => "현재 되돌리기를 건너뛸까요? 이 대상의 해결 내용과 미커밋/Stage 변경이 사라질 수 있습니다.",
+                        });
+                        if *action == crate::branches::RevertControl::Continue
+                            && state.no_commit.is_none()
+                        {
+                            card = card.child("외부에서 시작한 Revert의 커밋 옵션을 확인할 수 없습니다. 커밋 여부를 선택하세요.")
+                                .child(button("revert-recovery-mode", "", false)
+                                    .track_focus(&self.branch_checks_focus[0])
+                                    .child(crate::controls::checkbox(*no_commit, "커밋하지 않기"))
+                                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                                        if !matches!(event, ClickEvent::Mouse(_)) { return; }
+                                        if this.branch_busy { return; }
+                                        if let Some(dialog) = &mut this.branch_dialog
+                                            && let BranchAction::RevertControl { no_commit, .. } = &mut dialog.action {
+                                            *no_commit = !*no_commit;
+                                        }
+                                        this.branch_checks_focus[0].focus(window);
+                                        cx.notify();
+                                    })));
+                        }
+                    }
+                    BranchAction::StashControl { cancel, .. } => {
+                        card = card.child(if *cancel {
+                            "보관한 복원 전 파일과 Stage 상태로 돌아갈까요? 복원 후 해당 경로에 한 수정은 사라질 수 있습니다. 원본 Stash는 유지됩니다."
+                        } else { "현재 해결 결과를 유지하고 복원 상태를 종료할까요? 커밋을 만들지 않으며 원본 Stash는 유지됩니다." });
+                    }
                     BranchAction::Track(target) => {
                         card = card
                             .child(format!(
@@ -6102,6 +7395,7 @@ impl Render for Workspace {
                     card.child(div().text_color(rgb(ERROR)).child(error))
                 });
                 if !matches!(dialog.action, BranchAction::ChooseCheckout { .. }) {
+                    let can_submit = !matches!(&dialog.action, BranchAction::Connect { plan, selected } if plan.candidates.get(*selected).is_none());
                     footer = Some(
                         div()
                             .flex()
@@ -6110,6 +7404,7 @@ impl Render for Workspace {
                             .when(minimal, |footer| footer.justify_end())
                             .child(
                                 button("confirm-branch", "확인", true)
+                                    .when(!can_submit, |button| button.opacity(0.4))
                                     .when(create, |button| button.text_size(px(13.)))
                                     .on_click(cx.listener(|this, _, _, cx| this.submit_branch(cx))),
                             )

@@ -103,10 +103,67 @@ pub struct CommitSelection {
     pub detail: CommitDetail,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileRow {
     Group(bool),
+    Folder { path: Vec<u8> },
     File(usize),
+}
+
+impl FileRow {
+    pub fn file_index(&self) -> Option<usize> {
+        match self {
+            Self::File(index) => Some(*index),
+            _ => None,
+        }
+    }
+}
+
+pub fn file_tree_rows(files: &[FileChange]) -> Vec<FileRow> {
+    #[derive(Default)]
+    struct Folder {
+        children: BTreeMap<Vec<u8>, Folder>,
+        files: Vec<usize>,
+    }
+    fn flatten(folder: &Folder, path: &[u8], rows: &mut Vec<FileRow>) {
+        for (name, child) in &folder.children {
+            let mut path = path.to_vec();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend(name);
+            rows.push(FileRow::Folder { path: path.clone() });
+            flatten(child, &path, rows);
+        }
+        rows.extend(folder.files.iter().copied().map(FileRow::File));
+    }
+    let mut root = Folder::default();
+    let mut order: Vec<_> = (0..files.len()).collect();
+    order.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
+    for index in order {
+        let mut folder = &mut root;
+        let parts: Vec<_> = files[index].path.split(|byte| *byte == b'/').collect();
+        for part in &parts[..parts.len().saturating_sub(1)] {
+            folder = folder.children.entry(part.to_vec()).or_default();
+        }
+        folder.files.push(index);
+    }
+    let mut rows = Vec::new();
+    flatten(&root, &[], &mut rows);
+    rows
+}
+
+pub fn directory_stage_changes(files: &[FileChange], directory: &[u8]) -> BTreeMap<Vec<u8>, bool> {
+    let mut prefix = directory.to_vec();
+    prefix.push(b'/');
+    let stage = files
+        .iter()
+        .any(|file| file.path.starts_with(&prefix) && !file.staged);
+    files
+        .iter()
+        .filter(|file| file.path.starts_with(&prefix))
+        .map(|file| (file.path.clone(), stage))
+        .collect()
 }
 
 pub fn file_rows(files: &[FileChange], groups: bool) -> Vec<FileRow> {
@@ -200,21 +257,42 @@ impl StageSelection {
         extend: bool,
         control: bool,
     ) -> Option<usize> {
+        self.click_visible(
+            files,
+            &(0..files.len()).collect::<Vec<_>>(),
+            index,
+            extend,
+            control,
+        )
+    }
+    pub fn click_visible(
+        &mut self,
+        files: &[FileChange],
+        order: &[usize],
+        index: usize,
+        extend: bool,
+        control: bool,
+    ) -> Option<usize> {
         let file = files.get(index)?;
         let key = StageKey::of(file);
         if extend {
+            let position = order.iter().position(|item| *item == index)?;
             let anchor = self
                 .anchor
                 .as_ref()
-                .and_then(|anchor| files.iter().position(|file| StageKey::of(file) == *anchor))
-                .unwrap_or(index);
+                .and_then(|anchor| {
+                    order
+                        .iter()
+                        .position(|item| StageKey::of(&files[*item]) == *anchor)
+                })
+                .unwrap_or(position);
             if !control {
                 self.selected.clear();
             }
             self.selected.extend(
-                files[anchor.min(index)..=anchor.max(index)]
+                order[anchor.min(position)..=anchor.max(position)]
                     .iter()
-                    .map(StageKey::of),
+                    .map(|index| StageKey::of(&files[*index])),
             );
             if self.anchor.is_none() {
                 self.anchor = Some(key);
@@ -258,8 +336,33 @@ impl StageSelection {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeState {
+    pub root: PathBuf,
+    pub marker_modified: std::time::SystemTime,
+    pub head: String,
+    pub current_branch: Option<String>,
+    pub merge_heads: Vec<String>,
+    pub conflicts: Vec<Vec<u8>>,
+}
+
+impl MergeState {
+    pub fn same_operation(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.marker_modified == other.marker_modified
+            && self.head == other.head
+            && self.current_branch == other.current_branch
+            && self.merge_heads == other.merge_heads
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
+    pub stash_restore: Option<StashRestoreState>,
+    pub unmerged: Vec<Vec<u8>>,
+    pub revert: Option<RevertState>,
+    pub rebase: Option<RebaseState>,
+    pub merge: Option<MergeState>,
     pub root: PathBuf,
     pub head: String,
     pub head_commit: Option<String>,
@@ -272,6 +375,101 @@ pub struct Snapshot {
     pub reference_rows: [Vec<usize>; 4],
     pub session: Option<crate::paging::HistorySession>,
     pub has_more: bool,
+}
+
+impl Snapshot {
+    pub fn integration_active(&self) -> bool {
+        self.merge.is_some()
+            || self.rebase.is_some()
+            || self.revert.is_some()
+            || self.stash_restore.is_some()
+            || !self.unmerged.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StashRestoreState {
+    pub root: PathBuf,
+    pub id: String,
+    pub stash: String,
+    pub head: String,
+    pub current_branch: Option<String>,
+    pub revision: u64,
+    pub applying: bool,
+    pub error: Option<String>,
+    pub conflicts: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebaseState {
+    pub root: PathBuf,
+    pub backend: String,
+    pub marker_modified: std::time::SystemTime,
+    pub original_head: String,
+    pub branch: String,
+    pub branch_tip: Option<String>,
+    pub onto: String,
+    pub head: String,
+    pub current_branch: Option<String>,
+    pub current_commit: Option<String>,
+    pub step: Option<usize>,
+    pub total: Option<usize>,
+    pub conflicts: Vec<Vec<u8>>,
+}
+
+impl RebaseState {
+    pub fn same_session(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.backend == other.backend
+            && self.marker_modified == other.marker_modified
+            && self.original_head == other.original_head
+            && self.branch == other.branch
+            && self.branch_tip == other.branch_tip
+            && self.onto == other.onto
+    }
+    pub fn same_operation(&self, other: &Self) -> bool {
+        self.same_session(other)
+            && self.head == other.head
+            && self.current_branch == other.current_branch
+            && self.current_commit == other.current_commit
+            && self.step == other.step
+            && self.total == other.total
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevertState {
+    pub root: PathBuf,
+    pub head: String,
+    pub current_branch: Option<String>,
+    pub sequence_head: Option<String>,
+    pub session_modified: std::time::SystemTime,
+    pub target: String,
+    pub target_modified: Option<std::time::SystemTime>,
+    pub todo: String,
+    pub pending_count: usize,
+    pub options: String,
+    pub no_commit: Option<bool>,
+    pub conflicts: Vec<Vec<u8>>,
+}
+
+impl RevertState {
+    pub fn same_session(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.current_branch == other.current_branch
+            && self.sequence_head == other.sequence_head
+            && self.session_modified == other.session_modified
+            && self.options == other.options
+    }
+    pub fn same_operation(&self, other: &Self) -> bool {
+        self.same_session(other)
+            && self.head == other.head
+            && self.target == other.target
+            && self.target_modified == other.target_modified
+            && self.todo == other.todo
+            && self.pending_count == other.pending_count
+            && self.no_commit == other.no_commit
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -287,6 +485,16 @@ pub struct Diff {
     pub title: String,
     pub note: String,
     pub lines: Vec<DiffLine>,
+    pub conflict: Option<crate::conflict::Preview>,
+    pub partial: Option<crate::partial_stage::Preview>,
+}
+
+impl Diff {
+    pub fn conflict_at_row(&self, row: usize) -> Option<usize> {
+        self.conflict
+            .as_ref()?
+            .region_for_line(self.lines.get(row)?.new?)
+    }
 }
 
 pub struct Project {
@@ -394,6 +602,102 @@ mod selection_tests {
             after: Content::Worktree,
         }
     }
+    #[test]
+    fn tree_rows_preserve_original_indices_duplicates_and_nested_paths() {
+        let files = [
+            file("z.txt", false),
+            file("소스/sub/b.rs", false),
+            file("소스/a.rs", true),
+            file("소스/a.rs", false),
+        ];
+        let rows = file_tree_rows(&files);
+        assert_eq!(
+            rows,
+            vec![
+                FileRow::Folder {
+                    path: "소스".as_bytes().to_vec(),
+                },
+                FileRow::Folder {
+                    path: "소스/sub".as_bytes().to_vec(),
+                },
+                FileRow::File(1),
+                FileRow::File(2),
+                FileRow::File(3),
+                FileRow::File(0),
+            ]
+        );
+        assert_eq!(file_tree_rows(&files), rows);
+        assert!(file_tree_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn tree_uses_raw_paths_even_when_display_labels_collide() {
+        let mut files = [file("a/file", false), file("b/file", false)];
+        files[0].path = vec![0xfe, b'/', b'x'];
+        files[1].path = vec![0xff, b'/', b'x'];
+        files[0].label = "same".into();
+        files[1].label = "same".into();
+        let rows = file_tree_rows(&files);
+        assert_eq!(
+            rows.iter()
+                .filter_map(FileRow::file_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            file_tree_rows(&files)
+                .iter()
+                .filter_map(FileRow::file_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn directory_stage_targets_all_descendants_and_deduplicates_partial_changes() {
+        let files = [
+            file("src/a", true),
+            file("src/a", false),
+            file("src/deep/b", true),
+            file("src2/c", false),
+            file("src", false),
+            file("root", false),
+        ];
+        assert_eq!(
+            directory_stage_changes(&files, b"src"),
+            BTreeMap::from([(b"src/a".to_vec(), true), (b"src/deep/b".to_vec(), true)])
+        );
+        assert_eq!(
+            directory_stage_changes(&[file("src/a", true), file("src/deep/b", true)], b"src"),
+            BTreeMap::from([(b"src/a".to_vec(), false), (b"src/deep/b".to_vec(), false)])
+        );
+        assert!(directory_stage_changes(&files, b"missing").is_empty());
+        assert!(directory_stage_changes(&[], b"src").is_empty());
+    }
+
+    #[test]
+    fn visible_selection_follows_tree_order_and_excludes_hidden_files() {
+        let files = [
+            file("root", false),
+            file("dir/a", true),
+            file("hidden/x", false),
+            file("dir/b", false),
+        ];
+        let mut selection = StageSelection::default();
+        let order = [1, 3, 0];
+        selection.click_visible(&files, &order, 1, false, false);
+        selection.click_visible(&files, &order, 0, true, false);
+        assert!(
+            selection.contains(&files[0])
+                && selection.contains(&files[1])
+                && selection.contains(&files[3])
+        );
+        assert!(!selection.contains(&files[2]));
+        assert_eq!(selection.changes(&files).len(), 3);
+        selection.select_all(&files);
+        assert!(selection.contains(&files[2]));
+    }
+
     #[test]
     fn ranges_control_toggles_and_restoration_follow_file_identity() {
         let files = [

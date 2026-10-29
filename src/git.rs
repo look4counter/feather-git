@@ -151,6 +151,15 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
     };
     let commit_detail = history_id.map(|id| detail(&repo, id)).transpose()?;
     Ok(Snapshot {
+        stash_restore: crate::stash_recovery::state(path)?,
+        unmerged: stage
+            .iter()
+            .filter(|file| file.status == "U")
+            .map(|file| file.path.clone())
+            .collect(),
+        revert: revert_state(path)?,
+        rebase: rebase_state(path)?,
+        merge: merge_state(path)?,
         root,
         head,
         head_commit: if repo.head()?.is_unborn() {
@@ -187,6 +196,244 @@ pub fn load_stage(path: &Path) -> Result<Vec<FileChange>> {
     status(&repo)
 }
 
+pub fn revert_state(path: &Path) -> Result<Option<RevertState>> {
+    let repo = open(path)?;
+    let dir = repo.path();
+    if [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ]
+    .iter()
+    .any(|name| dir.join(name).exists())
+    {
+        return Ok(None);
+    }
+    let read = |name: &str| -> Result<Option<String>> {
+        match std::fs::read_to_string(dir.join(name)) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let marker = read("REVERT_HEAD")?;
+    let todo = read("sequencer/todo")?.unwrap_or_default();
+    let mut pending = Vec::new();
+    for line in todo
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("revert") {
+            return Ok(None);
+        }
+        pending.push(
+            fields
+                .next()
+                .context("Revert 대기 목록을 읽지 못했습니다.")?
+                .to_owned(),
+        );
+    }
+    let Some(target) = marker
+        .as_deref()
+        .map(str::trim)
+        .or_else(|| pending.first().map(String::as_str))
+    else {
+        return Ok(None);
+    };
+    let target = repo
+        .rev_parse_single(target.as_bytes().as_bstr())?
+        .to_string();
+    repo.find_commit(gix::ObjectId::from_hex(target.as_bytes())?)?;
+    let sequence_head = read("sequencer/head")?.map(|value| value.trim().to_owned());
+    let options = read("sequencer/opts")?.unwrap_or_default();
+    let mut no_commit = sequence_head.as_ref().map(|_| false);
+    for line in options
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && !line.starts_with(';'))
+    {
+        let (key, value) = line.split_once('=').unwrap_or((line, "true"));
+        if key.trim().eq_ignore_ascii_case("no-commit") {
+            no_commit = match value.trim().trim_matches('"').to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => Some(true),
+                "false" | "no" | "off" | "0" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    let target_modified = if marker.is_some() {
+        Some(std::fs::metadata(dir.join("REVERT_HEAD"))?.modified()?)
+    } else {
+        None
+    };
+    let session_modified = if sequence_head.is_some() {
+        std::fs::metadata(dir.join("sequencer/head"))?.modified()?
+    } else {
+        target_modified.context("Revert 세션을 읽지 못했습니다.")?
+    };
+    let index = repo.index_or_empty()?;
+    let conflicts = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| entry.path(&index).to_vec())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some(RevertState {
+        root: repo
+            .workdir()
+            .context("작업 디렉터리가 없습니다")?
+            .canonicalize()?,
+        head: repo.head_id()?.to_string(),
+        current_branch: repo.head_name()?.map(|name| name.to_string()),
+        sequence_head,
+        session_modified,
+        target,
+        target_modified,
+        pending_count: pending.len().max(usize::from(marker.is_some())),
+        todo,
+        options,
+        no_commit,
+        conflicts,
+    }))
+}
+
+pub fn rebase_state(path: &Path) -> Result<Option<RebaseState>> {
+    let repo = open(path)?;
+    let backend = if repo.path().join("rebase-merge").is_dir() {
+        "rebase-merge"
+    } else if repo.path().join("rebase-apply").is_dir()
+        && repo.path().join("rebase-apply/rebasing").exists()
+    {
+        "rebase-apply"
+    } else {
+        return Ok(None);
+    };
+    let dir = repo.path().join(backend);
+    let read = |name: &str| -> Result<Option<String>> {
+        match std::fs::read_to_string(dir.join(name)) {
+            Ok(value) => Ok(Some(value.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let original_head = read("orig-head")?.context("Rebase 시작 커밋을 읽지 못했습니다.")?;
+    let onto = read("onto")?.context("Rebase 기반 커밋을 읽지 못했습니다.")?;
+    let branch = read("head-name")?.context("Rebase 대상 브랜치를 읽지 못했습니다.")?;
+    for id in [&original_head, &onto] {
+        repo.find_commit(gix::ObjectId::from_hex(id.as_bytes())?)?;
+    }
+    let branch_tip = if branch.starts_with("refs/heads/") {
+        repo.try_find_reference(branch.as_str())?
+            .map(|mut reference| -> Result<String> {
+                Ok(reference.peel_to_commit()?.id.to_string())
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let current_commit = read(if backend == "rebase-merge" {
+        "stopped-sha"
+    } else {
+        "original-commit"
+    })?
+    .filter(|value| !value.is_empty());
+    if let Some(id) = &current_commit {
+        repo.find_commit(gix::ObjectId::from_hex(id.as_bytes())?)?;
+    }
+    let number = |name: &str| -> Result<Option<usize>> {
+        read(name)?
+            .map(|value| value.parse().map_err(anyhow::Error::from))
+            .transpose()
+    };
+    let index = repo.index_or_empty()?;
+    let conflicts = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| entry.path(&index).to_vec())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some(RebaseState {
+        root: repo
+            .workdir()
+            .context("작업 디렉터리가 없습니다")?
+            .canonicalize()?,
+        backend: backend.into(),
+        marker_modified: std::fs::metadata(dir.join("orig-head"))?.modified()?,
+        original_head,
+        branch,
+        branch_tip,
+        onto,
+        head: repo.head_id()?.to_string(),
+        current_branch: repo.head_name()?.map(|name| name.to_string()),
+        current_commit,
+        step: number(if backend == "rebase-merge" {
+            "msgnum"
+        } else {
+            "next"
+        })?,
+        total: number(if backend == "rebase-merge" {
+            "end"
+        } else {
+            "last"
+        })?,
+        conflicts,
+    }))
+}
+
+pub fn merge_state(path: &Path) -> Result<Option<MergeState>> {
+    let repo = open(path)?;
+    let git_dir = repo.path();
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        return Ok(None);
+    }
+    let mut marker = match std::fs::File::open(git_dir.join("MERGE_HEAD")) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let marker_modified = marker.metadata()?.modified()?;
+    let mut contents = String::new();
+    marker.read_to_string(&mut contents)?;
+    let merge_heads = contents
+        .lines()
+        .map(|line| {
+            let id = gix::ObjectId::from_hex(line.trim().as_bytes())?;
+            repo.find_commit(id)?;
+            Ok(id.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if merge_heads.is_empty() {
+        bail!("병합 대상 정보를 읽지 못했습니다.");
+    }
+    let index = repo.index_or_empty()?;
+    let conflicts = index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+        .map(|entry| entry.path(&index).to_vec())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(Some(MergeState {
+        root: repo
+            .workdir()
+            .context("작업 디렉터리가 없습니다")?
+            .canonicalize()?,
+        marker_modified,
+        head: repo.head_id()?.to_string(),
+        current_branch: repo.head_name()?.map(|name| name.to_string()),
+        merge_heads,
+        conflicts,
+    }))
+}
+
 fn detail(repo: &gix::Repository, id: &str) -> Result<CommitDetail> {
     let commit = repo.find_commit(gix::ObjectId::from_hex(id.as_bytes())?)?;
     let decoded = commit.decode()?;
@@ -221,6 +468,19 @@ fn tree_content(tree: Option<&gix::Tree<'_>>, path: &[u8]) -> Result<Content> {
 
 fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
     let index = repo.index_or_empty()?;
+    let mut conflicts: BTreeMap<Vec<u8>, Content> = BTreeMap::new();
+    for entry in index
+        .entries()
+        .iter()
+        .filter(|entry| entry.stage() != gix::index::entry::Stage::Unconflicted)
+    {
+        let base = conflicts
+            .entry(entry.path(&index).to_vec())
+            .or_insert(Content::Empty);
+        if entry.stage() as u8 == 1 {
+            *base = Content::Object(entry.id, entry.mode.bits() as u16);
+        }
+    }
     let head = if repo.head()?.is_unborn() {
         None
     } else {
@@ -236,6 +496,9 @@ fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
     for item in iter {
         let item = item?;
         let path = item.location().to_vec();
+        if conflicts.contains_key(&path) {
+            continue;
+        }
         let staged = matches!(item, gix::status::Item::TreeIndex(_));
         let entry = index.entry_by_path(path.as_bstr());
         let indexed = entry
@@ -255,12 +518,7 @@ fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
             };
             (indexed, after)
         };
-        let conflict = index.entries().iter().any(|e| {
-            e.path(&index) == path.as_bstr() && e.stage() != gix::index::entry::Stage::Unconflicted
-        });
-        let state = if conflict {
-            "U"
-        } else if matches!(before, Content::Empty) {
+        let state = if matches!(before, Content::Empty) {
             "A"
         } else if matches!(after, Content::Empty) {
             "D"
@@ -273,6 +531,25 @@ fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
             status: state.into(),
             staged,
             before,
+            after,
+        });
+    }
+    for (path, base) in conflicts {
+        let work_path = repo
+            .workdir()
+            .context("작업 디렉터리가 없습니다")?
+            .join(gix::path::from_bstr(path.as_bstr()));
+        let after = match std::fs::symlink_metadata(work_path) {
+            Ok(_) => Content::Worktree,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Content::Empty,
+            Err(error) => return Err(error.into()),
+        };
+        files.push(FileChange {
+            label: path.to_str_lossy().into_owned(),
+            path,
+            status: "U".into(),
+            staged: false,
+            before: base,
             after,
         });
     }
@@ -343,7 +620,11 @@ fn history(repo: &gix::Repository, id: &str) -> Result<Vec<FileChange>> {
     Ok(files)
 }
 
-fn read_content(repo: &gix::Repository, file: &FileChange, content: &Content) -> Result<Vec<u8>> {
+pub(crate) fn read_content(
+    repo: &gix::Repository,
+    file: &FileChange,
+    content: &Content,
+) -> Result<Vec<u8>> {
     match content {
         Content::Empty => Ok(Vec::new()),
         Content::Object(_, mode) if mode & 0o170000 != 0o100000 => {
@@ -421,6 +702,24 @@ pub fn diff(path: &Path, file: &FileChange) -> Result<Diff> {
     let diff = similar::TextDiff::configure()
         .timeout(Duration::from_millis(500))
         .diff_lines(before, after);
+    if crate::partial_stage::eligible(file) {
+        result.partial = Some(crate::partial_stage::Preview {
+            before: before.to_owned(),
+            after: after.to_owned(),
+        });
+    }
+    if file.status == "U" && !file.staged && matches!(file.after, Content::Worktree) {
+        match crate::conflict::parse(after) {
+            Ok(preview) if !preview.regions.is_empty() => {
+                result.note = "충돌 구간에 커서를 놓고 상단에서 선택하세요. 해결 후 파일 목록에서 Space로 Stage하세요. 현재/들어오는 변경은 마커의 위/아래 내용입니다.".into();
+                result.conflict = Some(preview);
+            }
+            Ok(_) => result.note =
+                "선택할 충돌 마커가 없습니다. 내용을 확인한 뒤 파일 목록에서 Space로 Stage하세요."
+                    .into(),
+            Err(error) => result.note = error.to_string(),
+        }
+    }
     for group in diff.grouped_ops(3) {
         if result.lines.len() >= 5000 {
             result.note = "차이를 5,000줄까지 표시합니다.".into();

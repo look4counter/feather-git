@@ -135,37 +135,7 @@ pub fn delete_stash(repository: &Path, selector: &str, expected: &str) -> Result
 }
 
 pub fn restore_stash(repository: &Path, commit: &str) -> Result<()> {
-    if ![40, 64].contains(&commit.len()) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("올바른 스태시를 선택하세요.");
-    }
-    let root = feather_git::git::repository_root(repository)?;
-    let entries = git_command(&root)
-        .args(["stash", "list", "--format=%H"])
-        .output()?;
-    if !entries.status.success() {
-        bail!(
-            "스태시 목록 조회 실패: {}",
-            String::from_utf8_lossy(&entries.stderr)
-        );
-    }
-    if !String::from_utf8_lossy(&entries.stdout)
-        .lines()
-        .any(|entry| entry.eq_ignore_ascii_case(commit))
-    {
-        bail!("선택한 스태시가 더 이상 목록에 없습니다.");
-    }
-    let output = git_command(&root)
-        .args(["stash", "apply", "--index", commit])
-        .output()
-        .context("스태시 복원을 실행하지 못했습니다.")?;
-    if !output.status.success() {
-        bail!(
-            "스태시 복원 실패. 원본 스태시는 유지됩니다: {}{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-    Ok(())
+    feather_git::stash_recovery::restore(repository, commit)
 }
 
 pub fn commit_then_push(repository: &Path, message: &str, push: bool) -> Result<Option<String>> {
@@ -562,6 +532,60 @@ mod tests {
         stage_file(repo, b"file.txt").unwrap();
         commit(repo, text).unwrap();
     }
+    #[test]
+    fn directory_stage_roundtrip_preserves_siblings_and_worktree_with_partial_changes() {
+        use feather_git::{git::load_stage, model::directory_stage_changes};
+        let (_temp, repo) = configured_repository();
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        std::fs::create_dir_all(repo.join("src2")).unwrap();
+        let names = ["src/a.txt", "src/deep/b.txt", "src2/c.txt", "root.txt"];
+        for name in names {
+            std::fs::write(repo.join(name), "base").unwrap();
+        }
+        assert!(
+            git_command(&repo)
+                .args(["add", "."])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        commit(&repo, "base").unwrap();
+        for name in names {
+            std::fs::write(repo.join(name), "changed").unwrap();
+        }
+        stage_file(&repo, b"src/a.txt").unwrap();
+        stage_file(&repo, b"src2/c.txt").unwrap();
+        std::fs::write(repo.join("src/a.txt"), "partial change").unwrap();
+        let changes = directory_stage_changes(&load_stage(&repo).unwrap(), b"src");
+        assert_eq!(changes.len(), 2);
+        assert!(changes.values().all(|stage| *stage));
+        toggle_files(&repo, &changes).unwrap();
+        let files = load_stage(&repo).unwrap();
+        for name in names {
+            let entries: Vec<_> = files.iter().filter(|file| file.label == name).collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].staged, name != "root.txt");
+        }
+        let changes = directory_stage_changes(&files, b"src");
+        assert_eq!(changes.len(), 2);
+        assert!(changes.values().all(|stage| !*stage));
+        toggle_files(&repo, &changes).unwrap();
+        let files = load_stage(&repo).unwrap();
+        for name in names {
+            let file = files.iter().find(|file| file.label == name).unwrap();
+            assert_eq!(file.staged, name == "src2/c.txt");
+            assert_eq!(
+                std::fs::read_to_string(repo.join(name)).unwrap(),
+                if name == "src/a.txt" {
+                    "partial change"
+                } else {
+                    "changed"
+                }
+            );
+        }
+    }
+
     #[test]
     fn batch_toggle_groups_mixed_states_and_validates_every_path_before_writing() {
         let (_temp, repo) = configured_repository();

@@ -1,7 +1,10 @@
+mod auth_settings;
 mod branches;
 mod commit_editor;
 mod controls;
 mod credentials;
+mod error_history;
+mod file_manager;
 mod history_view;
 mod layout;
 mod popup;
@@ -11,6 +14,7 @@ mod settings;
 mod settings_git;
 mod setup;
 mod shortcut;
+mod terminal;
 mod text_selection;
 mod theme;
 mod ui;

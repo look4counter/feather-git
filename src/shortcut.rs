@@ -69,12 +69,23 @@ pub fn badge(label: &str) -> Div {
 }
 
 pub fn hint(description: &str, shortcut: &str) -> Div {
-    div()
+    let mut row = div()
         .flex()
+        .flex_wrap()
         .items_center()
         .gap_2()
-        .child(description.to_owned())
-        .child(keys(shortcut))
+        .child(description.to_owned());
+    for (index, shortcut) in shortcut
+        .split(" / ")
+        .filter(|key| !key.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            row = row.child(div().text_color(rgb(theme::MUTED)).child("/"));
+        }
+        row = row.child(keys(shortcut));
+    }
+    row
 }
 
 pub fn label(text: &str) -> Div {
@@ -125,8 +136,8 @@ pub struct Command {
 
 pub fn subsections(group: &str) -> &'static [&'static str] {
     match group {
-        "브랜치" => &["Local", "Remote", "Stash", "Tag"],
-        "파일목록" => &["Stage", "History"],
+        "브랜치" => &["공통", "Local", "Remote"],
+        "파일목록" => &["공통", "Stage"],
         _ => &[""],
     }
 }
@@ -136,10 +147,14 @@ pub fn in_subsection(command: &Command, subsection: &str) -> bool {
         "브랜치" => match command.id.as_str() {
             "branch-upstream" => subsection == "Local",
             "branch-delete-server" => subsection == "Remote",
-            _ => subsections(command.group).contains(&subsection),
+            _ => subsection == "공통",
         },
         "파일목록" => {
-            subsection == "Stage" || (command.id == "files-tree" && subsection == "History")
+            if command.id == "files-tree" {
+                subsection == "공통"
+            } else {
+                subsection == "Stage"
+            }
         }
         _ => subsection.is_empty(),
     }
@@ -176,6 +191,8 @@ pub fn commands() -> Vec<Command> {
         });
     };
     for (id, name, key, second) in [
+        ("terminal", "터미널", "f9", ""),
+        ("explorer", "탐색기", "f10", ""),
         ("shortcuts", "단축키 설정", "f11", ""),
         ("help", "도움말", "?", ""),
         ("settings", "세팅", "f12", ""),
@@ -188,11 +205,26 @@ pub fn commands() -> Vec<Command> {
         ("pull", "풀", "p", ""),
         ("push", "푸시", "shift-p", ""),
     ] {
-        add(id, "공통", "*", name, key, key, second);
+        let first = match id {
+            "pull" => "ctrl-p",
+            "fetch" => "ctrl-f",
+            "push" => "ctrl-u",
+            _ => key,
+        };
+        add(id, "공통", "*", name, key, first, second);
     }
     for (id, name, key) in [("stash", "스태시", "s"), ("commit", "커밋", "c")] {
         add(id, "파일목록", "stage-files", name, key, key, "");
     }
+    add(
+        "errors",
+        "공통",
+        "error-history",
+        "오류 기록 열기 / 닫기",
+        "f1",
+        "f1",
+        "",
+    );
     for (direction, alias, name) in [
         ("up", "i", "방향키 위"),
         ("left", "j", "방향키 왼쪽"),
@@ -202,7 +234,11 @@ pub fn commands() -> Vec<Command> {
         add(
             &format!("nav-{direction}"),
             "공통",
-            "navigation",
+            if ["left", "right"].contains(&direction) {
+                "horizontal-navigation"
+            } else {
+                "navigation"
+            },
             name,
             direction,
             direction,
@@ -220,6 +256,27 @@ pub fn commands() -> Vec<Command> {
     }
     for (id, group, scope, name, key) in [
         (
+            "shortcuts-reset",
+            "공통",
+            "shortcuts-modal",
+            "단축키 기본값 복원",
+            "ctrl-d",
+        ),
+        (
+            "project-tab-previous",
+            "공통",
+            "project-tabs",
+            "이전 프로젝트 탭",
+            "ctrl-[",
+        ),
+        (
+            "project-tab-next",
+            "공통",
+            "project-tabs",
+            "다음 프로젝트 탭",
+            "ctrl-]",
+        ),
+        (
             "branch-jump",
             "브랜치",
             "branches",
@@ -235,9 +292,9 @@ pub fn commands() -> Vec<Command> {
         ),
         (
             "branch-checkout",
-            "브랜치",
-            "branches",
-            "선택 참조 체크아웃",
+            "공통",
+            "checkout-action",
+            "체크아웃",
             "o",
         ),
         ("branch-delete", "브랜치", "branches", "선택 참조 삭제", "d"),
@@ -260,14 +317,7 @@ pub fn commands() -> Vec<Command> {
         ("history-revert", "커밋히스토리", "history", "Revert", "v"),
         ("history-merge", "커밋히스토리", "history", "Merge", "m"),
         ("history-rebase", "커밋히스토리", "history", "Rebase", "r"),
-        (
-            "history-checkout",
-            "커밋히스토리",
-            "history",
-            "Checkout",
-            "o",
-        ),
-        ("files-all", "파일목록", "files", "전체 선택", "ctrl-a"),
+        ("files-all", "공통", "selection", "전체 선택", "ctrl-a"),
         ("files-tree", "파일목록", "files", "트리 모드 전환", "`"),
         (
             "files-stage",
@@ -299,13 +349,12 @@ pub fn commands() -> Vec<Command> {
             "줄 끝까지 선택",
             "shift-end",
         ),
-        ("viewer-all", "뷰어", "viewer", "전체 선택", "ctrl-a"),
         ("viewer-copy", "뷰어", "viewer", "복사", "ctrl-c"),
         (
             "viewer-toggle-line",
             "뷰어",
             "viewer",
-            "현재 변경 줄 체크 / 해제",
+            "선택 범위 / 현재 변경 줄 체크·해제",
             "space",
         ),
         (
@@ -316,10 +365,15 @@ pub fn commands() -> Vec<Command> {
             "enter",
         ),
     ] {
-        add(id, group, scope, name, key, key, "");
+        let (first, second) = match id {
+            "project-tab-previous" => ("ctrl-left", "ctrl-j"),
+            "project-tab-next" => ("ctrl-right", "ctrl-l"),
+            _ => (key, ""),
+        };
+        add(id, group, scope, name, key, first, second);
     }
     for (id, name, key, second) in [
-        ("confirm", "확인", "enter", "ctrl-s"),
+        ("confirm", "확인", "enter", ""),
         ("cancel", "취소", "escape", ""),
         ("next-input", "다음입력", "tab", ""),
         ("previous-input", "이전입력", "shift-tab", ""),
@@ -387,7 +441,7 @@ pub fn chord(key: &Keystroke) -> String {
     value
 }
 
-const DIALOG_SCOPES: [&str; 11] = [
+const DIALOG_SCOPES: [&str; 12] = [
     "upstream",
     "dialog",
     "modal",
@@ -399,10 +453,27 @@ const DIALOG_SCOPES: [&str; 11] = [
     "discard-modal",
     "settings-modal",
     "clone",
+    "shortcuts-modal",
 ];
 
 fn applies(command_scope: &str, scope: &str) -> bool {
-    command_scope == scope
+    command_scope == "error-history"
+        || command_scope == scope
+        || (command_scope == "selection" && ["files", "stage-files", "viewer"].contains(&scope))
+        || (command_scope == "checkout-action"
+            && ["branches", "local-branches", "history"].contains(&scope))
+        || (command_scope == "project-tabs"
+            && [
+                "main",
+                "branches",
+                "local-branches",
+                "history",
+                "files",
+                "stage-files",
+                "viewer",
+                "clone",
+            ]
+            .contains(&scope))
         || (command_scope == "branches" && scope == "local-branches")
         || (command_scope == "files" && scope == "stage-files")
         || (command_scope == "dialog" && DIALOG_SCOPES.contains(&scope))
@@ -419,8 +490,29 @@ fn applies(command_scope: &str, scope: &str) -> bool {
                 "upstream",
             ]
             .contains(&scope))
+        || (command_scope == "horizontal-navigation"
+            && [
+                "main",
+                "history",
+                "viewer",
+                "reset",
+                "upstream",
+                "branches",
+                "local-branches",
+                "files",
+                "stage-files",
+                "shortcuts-modal",
+            ]
+            .contains(&scope))
         || (command_scope == "toggle"
-            && ["branch", "reset", "commit-modal", "upstream"].contains(&scope))
+            && [
+                "branch",
+                "reset",
+                "commit-modal",
+                "upstream",
+                "settings-modal",
+            ]
+            .contains(&scope))
         || (command_scope == "*"
             && [
                 "branches",
@@ -453,19 +545,51 @@ fn overlap(a: &str, b: &str) -> bool {
         "discard-modal",
         "settings-modal",
         "clone",
+        "shortcuts-modal",
     ]
     .into_iter()
     .any(|scope| applies(a, scope) && applies(b, scope))
 }
 
 fn branch_priority_pair(a: &Command, b: &Command) -> bool {
-    (a.group == "브랜치" && b.group == "공통") || (b.group == "브랜치" && a.group == "공통")
+    ![
+        "errors",
+        "nav-left",
+        "nav-right",
+        "project-tab-previous",
+        "project-tab-next",
+        "branch-checkout",
+    ]
+    .contains(&a.id.as_str())
+        && ![
+            "errors",
+            "nav-left",
+            "nav-right",
+            "project-tab-previous",
+            "project-tab-next",
+            "branch-checkout",
+        ]
+        .contains(&b.id.as_str())
+        && ((a.group == "브랜치" && b.group == "공통")
+            || (b.group == "브랜치" && a.group == "공통"))
 }
 
 impl Bindings {
+    pub fn button_hint(&self, description: &str, id: &str) -> Div {
+        hint(description, &self.label(id))
+    }
+
     pub fn slots(&self, command: &Command) -> [String; 2] {
         self.0
             .get(&command.id)
+            .or_else(|| {
+                let previous = match command.id.as_str() {
+                    "files-all" => "viewer-all",
+                    "branch-checkout" => "history-checkout",
+                    _ => return None,
+                };
+                self.0.get(previous)
+            })
             .cloned()
             .unwrap_or_else(|| command.defaults.clone())
     }
@@ -543,7 +667,517 @@ impl Bindings {
 
 #[cfg(test)]
 mod binding_tests {
+    #[::core::prelude::v1::test]
+    fn terminal_shortcut_remaps_and_stays_out_of_popups() {
+        let mut bindings = super::Bindings::default();
+        assert_eq!(bindings.label("terminal"), "f9");
+        for scope in [
+            "main",
+            "branches",
+            "local-branches",
+            "history",
+            "files",
+            "stage-files",
+            "viewer",
+        ] {
+            assert_eq!(
+                super::chord(
+                    &bindings
+                        .resolve(scope, &gpui::Keystroke::parse("f9").unwrap())
+                        .unwrap()
+                ),
+                "f9"
+            );
+        }
+        for scope in super::DIALOG_SCOPES {
+            assert!(
+                bindings
+                    .resolve(scope, &gpui::Keystroke::parse("f9").unwrap())
+                    .is_none()
+            );
+        }
+        bindings.set("terminal", 0, "alt-t".into()).unwrap();
+        assert_eq!(bindings.label("terminal"), "alt + t");
+        assert!(
+            bindings
+                .resolve("main", &gpui::Keystroke::parse("f9").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            super::chord(
+                &bindings
+                    .resolve("main", &gpui::Keystroke::parse("alt-t").unwrap())
+                    .unwrap()
+            ),
+            "f9"
+        );
+        assert!(bindings.set("terminal", 0, "f10".into()).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn explorer_shortcut_remaps_and_does_not_run_in_popups() {
+        let mut bindings = super::Bindings::default();
+        assert_eq!(bindings.label("explorer"), "f10");
+        for scope in [
+            "main",
+            "branches",
+            "local-branches",
+            "files",
+            "stage-files",
+            "viewer",
+            "history",
+        ] {
+            assert_eq!(
+                super::chord(
+                    &bindings
+                        .resolve(scope, &gpui::Keystroke::parse("f10").unwrap())
+                        .unwrap()
+                ),
+                "f10"
+            );
+        }
+        for scope in super::DIALOG_SCOPES {
+            assert!(
+                bindings
+                    .resolve(scope, &gpui::Keystroke::parse("f10").unwrap())
+                    .is_none()
+            );
+        }
+        bindings.set("explorer", 0, "alt-e".into()).unwrap();
+        assert_eq!(bindings.label("explorer"), "alt + e");
+        assert!(
+            bindings
+                .resolve("main", &gpui::Keystroke::parse("f10").unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            super::chord(
+                &bindings
+                    .resolve("main", &gpui::Keystroke::parse("alt-e").unwrap())
+                    .unwrap()
+            ),
+            "f10"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn reset_shortcuts_is_popup_only_remappable_and_checks_conflicts() {
+        let mut bindings = super::Bindings::default();
+        let key = gpui::Keystroke::parse("ctrl-d").unwrap();
+        assert_eq!(
+            super::chord(&bindings.resolve("shortcuts-modal", &key).unwrap()),
+            "ctrl-d"
+        );
+        for scope in [
+            "main",
+            "branches",
+            "files",
+            "viewer",
+            "history",
+            "modal",
+            "settings-modal",
+        ] {
+            assert!(bindings.resolve(scope, &key).is_none());
+        }
+        assert!(bindings.set("shortcuts-reset", 0, "enter".into()).is_err());
+        assert!(bindings.set("shortcuts-reset", 0, "left".into()).is_err());
+        bindings.set("shortcuts-reset", 0, "alt-d".into()).unwrap();
+        assert!(bindings.resolve("shortcuts-modal", &key).is_none());
+        assert_eq!(
+            super::chord(
+                &bindings
+                    .resolve("shortcuts-modal", &gpui::Keystroke::parse("alt-d").unwrap())
+                    .unwrap()
+            ),
+            "ctrl-d"
+        );
+    }
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn shared_actions_use_one_common_setting_across_their_supported_areas() {
+        let mut bindings = Bindings::default();
+        let definitions = commands();
+        for (id, scopes, old, custom, alternate) in [
+            (
+                "files-all",
+                ["files", "stage-files", "viewer"],
+                "ctrl-a",
+                "alt-a",
+                "ctrl-alt-a",
+            ),
+            (
+                "branch-checkout",
+                ["branches", "local-branches", "history"],
+                "o",
+                "alt-o",
+                "ctrl-alt-o",
+            ),
+        ] {
+            let command = definitions.iter().find(|command| command.id == id).unwrap();
+            assert_eq!(command.group, "공통");
+            bindings.set(id, 0, custom.into()).unwrap();
+            bindings.set(id, 1, alternate.into()).unwrap();
+            for scope in scopes {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(old).unwrap())
+                        .is_none()
+                );
+                for key in [custom, alternate] {
+                    assert_eq!(
+                        chord(
+                            &bindings
+                                .resolve(scope, &Keystroke::parse(key).unwrap())
+                                .unwrap()
+                        ),
+                        old
+                    );
+                }
+            }
+            for scope in ["main", "modal", "commit-modal", "clone"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(custom).unwrap())
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            !definitions
+                .iter()
+                .any(|command| ["viewer-all", "history-checkout"].contains(&command.id.as_str()))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn shared_actions_inherit_legacy_slots_and_explicit_canonical_values_take_precedence() {
+        let mut bindings = Bindings::default();
+        bindings
+            .0
+            .insert("viewer-all".into(), ["alt-a".into(), "ctrl-alt-a".into()]);
+        bindings.0.insert(
+            "history-checkout".into(),
+            ["alt-o".into(), "ctrl-alt-o".into()],
+        );
+        for scope in ["files", "stage-files", "viewer"] {
+            for key in ["alt-a", "ctrl-alt-a"] {
+                assert_eq!(
+                    chord(
+                        &bindings
+                            .resolve(scope, &Keystroke::parse(key).unwrap())
+                            .unwrap()
+                    ),
+                    "ctrl-a"
+                );
+            }
+        }
+        for scope in ["branches", "local-branches", "history"] {
+            assert_eq!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("alt-o").unwrap())
+                    .unwrap()
+                    .key,
+                "o"
+            );
+        }
+        bindings
+            .0
+            .insert("files-all".into(), ["ctrl-a".into(), String::new()]);
+        assert!(
+            bindings
+                .resolve("viewer", &Keystroke::parse("alt-a").unwrap())
+                .is_none()
+        );
+        assert_eq!(bindings.label("files-all"), "ctrl + a");
+        bindings
+            .0
+            .insert("branch-checkout".into(), [String::new(), String::new()]);
+        assert!(
+            bindings
+                .resolve("history", &Keystroke::parse("alt-o").unwrap())
+                .is_none()
+        );
+        assert!(bindings.label("branch-checkout").is_empty());
+        bindings.set("branch-checkout", 0, "o".into()).unwrap();
+        assert_eq!(
+            bindings
+                .resolve("history", &Keystroke::parse("o").unwrap())
+                .unwrap()
+                .key,
+            "o"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn common_direction_keys_drive_internal_tabs_and_navigation_with_one_setting() {
+        let mut bindings = Bindings::default();
+        let scopes = [
+            "branches",
+            "local-branches",
+            "files",
+            "stage-files",
+            "shortcuts-modal",
+            "main",
+            "history",
+            "viewer",
+            "reset",
+            "upstream",
+        ];
+        for scope in scopes {
+            for (input, target) in [
+                ("left", "left"),
+                ("j", "left"),
+                ("right", "right"),
+                ("l", "right"),
+            ] {
+                assert_eq!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(input).unwrap())
+                        .unwrap()
+                        .key,
+                    target
+                );
+            }
+            for old in ["[", "]"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(old).unwrap())
+                        .is_none()
+                );
+            }
+        }
+        assert!(
+            !commands()
+                .iter()
+                .any(|c| ["tab-previous", "tab-next"].contains(&c.id.as_str()))
+        );
+        bindings
+            .0
+            .insert("tab-previous".into(), ["alt-q".into(), "alt-w".into()]);
+        for scope in scopes {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("alt-q").unwrap())
+                    .is_none()
+            );
+        }
+        bindings.set("nav-left", 0, "alt-u".into()).unwrap();
+        bindings.set("nav-left", 1, "ctrl-alt-u".into()).unwrap();
+        for scope in scopes {
+            for old in ["left", "j"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(old).unwrap())
+                        .is_none()
+                );
+            }
+            for input in ["alt-u", "ctrl-alt-u"] {
+                assert_eq!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(input).unwrap())
+                        .unwrap()
+                        .key,
+                    "left"
+                );
+            }
+        }
+        assert!(bindings.set("nav-right", 0, "alt-u".into()).is_err());
+        assert!(bindings.set("branch-upstream", 0, "alt-u".into()).is_err());
+        assert!(bindings.set("files-all", 0, "alt-u".into()).is_err());
+        assert!(bindings.set("nav-left", 0, "enter".into()).is_err());
+        for key in ["enter", "escape"] {
+            assert_eq!(
+                bindings
+                    .resolve("shortcuts-modal", &Keystroke::parse(key).unwrap())
+                    .unwrap()
+                    .key,
+                key
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn project_tab_keys_include_start_input_but_exclude_dialogs_and_can_be_remapped() {
+        let mut bindings = Bindings::default();
+        let scopes = [
+            "main",
+            "branches",
+            "local-branches",
+            "history",
+            "files",
+            "stage-files",
+            "viewer",
+            "clone",
+        ];
+        for scope in scopes {
+            for (key, target) in [
+                ("ctrl-left", "ctrl-["),
+                ("ctrl-j", "ctrl-["),
+                ("ctrl-right", "ctrl-]"),
+                ("ctrl-l", "ctrl-]"),
+            ] {
+                assert_eq!(
+                    chord(
+                        &bindings
+                            .resolve(scope, &Keystroke::parse(key).unwrap())
+                            .unwrap()
+                    ),
+                    target
+                );
+            }
+        }
+        for scope in [
+            "modal",
+            "shortcuts-modal",
+            "branch",
+            "commit-modal",
+            "settings-modal",
+        ] {
+            for key in ["ctrl-left", "ctrl-right", "ctrl-j", "ctrl-l"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(key).unwrap())
+                        .is_none()
+                );
+            }
+        }
+        bindings
+            .set("project-tab-previous", 0, "alt-y".into())
+            .unwrap();
+        for scope in scopes {
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("ctrl-j").unwrap())
+                        .unwrap()
+                ),
+                "ctrl-["
+            );
+            for old in ["ctrl-[", "ctrl-]"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(old).unwrap())
+                        .is_none()
+                );
+            }
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("ctrl-left").unwrap())
+                    .is_none()
+            );
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("alt-y").unwrap())
+                        .unwrap()
+                ),
+                "ctrl-["
+            );
+        }
+        assert!(bindings.set("nav-left", 0, "alt-y".into()).is_err());
+        assert!(bindings.set("branch-checkout", 0, "alt-y".into()).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn remote_defaults_use_control_chords_and_keep_the_existing_execution_targets() {
+        let mut bindings = Bindings::default();
+        for scope in [
+            "main",
+            "local-branches",
+            "branches",
+            "history",
+            "files",
+            "stage-files",
+            "viewer",
+        ] {
+            for (key, target) in [("ctrl-p", "p"), ("ctrl-f", "f"), ("ctrl-u", "shift-p")] {
+                assert_eq!(
+                    chord(
+                        &bindings
+                            .resolve(scope, &Keystroke::parse(key).unwrap())
+                            .unwrap()
+                    ),
+                    target
+                );
+            }
+            for key in ["p", "f", "shift-p"] {
+                assert!(
+                    bindings
+                        .resolve(scope, &Keystroke::parse(key).unwrap())
+                        .is_none()
+                );
+            }
+        }
+        for (id, default, custom, target) in [
+            ("pull", "ctrl-p", "ctrl-alt-p", "p"),
+            ("fetch", "ctrl-f", "ctrl-alt-f", "f"),
+            ("push", "ctrl-u", "ctrl-alt-u", "shift-p"),
+        ] {
+            bindings.set(id, 0, custom.into()).unwrap();
+            assert!(
+                bindings
+                    .resolve("main", &Keystroke::parse(default).unwrap())
+                    .is_none()
+            );
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve("main", &Keystroke::parse(custom).unwrap())
+                        .unwrap()
+                ),
+                target
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn error_history_key_is_global_remappable_and_confirmation_defaults_to_enter_only() {
+        let mut bindings = Bindings::default();
+        assert_eq!(bindings.label("errors"), "f1");
+        assert!(
+            bindings
+                .resolve("error-history", &Keystroke::parse("f10").unwrap())
+                .is_none()
+        );
+        assert_eq!(bindings.label("confirm"), "enter");
+        for scope in DIALOG_SCOPES {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("ctrl-s").unwrap())
+                    .is_none()
+            );
+        }
+        for scope in ["main", "viewer", "branch", "commit-modal", "error-history"] {
+            assert_eq!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("f1").unwrap())
+                    .unwrap()
+                    .key,
+                "f1"
+            );
+        }
+        assert!(bindings.set("errors", 0, "enter".into()).is_err());
+        assert!(bindings.set("errors", 0, "r".into()).is_err());
+        bindings.set("errors", 0, "alt-z".into()).unwrap();
+        assert_eq!(bindings.label("errors"), "alt + z");
+        for scope in ["main", "viewer", "branch", "commit-modal", "error-history"] {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("f1").unwrap())
+                    .is_none()
+            );
+            assert_eq!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("alt-z").unwrap())
+                    .unwrap()
+                    .key,
+                "f1"
+            );
+        }
+        assert!(bindings.set("branch-checkout", 0, "alt-z".into()).is_err());
+        assert!(bindings.set("confirm", 1, "alt-z".into()).is_err());
+    }
     #[::core::prelude::v1::test]
     fn tree_toggle_is_scoped_to_both_file_tabs_and_can_be_remapped() {
         let mut bindings = Bindings::default();
@@ -830,21 +1464,23 @@ mod binding_tests {
     #[::core::prelude::v1::test]
     fn subsections_share_commands_and_internal_number_keys_remain_executable() {
         let commands = commands();
-        assert_eq!(subsections("브랜치"), ["Local", "Remote", "Stash", "Tag"]);
-        assert_eq!(subsections("파일목록"), ["Stage", "History"]);
+        assert_eq!(subsections("브랜치"), ["공통", "Local", "Remote"]);
+        assert_eq!(subsections("파일목록"), ["공통", "Stage"]);
         for command in commands.iter().filter(|c| list_visible(c)) {
-            assert!(
+            assert_eq!(
                 subsections(command.group)
                     .iter()
-                    .any(|subsection| in_subsection(command, subsection)),
+                    .filter(|subsection| in_subsection(command, subsection))
+                    .count(),
+                1,
                 "{}",
                 command.id
             );
         }
         let jump = commands.iter().find(|c| c.id == "branch-jump").unwrap();
-        for subsection in subsections("브랜치") {
-            assert!(in_subsection(jump, subsection));
-        }
+        assert!(in_subsection(jump, "공통"));
+        assert!(!in_subsection(jump, "Local"));
+        assert!(!in_subsection(jump, "Remote"));
         assert_eq!(commands.iter().filter(|c| c.id == jump.id).count(), 1);
         let upload = commands.iter().find(|c| c.id == "branch-upstream").unwrap();
         assert!(in_subsection(upload, "Local"));
@@ -852,7 +1488,7 @@ mod binding_tests {
         assert_eq!(
             commands
                 .iter()
-                .filter(|c| c.group == "파일목록" && in_subsection(c, "History"))
+                .filter(|c| c.group == "파일목록" && in_subsection(c, "공통"))
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["files-tree"]
@@ -941,7 +1577,7 @@ mod binding_tests {
             assert_eq!(
                 chord(
                     &bindings
-                        .resolve(scope, &Keystroke::parse("shift-p").unwrap())
+                        .resolve(scope, &Keystroke::parse("ctrl-u").unwrap())
                         .unwrap()
                 ),
                 "shift-p"

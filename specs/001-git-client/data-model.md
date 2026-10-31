@@ -337,3 +337,181 @@ StashRestoreState는 세션 ID/저장소/원본 Stash/HEAD/브랜치·개정/적
 ## US98 커서와 충돌 구간
 
 충돌 구간은 시작 줄과 종료 줄을 포함한다. 현재 대상은 Diff 표시 행의 작업 파일 new 줄 번호로 구간을 조회한 결과이며 별도 저장하지 않는다. 좌표 없는 삭제/헤더 줄은 대상 없음이다. 합성 충돌 동작 행과 관련 필드는 제거한다. 커서는 기존 프로젝트별 Selection.cursor를 사용하고 파일/미리보기 변경 시 초기화한다.
+
+## US99 버튼 단축키 안내
+
+기존 Bindings의 명령 ID와 두 슬롯에서 렌더링 시 안내를 파생한다. 별도 저장 상태는 없으며 빈 슬롯은 표시하지 않는다.
+
+## US100 오류 기록
+
+오류 기록은 출처 키·표시 출처·전체 메시지의 순서 목록과 출처별 관찰 상태, 현재 페이지를 가진다. 같은 출처/메시지는 유지 동안 한 번만 추가하고 해제 후 재발생은 다시 추가한다. 팝업 열림 여부는 Workspace가 보관한다. 앱 종료 시 모두 소멸한다.
+
+## US101 확인완료 전이
+
+현재 오류 제거 후 동일 인덱스의 다음 항목을 선택하고 인덱스가 끝을 넘으면 새 마지막 항목으로 보정한다. 빈 기록은 0을 유지한다. 마지막 관찰 상태는 제거하지 않는다. open은 마지막 인덱스로 이동한다.
+
+## US102 명령 변경
+
+오류 기록 명령의 기본 슬롯은 F10/빈 값이며 전역 범위를 가진다. 확인 기본 슬롯은 Enter/빈 값이다. 저장된 사용자 재지정은 기존 Bindings 규칙을 따른다. 오류 수명/순서는 변경하지 않는다.
+
+## US103 범위와 유효 행
+
+기존 Selection의 정규화된 시작/끝에서 표시 행 범위를 파생한다. DiffLine의 old 또는 new가 있는 행 인덱스를 유효 커서 행으로 사용한다. 체크 집합은 기존 프로젝트/세대별 BTreeSet을 유지한다.
+
+## US104 표시 상태
+
+새 데이터 상태는 없다. 기존 오류 건수에서 표시 내용/너비를 파생하며 기록·페이지·명령은 유지한다.
+
+## US105 상태 보존
+
+배치·색·패딩만 변경하고 오류 기록·페이지·단축키 상태는 유지한다.
+
+## US106 오류 발생 단위
+
+명시적 report는 출처 키·표시 출처·메시지를 받아 목록에 추가하고 observed를 갱신한다. 설정은 오류 대입 버전을 별도로 가진다. 현재 페이지/메시지와 읽기 전용 편집기 캐시는 Workspace에만 존재한다. 확인완료는 기존처럼 목록만 제거한다.
+
+## US107 상태 보존
+
+기본 배경 알파만 변경하며 오류 기록·선택·페이지·단축키 모델은 유지한다.
+
+## US108 표시 행 매핑
+
+표시 행은 원문 시작 바이트와 ShapedLine을 가진다. 줄바꿈 문자나 원문 버퍼는 추가/수정하지 않는다. 읽기 전용 모드에서 뷰포트 폭으로 재계산한다.
+
+## US109 오류 전달 모델
+
+report는 새로운 발생으로 한 건 추가하고 mirror는 동일 발생을 표시하는 출처의 observed만 갱신한다. 충돌 파일은 기존 RevertState.conflicts 원시 경로를 사용한다.
+
+## US110 명령과 상태
+
+기존 RefTab/FileTab과 목록 포커스를 재사용한다. 영역별 이전/다음 네 명령의 기본 슬롯은 [/빈 값 또는 ]/빈 값이다. 추가 영속 상태는 없다.
+
+## US111 입력 분류
+
+기존 ClickEvent의 Mouse/Keyboard와 KeyDownEvent.is_held를 사용한다. 체크 상태/단축키 저장 모델은 변경하지 않는다.
+
+## US112 명령/상태
+
+설정 탭/프로젝트 탭 이전·다음 네 명령을 추가한다. shortcuts-modal은 대화상자 범위이고 project-tabs는 일반 화면 범위다. 기존 shortcut_tab·WorkspaceTab·Bindings와 원격 내부 target을 재사용한다.
+
+US112 공통화 보완: 내부 tab-previous/next는 하나의 Bindings 설정을 브랜치/파일/설정 팝업이 공유한다. 프로젝트 명령 두 개는 별도 공통 항목이다.
+
+## US113 기준 명령과 이전 ID
+
+files-all의 공유 범위는 files/stage-files/viewer이고 branch-checkout의 공유 범위는 branches/local-branches/history다. 이전 viewer-all/history-checkout은 저장 값 읽기 승계에만 사용한다. 기준 ID가 비어 있는 슬롯 배열을 명시한 경우도 기준 값을 우선한다.
+
+## US120 상태 변경
+
+세팅의 탭/전역 선택 상태를 제거하고 명시적 저장 대상 및 세 버튼 포커스를 사용한다. 이름/이메일 draft와 원격 인증 URL/계정은 독립이다. snapshot은 global/effective/info만 유지한다. 세션의 옛 use_global은 읽기 호환 필드로 남지만 동작에 사용하지 않는다.
+
+## US121 명령 변경
+
+tab-previous/next 활성 명령을 제거하며 과거 override 데이터는 방향 설정에 합치지 않는다. nav-left/right가 horizontal-navigation scope에서 탐색과 내부 탭을 담당한다. project-tab-previous/next는 독립 명령/두 슬롯을 유지한다.
+
+## US122 작성자 상태
+
+use_global은 실제 local override 유무로 초기화하며 옛 세션 선호값을 사용하지 않는다. local_draft는 체크 전 편집값을 보존한다. snapshot에 global/effective/use_global/info를 제공하고 두 포커스는 체크와 저장에 대응한다. US120의 세 버튼 상태를 대체한다.
+
+## US127 실행 모델
+
+UI 모델은 유지한다. backend는 gix Repository/Config/Index/Object/Ref를 우선 사용하고 git2 Repository/Remote/통합 API를 복합 작업 단위로 열어 인프로세스 결과를 반환한다. 통합/복구 상태는 기존 Git 상태와 비교 가능한 형태로 저장한다. 인증 정보는 메모리 콜백 내에서만 전달한다.
+
+## US128 저장소 설정 일관성
+
+새 영속 데이터는 없다. 조회와 쓰기는 같은 시스템→전역→저장소 설정 우선순위를 사용하며 조회만 외부 필터 실행을 차단한다.
+
+## US129 스태시 추가 표시
+
+기존 StashDialog의 editor·deletion·error·busy 상태를 그대로 사용하며 데이터 구조 변경은 없다.
+
+## US130 참조와 그래프 범위
+
+Reference의 Stash 분류와 목록을 유지하되 일반 그래프 tips에서 제외한다. 선택한 스태시의 CommitSelection은 그래프 포함 여부와 독립적이다.
+
+## US131 읽기 전용 스타일
+
+기존 read_only 상태를 그대로 사용하며 추가 데이터나 저장 설정은 없다.
+
+## US132 배경색 공유
+
+기존 read_only 상태로 배경을 산출한다. 별도 설정·영속 데이터는 추가하지 않는다.
+
+## US133 포커스 상태
+
+SettingsPanel은 전역 설정 체크박스의 FocusHandle 하나만 보유한다. 저장 버튼의 포커스 상태를 제거하며 영속 데이터는 변경하지 않는다.
+
+## US134 원격 추가 상태
+
+SettingsPanel은 추가 버튼 핸들, 이름·URL 편집기, 팝업 열림 상태를 가진다. 저장 중에는 기존 Work::Saving을 사용한다. RemoteInfo의 이름·fetch_urls를 목록에 사용하며 영속 형식은 remote.<이름>.url과 fetch다.
+
+## US135 팝업 상태
+
+기존 remote_dialog·입력 편집기·작업 상태를 그대로 사용한다. 새 영속 데이터 없이 세팅 본문과 추가 팝업이 같은 SettingsPanel 상태를 공유한다.
+
+## US136 레이아웃 보완
+
+기존 입력 엔티티와 팝업 상태를 유지하며 데이터 모델 변경은 없다.
+
+## US137 삭제 상태
+
+기존 원격 이름과 Work::Saving을 재사용한다. 삭제 결과는 RepositoryInfo만 교체하고 Identity 초안은 유지한다. 신규 영속 데이터는 없다.
+
+## US138 원격별 포커스
+
+SettingsPanel은 원격 이름을 키로 하는 FocusHandle 맵을 보유한다. 목록과 함께 동기화하고 기존 원격의 핸들을 유지한다. 영속 데이터는 변경하지 않는다.
+
+## US139 진단 데이터
+
+일시적인 오류에는 원격 이름·git2 오류 분류/코드·가림 처리한 원문을 포함한다. 저장소 설정과 영속 스키마는 변경하지 않는다.
+
+## US140 인증 모델
+
+AuthMethod는 Gcm·BrowserGcm·BrowserOAuth·Password다. AuthProfile은 id·url·username·method를 가지며 비밀을 포함하지 않는다. AuthStore는 메타데이터 경로와 SecretStore를 사용하고 비밀 키는 앱 네임스페이스/profile id다. Secret은 표시/직렬화하지 않고 해제 시 내용을 지운다. 설정 UI는 인증 목록·핸들 맵·팝업 방식·URL/계정/비밀번호/Client ID 입력·작업 취소 플래그를 가진다. OAuth DeviceGrant는 일시적 code·검증 URL·만료·poll 주기를 보유한다.
+
+## US141 가져온 인증 메타데이터
+
+AuthProfile에 imported·hidden boolean을 serde 기본 false로 추가한다. 가져온 id는 URL·계정의 안정적인 해시이며 비밀을 포함하지 않는다. 숨긴 항목은 앱 파일에 남아 다음 자동 병합에서 재등장하지 않는다. 화면에는 활성 항목만 표시하고 명시적 앱 등록이 같은 URL/계정을 대체한다. 외부 메타데이터 입력은 target·username만 가진다.
+
+## US142 표시 상태
+
+AuthPanel은 all_profiles·표시 profiles·remote_urls를 보유한다. 표시 profiles는 원격별 가장 가까운 URL 범위의 합집합이다. 프로필 파일 스키마는 변경하지 않는다. 삭제/Tab 핸들은 표시 목록에만 대응한다.
+
+## US143 로그아웃 상태
+
+프로필의 URL·username·method로 GCM 로그아웃 대상을 지정한다. 명시적 실제 로그아웃은 imported hidden tombstone을 생성하지 않는다. 메타데이터 잠금이 선행되고 GCM 제거 성공 여부는 일시적 결과로만 보유한다.
+
+## US144 배지 상태
+
+기존 오류 개수와 errors 단축키 설정을 그대로 사용한다. 신규 상태나 영속 데이터는 없다.
+
+## US145 상태 보존
+
+오류 기록과 사용자 바인딩 구조를 유지한다. 기본 명령의 errors target/default만 f1로 바꾸며 새 상태는 없다.
+
+## US146 기존 항목 제거 경계
+
+ExistingCredentialStore는 target·username 메타데이터 목록과 target별 erase만 제공한다. 비밀은 인터페이스에 포함하지 않는다. 삭제 결과는 제거 건수와 재조회 성공으로 확인하며 기존 프로필 스키마는 유지한다.
+
+## US147 GCM 요청 모델
+
+AuthProfile.url은 검증된 표준 URL이며 .git을 보존한다. ResolvedAuth::Gcm은 username과 url을 전달한다. 프로필 스키마에 구주소 호환 필드는 추가하지 않는다. callback은 프로세스가 아닌 명령별 프로젝트 디렉터리 상태를 보유한다.
+
+## US148 방식 표시
+
+추가 팝업의 최상위 선택과 핸들은 두 개다. 기존 AuthMethod 값과 저장된 프로필 스키마는 유지한다.
+
+
+
+## US149 상태 정리
+
+AuthPanel의 browsers·client_id·code를 제거한다. 기존 영속 BrowserOAuth와 비밀은 보존한다. 신규 등록은 BrowserGcm·Password뿐이다.
+
+
+## US150 상태
+
+새 영속 상태는 없다. 기존 활성 프로젝트 경로와 단축키 바인딩을 사용한다.
+
+
+## US151 실행 상태
+
+영속 상태는 추가하지 않는다. 활성 프로젝트 경로를 실행 시 복사하고 기존 단축키 설정을 사용한다. 실행 계획은 터미널·Bash 경로와 Command 인수로 구성한다.

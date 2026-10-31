@@ -1,7 +1,13 @@
+pub mod auth_profiles;
 pub mod conflict;
 pub mod git;
 pub mod graph;
 pub mod model;
+pub mod native_git;
+mod native_local;
+mod native_operations;
+mod native_refs;
+mod native_remote;
 pub mod paging;
 pub mod partial_stage;
 pub mod stash_recovery;

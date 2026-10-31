@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, bail};
-use std::{path::Path, process::Command};
+use std::path::Path;
+#[cfg(test)]
+use std::process::Command;
 
-fn git_command(path: &Path) -> Command {
+fn git_command(path: &Path) -> feather_git::native_git::Command {
+    feather_git::native_git::Command::at(path)
+}
+
+#[cfg(test)]
+fn oracle_git_command(path: &Path) -> Command {
     let mut command = Command::new("git");
     command.current_dir(path).env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
     command
 }
 
@@ -161,45 +163,7 @@ pub fn unstage_file(repository: &Path, path: &[u8]) -> Result<()> {
 }
 
 pub fn commit(repository: &Path, message: &str) -> Result<()> {
-    use std::{io::Write, process::Stdio};
-    if message.trim().is_empty() || message.contains('\0') {
-        bail!("커밋 메시지를 입력하세요.");
-    }
-    let root = feather_git::git::repository_root(repository)?;
-    let staged = git_command(&root)
-        .args(["diff", "--cached", "--quiet", "--no-ext-diff"])
-        .output()?;
-    match staged.status.code() {
-        Some(0) => bail!("staged 변경사항이 없습니다."),
-        Some(1) => {}
-        _ => bail!(
-            "staged 변경사항을 확인하지 못했습니다: {}",
-            String::from_utf8_lossy(&staged.stderr)
-        ),
-    }
-    let mut child = git_command(&root)
-        .args(["commit", "--file=-", "--cleanup=verbatim"])
-        .env("GIT_EDITOR", "true")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Git 커밋을 실행하지 못했습니다.")?;
-    let written = child
-        .stdin
-        .take()
-        .context("커밋 메시지 입력을 열지 못했습니다.")?
-        .write_all(message.as_bytes());
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "커밋 실패: {}{}",
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-    written.context("커밋 메시지를 전달하지 못했습니다.")?;
-    Ok(())
+    feather_git::native_git::commit(repository, message)
 }
 
 #[cfg(test)]
@@ -237,7 +201,10 @@ fn update_index_many(repository: &Path, paths: &[Vec<u8>], staged: bool) -> Resu
     command.arg("--literal-pathspecs");
     if staged {
         command.args(["add", "--all", "--"]);
-    } else if gix::discover(&root)?.head()?.is_unborn() {
+    } else if feather_git::native_git::gix_repository(&root)?
+        .head()?
+        .is_unborn()
+    {
         command.args(["rm", "--cached", "--force", "--ignore-unmatch", "--"]);
     } else {
         command.args(["reset", "--quiet", "HEAD", "--"]);
@@ -289,7 +256,7 @@ pub fn discard_files(repository: &Path, paths: &[Vec<u8>]) -> Result<()> {
     let mut tracked = Vec::new();
     let mut added = Vec::new();
     {
-        let repo = gix::discover(&root)?;
+        let repo = feather_git::native_git::gix_repository(&root)?;
         let head = if repo.head()?.is_unborn() {
             None
         } else {
@@ -482,23 +449,10 @@ pub fn create(path: &Path, source: Option<&str>) -> Result<()> {
     }
     std::fs::create_dir(path)
         .context("새 대상 폴더를 만들 수 없습니다. 기존 경로는 사용할 수 없습니다.")?;
-    let mut command = Command::new("git");
-    command.env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
     if let Some(url) = source {
-        command.args(["clone", "--", url]).arg(path);
+        feather_git::native_git::clone_repository(url, path)?;
     } else {
-        command.args(["init", "--"]).arg(path);
-    }
-    let output = command
-        .output()
-        .context("Git을 실행할 수 없습니다. Git 설치와 PATH를 확인하세요.")?;
-    if !output.status.success() {
-        bail!("Git 작업 실패: {}", String::from_utf8_lossy(&output.stderr));
+        feather_git::native_git::init_repository(path)?;
     }
     Ok(())
 }
@@ -508,7 +462,7 @@ mod tests {
     use super::*;
 
     fn configured_repository() -> (tempfile::TempDir, std::path::PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let repo = temp.path().join("repo");
         create(&repo, None).unwrap();
         for args in [
@@ -517,7 +471,7 @@ mod tests {
             ["config", "commit.gpgsign", "false"],
         ] {
             assert!(
-                git_command(&repo)
+                oracle_git_command(&repo)
                     .args(args)
                     .output()
                     .unwrap()
@@ -533,6 +487,95 @@ mod tests {
         commit(repo, text).unwrap();
     }
     #[test]
+    fn system_line_endings_stage_without_phantom_modifications() {
+        let temp = tempfile::tempdir().unwrap();
+        let system = temp.path().join("system-config");
+        let global = temp.path().join("global-config");
+        std::fs::write(&system, "[core]\n autocrlf = true\n").unwrap();
+        std::fs::write(&global, "").unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "setup::tests::system_line_endings_child",
+                "--nocapture",
+            ])
+            .env("FEATHER_SYSTEM_STAGE_CHILD", "1")
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "0")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated environment child invoked by parent test"]
+    fn system_line_endings_child() {
+        if std::env::var_os("FEATHER_SYSTEM_STAGE_CHILD").is_none() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repo");
+        create(&repository, None).unwrap();
+        let run = |args: &[&str]| {
+            let output = oracle_git_command(&repository).args(args).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::write(repository.join("tracked.txt"), b"base\r\n").unwrap();
+        run(&["add", "."]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "base",
+        ]);
+        for local_override in [false, true] {
+            if local_override {
+                run(&["config", "core.autocrlf", "false"]);
+            }
+            let content = if local_override {
+                b"local\r\n".as_slice()
+            } else {
+                b"changed\r\n".as_slice()
+            };
+            for name in ["tracked.txt", "new.txt"] {
+                std::fs::write(repository.join(name), content).unwrap();
+                stage_file(&repository, name.as_bytes()).unwrap();
+            }
+            let files = feather_git::git::load_stage(&repository).unwrap();
+            assert_eq!(files.len(), 2, "unexpected stage rows: {files:?}");
+            assert!(
+                files.iter().all(|f| f.staged),
+                "phantom unstaged rows: {files:?}"
+            );
+            for name in ["tracked.txt", "new.txt"] {
+                assert_eq!(std::fs::read(repository.join(name)).unwrap(), content);
+            }
+            let output = oracle_git_command(&repository)
+                .args(["diff", "--name-only"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+    }
+
+    #[test]
     fn directory_stage_roundtrip_preserves_siblings_and_worktree_with_partial_changes() {
         use feather_git::{git::load_stage, model::directory_stage_changes};
         let (_temp, repo) = configured_repository();
@@ -543,7 +586,7 @@ mod tests {
             std::fs::write(repo.join(name), "base").unwrap();
         }
         assert!(
-            git_command(&repo)
+            oracle_git_command(&repo)
                 .args(["add", "."])
                 .output()
                 .unwrap()
@@ -593,7 +636,7 @@ mod tests {
             std::fs::write(repo.join(name), "base").unwrap();
         }
         assert!(
-            git_command(&repo)
+            oracle_git_command(&repo)
                 .args(["add", "."])
                 .output()
                 .unwrap()
@@ -654,7 +697,7 @@ mod tests {
             std::fs::write(repo.join(name), "base").unwrap();
         }
         assert!(
-            git_command(&repo)
+            oracle_git_command(&repo)
                 .args(["add", "."])
                 .output()
                 .unwrap()
@@ -725,7 +768,7 @@ mod tests {
         save_commit(&source, "first");
         let bare = temp.path().join("remote.git");
         assert!(
-            git_command(temp.path())
+            oracle_git_command(temp.path())
                 .args(["clone", "--bare"])
                 .arg(&source)
                 .arg(&bare)
@@ -744,7 +787,7 @@ mod tests {
                 ["config", "commit.gpgsign", "false"],
             ] {
                 assert!(
-                    git_command(repo)
+                    oracle_git_command(repo)
                         .args(args)
                         .output()
                         .unwrap()
@@ -764,14 +807,14 @@ mod tests {
         save_commit(&a, "third");
         RemoteOperation::Push.run(&a).unwrap();
         save_commit(&b, "local divergent");
-        let head = git_command(&b)
+        let head = oracle_git_command(&b)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap()
             .stdout;
         assert!(RemoteOperation::Pull.run(&b).is_err());
         assert_eq!(
-            git_command(&b)
+            oracle_git_command(&b)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -782,14 +825,14 @@ mod tests {
             std::fs::read_to_string(b.join("file.txt")).unwrap(),
             "local divergent"
         );
-        let remote_head = git_command(&bare)
+        let remote_head = oracle_git_command(&bare)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap()
             .stdout;
         assert!(commit_then_push(&a, "no staged changes", true).is_err());
         assert_eq!(
-            git_command(&bare)
+            oracle_git_command(&bare)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -797,7 +840,7 @@ mod tests {
             remote_head
         );
         assert!(
-            git_command(&a)
+            oracle_git_command(&a)
                 .args(["remote", "remove", "origin"])
                 .output()
                 .unwrap()
@@ -812,7 +855,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            git_command(&a)
+            oracle_git_command(&a)
                 .args(["show", "HEAD:file.txt"])
                 .output()
                 .unwrap()
@@ -832,7 +875,7 @@ mod tests {
             ["config", "commit.gpgsign", "false"],
         ] {
             assert!(
-                git_command(&repository)
+                oracle_git_command(&repository)
                     .args(args)
                     .output()
                     .unwrap()
@@ -851,7 +894,7 @@ mod tests {
         stage_file(&repository, b"tracked.txt").unwrap();
         let message = "첫 커밋 😀\n\n본문 한 줄\n둘째 줄\n";
         commit(&repository, message).unwrap();
-        let log = git_command(&repository)
+        let log = oracle_git_command(&repository)
             .args(["log", "-1", "--format=%B"])
             .output()
             .unwrap();
@@ -865,7 +908,7 @@ mod tests {
         std::fs::write(repository.join("outside.txt"), "leave untracked").unwrap();
         commit(&repository, "second").unwrap();
         assert_eq!(
-            git_command(&repository)
+            oracle_git_command(&repository)
                 .args(["show", "HEAD:tracked.txt"])
                 .output()
                 .unwrap()
@@ -873,7 +916,7 @@ mod tests {
             b"indexed"
         );
         assert!(
-            !git_command(&repository)
+            !oracle_git_command(&repository)
                 .args(["cat-file", "-e", "HEAD:outside.txt"])
                 .output()
                 .unwrap()
@@ -888,7 +931,7 @@ mod tests {
             std::fs::read_to_string(repository.join("outside.txt")).unwrap(),
             "leave untracked"
         );
-        let head = git_command(&repository)
+        let head = oracle_git_command(&repository)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap()
@@ -901,7 +944,7 @@ mod tests {
         );
         assert!(commit(&repository, "bad\0message").is_err());
         assert_eq!(
-            git_command(&repository)
+            oracle_git_command(&repository)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -925,7 +968,7 @@ mod tests {
             std::fs::write(repository.join(name), "base\n").unwrap();
         }
         assert!(
-            git_command(&repository)
+            oracle_git_command(&repository)
                 .args(["add", "."])
                 .output()
                 .unwrap()
@@ -933,7 +976,7 @@ mod tests {
                 .success()
         );
         assert!(
-            git_command(&repository)
+            oracle_git_command(&repository)
                 .args([
                     "-c",
                     "user.name=Test",
@@ -1120,13 +1163,13 @@ mod tests {
 
     #[test]
     fn fetch_updates_remote_refs_without_changing_worktree() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let source = temp.path().join("source");
         create(&source, None).unwrap();
         fn commit(path: &Path, contents: &str) {
             std::fs::write(path.join("tracked"), contents).unwrap();
             assert!(
-                git_command(path)
+                oracle_git_command(path)
                     .args(["add", "tracked"])
                     .output()
                     .unwrap()
@@ -1134,7 +1177,7 @@ mod tests {
                     .success()
             );
             assert!(
-                git_command(path)
+                oracle_git_command(path)
                     .args([
                         "-c",
                         "user.name=Test",
@@ -1154,7 +1197,7 @@ mod tests {
         commit(&source, "first");
         let target = temp.path().join("target");
         create(&target, Some(source.to_str().unwrap())).unwrap();
-        let before = git_command(&target)
+        let before = oracle_git_command(&target)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap()
@@ -1163,14 +1206,14 @@ mod tests {
         std::fs::write(target.join("tracked"), "local changes").unwrap();
         fetch(&target).unwrap();
         assert_eq!(
-            git_command(&target)
+            oracle_git_command(&target)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
                 .stdout,
             before
         );
-        let remote = git_command(&target)
+        let remote = oracle_git_command(&target)
             .args(["rev-parse", "refs/remotes/origin/HEAD"])
             .output()
             .unwrap()
@@ -1246,7 +1289,7 @@ mod stash_tests {
     use super::*;
 
     fn run(path: &Path, args: &[&str]) -> Vec<u8> {
-        let output = git_command(path).args(args).output().unwrap();
+        let output = oracle_git_command(path).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "{}",

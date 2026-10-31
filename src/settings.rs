@@ -1,12 +1,12 @@
 use crate::theme;
 use crate::{
+    auth_settings::AuthPanel,
     commit_editor::CommitEditor,
-    credentials::{self, Gcm, LoginTarget},
-    session,
-    settings_git::{GitContext, Identity, SettingsSnapshot, display_url},
+    settings_git::{GitContext, Identity, RepositoryInfo, SettingsSnapshot, display_url},
 };
 use gpui::{prelude::*, *};
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,41 +15,29 @@ use std::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsTab {
-    User,
-    Remote,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Work {
     Loading,
     Saving,
-    Auth,
-}
-
-#[derive(Clone, Copy)]
-enum AuthAction {
-    Status,
-    Login,
-    Logout,
-    Configure,
 }
 
 pub struct SettingsPanel {
     context: GitContext,
-    tab: SettingsTab,
     snapshot: Option<SettingsSnapshot>,
     name: Entity<CommitEditor>,
     email: Entity<CommitEditor>,
-    login_url: Entity<CommitEditor>,
+    auth: Entity<AuthPanel>,
+    identity_focus: FocusHandle,
+    remote_focus: FocusHandle,
+    remote_delete_focus: BTreeMap<String, FocusHandle>,
+    remote_name: Entity<CommitEditor>,
+    remote_url: Entity<CommitEditor>,
+    remote_dialog: bool,
+    restore_remote_focus: bool,
     use_global: bool,
-    preferred_global: Option<bool>,
-    global_focus: FocusHandle,
-    gcm: Option<Gcm>,
-    _helper_configured: bool,
-    account: Option<(String, String)>,
+    local_draft: Identity,
     work: Option<Work>,
     error: Option<String>,
+    error_revision: u64,
     notice: Option<String>,
     cancel: Arc<AtomicBool>,
 }
@@ -61,26 +49,40 @@ impl Drop for SettingsPanel {
 }
 
 impl SettingsPanel {
-    pub fn new(
-        repository: Option<PathBuf>,
-        preferred_global: Option<bool>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn error_revision(&self) -> u64 {
+        self.error_revision
+    }
+
+    fn error_occurrence(&mut self, message: String) -> Option<String> {
+        self.error_revision += 1;
+        Some(message)
+    }
+
+    pub fn new(repository: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        let auth = cx.new(|cx| AuthPanel::new(GitContext::new(repository.clone()), cx));
+        cx.observe(&auth, |_, _, cx| cx.notify()).detach();
         let mut panel = Self {
             context: GitContext::new(repository),
-            tab: SettingsTab::User,
             snapshot: None,
             name: cx.new(|cx| CommitEditor::single_line("", cx)),
             email: cx.new(|cx| CommitEditor::single_line("", cx)),
-            login_url: cx.new(|cx| CommitEditor::single_line("", cx)),
+            auth,
+            identity_focus: cx.focus_handle(),
+            remote_focus: cx.focus_handle(),
+            remote_delete_focus: BTreeMap::new(),
+            remote_name: cx.new(|cx| CommitEditor::single_line("", cx)),
+            remote_url: cx.new(|cx| CommitEditor::single_line("", cx)),
+            remote_dialog: false,
+            restore_remote_focus: false,
             use_global: true,
-            preferred_global,
-            global_focus: cx.focus_handle(),
-            gcm: None,
-            _helper_configured: false,
-            account: None,
+            local_draft: Identity::default(),
             work: None,
             error: None,
+            error_revision: 0,
             notice: None,
             cancel: Arc::new(AtomicBool::new(false)),
         };
@@ -88,12 +90,8 @@ impl SettingsPanel {
         panel
     }
 
-    pub fn use_global_preference(&self) -> Option<bool> {
-        self.snapshot.as_ref().map(|_| self.use_global)
-    }
-
-    pub fn can_close(&self) -> bool {
-        self.work != Some(Work::Saving)
+    pub fn can_close(&self, cx: &App) -> bool {
+        self.work != Some(Work::Saving) && self.auth.read(cx).can_close()
     }
 
     pub fn cancel(&self) {
@@ -101,13 +99,34 @@ impl SettingsPanel {
     }
 
     pub fn is_composing(&self, cx: &App) -> bool {
-        [&self.name, &self.email, &self.login_url]
-            .iter()
-            .any(|editor| editor.read(cx).is_composing())
+        if self.auth.read(cx).popup_open() {
+            return self.auth.read(cx).is_composing(cx);
+        }
+        let editors = if self.remote_dialog {
+            vec![&self.remote_name, &self.remote_url]
+        } else {
+            vec![&self.name, &self.email]
+        };
+        editors.iter().any(|editor| editor.read(cx).is_composing())
     }
 
     pub fn focus_next(&self, backwards: bool, window: &mut Window, cx: &App) {
-        if self.tab != SettingsTab::User || self.work.is_some() || self.is_composing(cx) {
+        if self.auth.read(cx).popup_open() {
+            self.auth.read(cx).focus_next(backwards, window, cx);
+            return;
+        }
+        if self.work.is_some() || self.snapshot.is_none() || self.is_composing(cx) {
+            return;
+        }
+        if self.remote_dialog {
+            crate::popup::focus_next(
+                &[
+                    self.remote_name.read(cx).focus.clone(),
+                    self.remote_url.read(cx).focus.clone(),
+                ],
+                backwards,
+                window,
+            );
             return;
         }
         let mut inputs = vec![
@@ -115,35 +134,111 @@ impl SettingsPanel {
             self.email.read(cx).focus.clone(),
         ];
         if self.context.repository.is_some() {
-            inputs.push(self.global_focus.clone());
+            inputs.push(self.identity_focus.clone());
         }
-        inputs.push(self.login_url.read(cx).focus.clone());
+        if self.context.repository.is_some() {
+            if let Some(snapshot) = &self.snapshot {
+                for remote in &snapshot.info.remotes {
+                    if let Some(focus) = self.remote_delete_focus.get(&remote.name) {
+                        inputs.push(focus.clone());
+                    }
+                }
+            }
+            inputs.push(self.remote_focus.clone());
+        }
+        inputs.extend(self.auth.read(cx).main_focus());
         crate::popup::focus_next(&inputs, backwards, window);
     }
 
+    pub fn action_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.auth.read(cx).popup_open() {
+            return self.auth.read(cx).action_focused(window);
+        }
+        !self.remote_dialog
+            && (self.identity_focus.is_focused(window)
+                || self.remote_focus.is_focused(window)
+                || self.auth.read(cx).action_focused(window)
+                || self
+                    .remote_delete_focus
+                    .values()
+                    .any(|focus| focus.is_focused(window)))
+    }
+
+    pub fn activate_focused(
+        &mut self,
+        window: &mut Window,
+        allow_delete: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.auth.read(cx).popup_open()
+            || (!self.remote_dialog && self.auth.read(cx).action_focused(window))
+        {
+            return self.auth.update(cx, |auth, cx| {
+                auth.activate_focused(window, allow_delete, cx)
+            });
+        }
+        if self.remote_dialog {
+            return false;
+        }
+        if let Some(name) = self
+            .remote_delete_focus
+            .iter()
+            .find_map(|(name, focus)| focus.is_focused(window).then(|| name.clone()))
+        {
+            if !allow_delete {
+                return false;
+            }
+            self.remove_remote(name, cx);
+            return true;
+        }
+        if self.remote_focus.is_focused(window) {
+            self.open_remote(window, cx);
+            return true;
+        }
+        if !self.identity_focus.is_focused(window) {
+            return false;
+        }
+        self.toggle_global(cx);
+        true
+    }
+
+    fn show_identity(&mut self, identity: &Identity, cx: &mut Context<Self>) {
+        for (editor, value) in [(&self.name, &identity.name), (&self.email, &identity.email)] {
+            editor.update(cx, |editor, cx| {
+                editor.set_text(value, cx);
+                editor.set_read_only(self.use_global, cx);
+            });
+        }
+    }
+
     fn toggle_global(&mut self, cx: &mut Context<Self>) {
-        if self.work.is_some() || self.context.repository.is_none() {
+        if self.work.is_some()
+            || self.snapshot.is_none()
+            || self.context.repository.is_none()
+            || self.is_composing(cx)
+        {
             return;
         }
-        self.use_global = !self.use_global;
-        self.preferred_global = Some(self.use_global);
-        if let Some(snapshot) = &self.snapshot {
-            let identity = if self.use_global {
-                &snapshot.global
-            } else {
-                &snapshot.effective
+        if !self.use_global {
+            self.local_draft = Identity {
+                name: self.name.read(cx).message().into(),
+                email: self.email.read(cx).message().into(),
             };
-            self.name
-                .update(cx, |editor, cx| editor.set_text(&identity.name, cx));
-            self.email
-                .update(cx, |editor, cx| editor.set_text(&identity.email, cx));
         }
+        self.use_global = !self.use_global;
+        let identity = if self.use_global {
+            self.snapshot.as_ref().unwrap().global.clone()
+        } else {
+            self.local_draft.clone()
+        };
+        self.show_identity(&identity, cx);
+        self.notice = None;
         cx.notify();
     }
 
     fn set_work(&mut self, work: Option<Work>, cx: &mut Context<Self>) {
         self.work = work;
-        for editor in [&self.name, &self.email, &self.login_url] {
+        for editor in [&self.name, &self.email, &self.remote_name, &self.remote_url] {
             editor.update(cx, |editor, cx| {
                 editor.enabled = work.is_none() && self.snapshot.is_some();
                 cx.notify();
@@ -153,30 +248,50 @@ impl SettingsPanel {
     }
 
     fn apply(&mut self, snapshot: SettingsSnapshot, cx: &mut Context<Self>) {
-        self.use_global = self.context.repository.is_none()
-            || self.preferred_global.unwrap_or(snapshot.use_global);
+        self.use_global = snapshot.use_global;
+        self.local_draft = snapshot.effective.clone();
         let identity = if self.use_global {
             &snapshot.global
         } else {
             &snapshot.effective
         };
-        self.name
-            .update(cx, |editor, cx| editor.set_text(&identity.name, cx));
-        self.email
-            .update(cx, |editor, cx| editor.set_text(&identity.email, cx));
-        if self.login_url.read(cx).message().is_empty() {
-            let target = snapshot
+        self.show_identity(identity, cx);
+        self.snapshot = Some(snapshot);
+        self.sync_remote_focus(cx);
+    }
+
+    fn sync_remote_focus(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = &self.snapshot else {
+            return;
+        };
+        let urls = snapshot
+            .info
+            .remotes
+            .iter()
+            .flat_map(|remote| remote.fetch_urls.iter().chain(remote.push_urls.iter()))
+            .cloned()
+            .collect();
+        self.auth
+            .update(cx, |auth, cx| auth.set_remote_urls(urls, cx));
+        self.remote_delete_focus.retain(|name, _| {
+            snapshot
                 .info
                 .remotes
                 .iter()
-                .flat_map(|remote| &remote.fetch_urls)
-                .map(|url| display_url(url))
-                .find(|url| LoginTarget::parse(url).is_ok())
-                .unwrap_or_default();
-            self.login_url
-                .update(cx, |editor, cx| editor.set_text(&target, cx));
+                .any(|remote| &remote.name == name)
+        });
+        for remote in &snapshot.info.remotes {
+            self.remote_delete_focus
+                .entry(remote.name.clone())
+                .or_insert_with(|| cx.focus_handle());
         }
-        self.snapshot = Some(snapshot);
+    }
+
+    fn update_remote_info(&mut self, info: RepositoryInfo, cx: &mut Context<Self>) {
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.info = info;
+        }
+        self.sync_remote_focus(cx);
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -186,19 +301,15 @@ impl SettingsPanel {
         self.error = None;
         self.set_work(Some(Work::Loading), cx);
         let context = self.context.clone();
-        let task = cx.background_executor().spawn(async move {
-            let snapshot = context.load();
-            let gcm = Gcm::detect(&context);
-            (snapshot, gcm, context.gcm_configured())
-        });
+        let task = cx
+            .background_executor()
+            .spawn(async move { context.load() });
         cx.spawn(async move |this, cx| {
-            let (snapshot, gcm, configured) = task.await;
+            let snapshot = task.await;
             this.update(cx, |this, cx| {
-                this.gcm = gcm;
-                this._helper_configured = configured;
                 match snapshot {
                     Ok(snapshot) => this.apply(snapshot, cx),
-                    Err(error) => this.error = Some(error.to_string()),
+                    Err(error) => this.error = this.error_occurrence(error.to_string()),
                 }
                 this.set_work(None, cx);
             })
@@ -208,9 +319,17 @@ impl SettingsPanel {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        if self.auth.read(cx).popup_open() {
+            self.auth.update(cx, |auth, cx| auth.submit(cx));
+            return;
+        }
+        if self.remote_dialog {
+            self.save_remote(cx);
+            return;
+        }
         if self.work.is_some()
             || self.snapshot.is_none()
-            || self.tab != SettingsTab::User
+            || self.context.repository.is_none()
             || self.is_composing(cx)
         {
             return;
@@ -225,7 +344,11 @@ impl SettingsPanel {
         self.notice = None;
         self.set_work(Some(Work::Saving), cx);
         let task = cx.background_executor().spawn(async move {
-            context.save_identity(&identity, global)?;
+            if global {
+                context.use_global_identity()?;
+            } else {
+                context.save_identity(&identity, false)?;
+            }
             context.load()
         });
         cx.spawn(async move |this, cx| {
@@ -234,9 +357,16 @@ impl SettingsPanel {
                 match result {
                     Ok(snapshot) => {
                         this.apply(snapshot, cx);
-                        this.notice = Some("사용자 설정을 저장했습니다.".into());
+                        this.notice = Some(
+                            if global {
+                                "현재 저장소에 전역 작성자 설정을 적용했습니다."
+                            } else {
+                                "현재 저장소에 저장했습니다."
+                            }
+                            .into(),
+                        );
                     }
-                    Err(error) => this.error = Some(error.to_string()),
+                    Err(error) => this.error = this.error_occurrence(error.to_string()),
                 }
                 this.set_work(None, cx);
             })
@@ -245,220 +375,315 @@ impl SettingsPanel {
         .detach();
     }
 
-    fn auth(&mut self, action: AuthAction, cx: &mut Context<Self>) {
-        if self.work.is_some() {
-            return;
-        }
-        let Some(gcm) = self.gcm.clone() else {
-            self.error =
-                Some("사용 가능한 인증 도구가 없습니다. Git 인증 설정을 확인해 주세요.".into());
-            cx.notify();
-            return;
-        };
-        let url = self.login_url.read(cx).message().trim().to_owned();
-        let target = if matches!(action, AuthAction::Configure) {
-            None
-        } else {
-            match LoginTarget::parse(&url) {
-                Ok(target) => Some(target),
-                Err(error) => {
-                    self.error = Some(error.to_string());
-                    cx.notify();
+    fn identity_section(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let enabled = self.work.is_none() && self.snapshot.is_some();
+        let available = enabled && self.context.repository.is_some();
+        let checkbox = action("settings-global", "", available)
+            .track_focus(&self.identity_focus)
+            .when(self.identity_focus.is_focused(window), |button| {
+                button.bg(rgb(theme::SELECT))
+            })
+            .py(px(crate::controls::CHECKBOX_PADDING))
+            .child(crate::controls::checkbox(self.use_global, "전역 설정 사용"))
+            .on_click(cx.listener(move |this, event, window, cx| {
+                if !available || !crate::controls::checkbox_click(event) {
                     return;
                 }
+                this.identity_focus.focus(window);
+                this.toggle_global(cx);
+            }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_heading("커밋 작성자"))
+            .child(field("이름", self.name.clone(), cx))
+            .child(field("이메일", self.email.clone(), cx))
+            .child(checkbox)
+    }
+
+    pub fn save_button(&self, keys: &str, cx: &Context<Self>) -> Stateful<Div> {
+        let available =
+            self.work.is_none() && self.snapshot.is_some() && self.context.repository.is_some();
+        action(
+            if self.remote_dialog {
+                "settings-save-remote"
+            } else {
+                "settings-save-identity"
+            },
+            "",
+            available,
+        )
+        .bg(rgb(theme::SELECT))
+        .text_color(rgb(theme::ACCENT))
+        .child(crate::shortcut::hint("저장", keys))
+        .on_click(cx.listener(move |this, event, _, cx| {
+            if !available || !crate::controls::checkbox_click(event) {
+                return;
             }
-        };
+            this.save(cx);
+        }))
+    }
+
+    pub fn child_popup_open(&self, cx: &App) -> bool {
+        self.remote_dialog || self.auth.read(cx).popup_open()
+    }
+
+    pub fn close_child_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.auth.read(cx).popup_open() {
+            return self
+                .auth
+                .update(cx, |auth, cx| auth.close_popup(window, cx));
+        }
+        if !self.remote_dialog {
+            return false;
+        }
+        if self.work.is_none() && !self.is_composing(cx) {
+            self.remote_dialog = false;
+            self.error = None;
+            self.remote_focus.focus(window);
+            cx.notify();
+        }
+        true
+    }
+
+    fn open_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.work.is_some()
+            || self.snapshot.is_none()
+            || self.context.repository.is_none()
+            || self.remote_dialog
+        {
+            return;
+        }
+        self.remote_name
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.remote_url
+            .update(cx, |editor, cx| editor.set_text("", cx));
+        self.remote_dialog = true;
         self.error = None;
-        self.notice = Some(
-            if matches!(action, AuthAction::Login) {
-                "브라우저에서 로그인을 완료하세요. 기존 인증이 있으면 재사용합니다."
-            } else {
-                "인증 정보를 처리하고 있습니다…"
-            }
-            .into(),
-        );
-        self.set_work(
-            Some(if matches!(action, AuthAction::Configure) {
-                Work::Saving
-            } else {
-                Work::Auth
-            }),
-            cx,
-        );
-        let cancel = self.cancel.clone();
+        self.notice = None;
+        self.remote_name.read(cx).focus.focus(window);
+        cx.notify();
+    }
+
+    fn save_remote(&mut self, cx: &mut Context<Self>) {
+        if self.work.is_some() || self.is_composing(cx) {
+            return;
+        }
+        let name = self.remote_name.read(cx).message().to_owned();
+        let url = self.remote_url.read(cx).message().to_owned();
         let context = self.context.clone();
+        self.error = None;
+        self.set_work(Some(Work::Saving), cx);
         let task = cx.background_executor().spawn(async move {
-            let account = match action {
-                AuthAction::Configure => {
-                    gcm.configure(&cancel)?;
-                    None
-                }
-                AuthAction::Logout => {
-                    credentials::logout(&gcm, target.as_ref().unwrap(), &cancel)?;
-                    None
-                }
-                AuthAction::Status | AuthAction::Login => Some(credentials::authenticate(
-                    &gcm,
-                    target.as_ref().unwrap(),
-                    matches!(action, AuthAction::Login),
-                    &cancel,
-                )?),
-            };
-            Ok::<_, anyhow::Error>((account, context.gcm_configured()))
+            context.add_remote(&name, &url)?;
+            context.remote_info()
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                if this.cancel.load(Ordering::Relaxed) { return; }
                 match result {
-                    Ok((account, configured)) => {
-                        this._helper_configured = configured;
-                        if !matches!(action, AuthAction::Configure) { this.account = account.map(|account| (url, account)); }
-                        this.notice = Some(match action {
-                            AuthAction::Configure => "Git 인증을 연결했습니다.",
-                            AuthAction::Logout => "저장된 로그인을 삭제했습니다. 브라우저 로그인 세션은 유지됩니다.",
-                            _ => "로그인 정보를 확인했습니다.",
-                        }.into());
+                    Ok(info) => {
+                        this.update_remote_info(info, cx);
+                        this.remote_dialog = false;
+                        this.notice = Some("원격 저장소를 추가했습니다.".into());
+                        this.restore_remote_focus = true;
                     }
-                    Err(error) => { this.account = None; this.notice = None; this.error = Some(error.to_string()); }
+                    Err(error) => this.error = this.error_occurrence(error.to_string()),
                 }
                 this.set_work(None, cx);
-            }).ok();
-        }).detach();
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn user_tab(&self, window: &Window, cx: &Context<Self>) -> Div {
-        let mut body = div().flex().flex_col().gap_3();
-        body = body
-            .child(field("이름", self.name.clone()))
-            .child(field("이메일", self.email.clone()))
-            .child(
-                action(
-                    "settings-global",
-                    "",
-                    self.work.is_none() && self.context.repository.is_some(),
-                )
-                .track_focus(&self.global_focus)
-                .when(self.global_focus.is_focused(window), |button| {
-                    button.bg(rgb(theme::SELECT))
-                })
-                .py(px(crate::controls::CHECKBOX_PADDING))
-                .flex()
-                .items_center()
-                .child(crate::controls::checkbox(self.use_global, "전역 설정 사용"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.global_focus.focus(window);
-                    this.toggle_global(cx);
-                })),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .text_color(rgb(theme::ACCENT))
-                    .child("원격 로그인"),
-            );
-        body = body.child(field(
-            "로그인할 HTTPS 저장소 또는 서비스 URL",
-            self.login_url.clone(),
-        ));
-        let url = self.login_url.read(cx).message().trim();
-        body = body.child(
-            div().text_xs().child(
-                self.account
-                    .as_ref()
-                    .filter(|(target, _)| target == url)
-                    .map(|(_, account)| format!("연결된 계정: {account}"))
-                    .unwrap_or_else(|| {
-                        "이 주소의 로그인 상태를 확인하세요. SSH는 SSH 키로 인증합니다.".into()
-                    }),
-            ),
-        );
-        let enabled = self.work.is_none() && self.gcm.is_some();
-        body = body.child(
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .child(
-                    action("settings-auth-status", "상태 확인", enabled)
-                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Status, cx))),
-                )
-                .child(
-                    action("settings-auth-login", "브라우저 로그인", enabled)
-                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Login, cx))),
-                )
-                .child(
-                    action("settings-auth-logout", "로그아웃", enabled)
-                        .on_click(cx.listener(|this, _, _, cx| this.auth(AuthAction::Logout, cx))),
-                )
-                .child(
-                    action("settings-auth-configure", "Git 연결", enabled).on_click(
-                        cx.listener(|this, _, _, cx| this.auth(AuthAction::Configure, cx)),
-                    ),
-                ),
-        );
-        body
-    }
-
-    fn remote_tab(&self) -> Div {
-        let mut body = div().flex().flex_col().gap_3();
-        let Some(path) = &self.context.repository else {
-            return body.child("저장소를 열면 원격 정보를 볼 수 있습니다.");
-        };
-        body = body.child(div().text_sm().child(session::display_path(path)));
-        let Some(snapshot) = &self.snapshot else {
-            return body;
-        };
-        body = body
-            .child(format!(
-                "현재 브랜치: {}",
-                snapshot.info.branch.as_deref().unwrap_or("Detached HEAD")
-            ))
-            .child(format!(
-                "추적 브랜치: {}",
-                snapshot.info.upstream.as_deref().unwrap_or("없음")
-            ));
-        if snapshot.info.remotes.is_empty() {
-            body = body.child("등록된 원격 저장소가 없습니다.");
+    fn remove_remote(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.work.is_some() || self.remote_dialog || self.is_composing(cx) {
+            return;
         }
-        for remote in &snapshot.info.remotes {
-            let mut entry = div()
-                .p_3()
-                .border_1()
-                .border_color(rgb(theme::LINE))
-                .rounded_md()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
+        self.error = None;
+        self.notice = None;
+        self.set_work(Some(Work::Saving), cx);
+        let context = self.context.clone();
+        let task = cx.background_executor().spawn(async move {
+            context.remove_remote(&name)?;
+            context.remote_info()
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(info) => {
+                        this.update_remote_info(info, cx);
+                        this.notice = Some("원격 저장소 연결을 삭제했습니다.".into());
+                        this.restore_remote_focus = true;
+                    }
+                    Err(error) => this.error = this.error_occurrence(error.to_string()),
+                }
+                this.set_work(None, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn child_popup(
+        &mut self,
+        keys: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        if self.auth.read(cx).popup_open() {
+            return self
+                .auth
+                .update(cx, |auth, cx| auth.popup(keys, window, cx));
+        }
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .pb_1()
+            .child(field("원격 이름", self.remote_name.clone(), cx).flex_shrink_0())
+            .child(field("URL", self.remote_url.clone(), cx).flex_shrink_0())
+            .when(self.work == Some(Work::Saving), |body| {
+                body.child("저장하고 있습니다…")
+            })
+            .when_some(self.error.clone(), |body, error| {
+                body.child(div().text_sm().text_color(rgb(theme::ERROR)).child(error))
+            });
+        let card = crate::popup::frame(
+            "원격 저장소 추가",
+            540.,
+            crate::popup::Body {
+                header: None,
+                content: body,
+            },
+            Some(self.save_button(keys, cx).into_any_element()),
+            None,
+            window.viewport_size().height,
+            None,
+        );
+        div()
+            .id("settings-remote-overlay")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .bg(rgba(theme::BACKDROP))
+            .text_color(rgb(theme::TEXT))
+            .text_sm()
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_child_popup(window, cx);
+                cx.stop_propagation();
+            }))
+            .child(card)
+    }
+
+    fn remote_section(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let available =
+            self.work.is_none() && self.snapshot.is_some() && self.context.repository.is_some();
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_heading("원격 저장소"));
+        if let Some(snapshot) = &self.snapshot {
+            for (index, remote) in snapshot.info.remotes.iter().enumerate() {
+                let mut urls = remote.fetch_urls.clone();
+                for url in &remote.push_urls {
+                    if !urls.contains(url) {
+                        urls.push(url.clone());
+                    }
+                }
+                if urls.is_empty() {
+                    urls.push("URL 없음".into());
+                }
+                let mut entries = div().flex_1().min_w_0().flex().flex_col().gap_2();
+                for url in &urls {
+                    entries = entries.child(
+                        div()
+                            .flex()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::ACCENT))
+                                    .child(remote.name.clone()),
+                            )
+                            .child(div().flex_1().min_w_0().child(display_url(url))),
+                    );
+                }
+                let name = remote.name.clone();
+                let focus = self.remote_delete_focus[&name].clone();
+                let deletable = available && !self.remote_dialog;
+                body = body.child(
                     div()
-                        .text_color(rgb(theme::ACCENT))
-                        .child(remote.name.clone()),
+                        .id(("settings-remote", index))
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .child(entries)
+                        .child(
+                            action("settings-delete-remote", "×", deletable)
+                                .track_focus(&focus)
+                                .when(focus.is_focused(window), |button| {
+                                    button
+                                        .bg(rgb(theme::SELECT))
+                                        .border_1()
+                                        .border_color(rgb(theme::ACCENT))
+                                })
+                                .flex_shrink_0()
+                                .text_color(rgb(theme::ERROR))
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    if deletable && crate::controls::checkbox_click(event) {
+                                        focus.focus(window);
+                                        this.remove_remote(name.clone(), cx);
+                                    }
+                                })),
+                        ),
                 );
-            for url in &remote.fetch_urls {
-                entry = entry.child(format!("가져오기: {}", display_url(url)));
             }
-            for url in &remote.push_urls {
-                entry = entry.child(format!("푸시: {}", display_url(url)));
+            if snapshot.info.remotes.is_empty() {
+                body = body.child("등록된 원격 저장소가 없습니다.");
             }
-            body = body.child(entry);
         }
         body.child(
-            div()
-                .text_xs()
-                .text_color(rgb(theme::MUTED))
-                .child("원격 정보는 읽기 전용입니다."),
+            div().flex().child(
+                action("settings-add-remote", "추가", available)
+                    .track_focus(&self.remote_focus)
+                    .when(self.remote_focus.is_focused(window), |button| {
+                        button
+                            .bg(rgb(theme::SELECT))
+                            .border_1()
+                            .border_color(rgb(theme::ACCENT))
+                    })
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        if available && crate::controls::checkbox_click(event) {
+                            this.open_remote(window, cx);
+                        }
+                    })),
+            ),
         )
     }
 }
 
 impl Render for SettingsPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = if self.tab == SettingsTab::User {
-            self.user_tab(window, cx)
-        } else {
-            self.remote_tab()
-        };
+        if self.restore_remote_focus {
+            self.restore_remote_focus = false;
+            self.remote_focus.focus(window);
+        }
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(self.identity_section(window, cx))
+            .child(self.remote_section(window, cx))
+            .child(self.auth.clone());
         div()
             .flex()
             .flex_col()
@@ -468,31 +693,6 @@ impl Render for SettingsPanel {
             .min_h_0()
             .child(
                 div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        action("settings-user-tab", "사용자", true)
-                            .when(self.tab == SettingsTab::User, |tab| {
-                                tab.bg(rgb(theme::SELECT)).text_color(rgb(theme::ACCENT))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.tab = SettingsTab::User;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        action("settings-remote-tab", "원격", true)
-                            .when(self.tab == SettingsTab::Remote, |tab| {
-                                tab.bg(rgb(theme::SELECT)).text_color(rgb(theme::ACCENT))
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.tab = SettingsTab::Remote;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
                     .id("settings-body")
                     .flex_1()
                     .min_h_0()
@@ -500,16 +700,18 @@ impl Render for SettingsPanel {
                     .pr_2()
                     .child(body),
             )
-            .when_some(self.work, |panel, work| {
+            .when_some(self.work.filter(|_| !self.remote_dialog), |panel, work| {
                 panel.child(match work {
                     Work::Loading => "설정을 읽고 있습니다…",
                     Work::Saving => "저장하고 있습니다…",
-                    Work::Auth => "인증을 처리하고 있습니다… (닫으면 취소)",
                 })
             })
-            .when_some(self.error.clone(), |panel, error| {
-                panel.child(div().text_sm().text_color(rgb(theme::ERROR)).child(error))
-            })
+            .when_some(
+                self.error.clone().filter(|_| !self.remote_dialog),
+                |panel, error| {
+                    panel.child(div().text_sm().text_color(rgb(theme::ERROR)).child(error))
+                },
+            )
             .when_some(self.notice.clone(), |panel, notice| {
                 panel.child(div().text_sm().text_color(rgb(theme::ACCENT)).child(notice))
             })
@@ -520,6 +722,14 @@ impl Render for SettingsPanel {
                 )
             })
     }
+}
+
+fn section_heading(title: &str) -> Div {
+    div()
+        .text_sm()
+        .text_color(rgb(theme::ACCENT))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title.to_owned())
 }
 
 fn action(id: &'static str, label: &str, enabled: bool) -> Stateful<Div> {
@@ -540,7 +750,8 @@ fn action(id: &'static str, label: &str, enabled: bool) -> Stateful<Div> {
         .when(!label.is_empty(), |button| button.child(label.to_owned()))
 }
 
-fn field(label: &str, editor: Entity<CommitEditor>) -> Div {
+fn field(label: &str, editor: Entity<CommitEditor>, cx: &App) -> Div {
+    let background = editor.read(cx).background_color();
     div()
         .flex()
         .flex_col()
@@ -555,6 +766,7 @@ fn field(label: &str, editor: Entity<CommitEditor>) -> Div {
                 .border_color(rgb(theme::LINE))
                 .rounded_sm()
                 .p_1()
+                .bg(rgb(background))
                 .child(editor),
         )
 }

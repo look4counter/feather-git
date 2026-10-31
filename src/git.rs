@@ -12,11 +12,10 @@ pub const MAX_BYTES: u64 = 1024 * 1024;
 
 pub(crate) fn open(path: &Path) -> Result<gix::Repository> {
     // 조회 중에도 사용자 정의 clean/process 필터가 실행되지 않도록 한다.
-    Ok(gix::discover_opts(
+    crate::native_local::repo_with_options(
         path,
-        Default::default(),
-        gix::open::Options::default().filter_config_section(|_| false),
-    )?)
+        crate::native_local::open_options().filter_config_section(|_| false),
+    )
 }
 
 pub fn repository_root(path: &Path) -> Result<std::path::PathBuf> {
@@ -38,8 +37,14 @@ pub fn load_initial(path: &Path, selected_commit: Option<&str>) -> Result<Snapsh
 
 pub fn load_for_refresh(path: &Path, selected_commit: Option<&str>) -> Result<Snapshot> {
     let mut snapshot = load_initial(path, selected_commit)?;
+    let graph_target = selected_commit.filter(|selected| {
+        !snapshot
+            .references
+            .iter()
+            .any(|reference| reference.kind == RefTab::Stash && reference.target == *selected)
+    });
     while snapshot.has_more
-        && selected_commit
+        && graph_target
             .is_some_and(|selected| !snapshot.commits.iter().any(|commit| commit.id == selected))
     {
         let Some(session) = &snapshot.session else {
@@ -106,7 +111,9 @@ fn load_snapshot(path: &Path, selected_commit: Option<&str>, paged: bool) -> Res
         .unwrap_or_else(|| "Detached HEAD".into());
     let mut tips = HashSet::new();
     for reference in &references {
-        tips.insert(gix::ObjectId::from_hex(reference.target.as_bytes())?);
+        if reference.kind != RefTab::Stash {
+            tips.insert(gix::ObjectId::from_hex(reference.target.as_bytes())?);
+        }
     }
     if !repo.head()?.is_unborn() {
         tips.insert(repo.head_id()?.detach());

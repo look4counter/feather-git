@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
-use std::{path::PathBuf, process::Command};
+use feather_git::native_git::Command;
+use std::path::PathBuf;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Identity {
@@ -24,8 +25,6 @@ pub struct RemoteInfo {
 #[derive(Default)]
 pub struct RepositoryInfo {
     pub remotes: Vec<RemoteInfo>,
-    pub branch: Option<String>,
-    pub upstream: Option<String>,
 }
 
 pub struct SettingsSnapshot {
@@ -45,16 +44,12 @@ impl GitContext {
     }
 
     pub fn command(&self) -> Command {
-        let mut command = Command::new("git");
-        if let Some(path) = &self.repository {
-            command.current_dir(path);
-        }
+        let mut command = Command::at(
+            self.repository
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
         command.env("GIT_TERMINAL_PROMPT", "0");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
         #[cfg(test)]
         if let Some(global) = &self.global_file {
             command
@@ -156,18 +151,16 @@ impl GitContext {
         let mut before = Vec::new();
         for key in ["user.name", "user.email"] {
             before.push((scope, key, self.values(Some(scope), key)?));
-            if global && self.repository.is_some() {
-                before.push(("--local", key, self.values(Some("--local"), key)?));
-            }
         }
         let result = (|| {
             self.set_values(scope, "user.name", std::slice::from_ref(&identity.name))?;
             self.set_values(scope, "user.email", std::slice::from_ref(&identity.email))?;
-            if global && self.repository.is_some() {
-                self.set_values("--local", "user.name", &[])?;
-                self.set_values("--local", "user.email", &[])?;
-            }
-            if self.effective_identity()? != identity {
+            let saved = if global {
+                self.identity(scope)?
+            } else {
+                self.effective_identity()?
+            };
+            if saved != identity {
                 bail!("다른 Git 설정이 사용자 정보를 덮어쓰고 있습니다.");
             }
             Ok(())
@@ -187,20 +180,71 @@ impl GitContext {
         Ok(())
     }
 
+    pub fn use_global_identity(&self) -> Result<()> {
+        if self.repository.is_none() {
+            bail!("저장소를 연 뒤 전역 설정 사용을 적용하세요.");
+        }
+        let global = self.identity("--global")?;
+        if global.name.is_empty() || global.email.is_empty() {
+            bail!("전역 이름과 이메일을 먼저 설정하세요.");
+        }
+        let before = [
+            ("user.name", self.values(Some("--local"), "user.name")?),
+            ("user.email", self.values(Some("--local"), "user.email")?),
+        ];
+        let result = (|| {
+            for (key, _) in &before {
+                self.set_values("--local", key, &[])?;
+            }
+            if self.effective_identity()? != global {
+                bail!("다른 Git 설정이 전역 작성자 정보를 덮어쓰고 있습니다.");
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let restored = before.iter().fold(true, |restored, (key, values)| {
+                let unchanged = self.values(Some("--local"), key).ok().as_ref() == Some(values);
+                (unchanged || self.set_values("--local", key, values).is_ok()) && restored
+            });
+            if !restored {
+                bail!(
+                    "{error} 기존 값 일부를 복구하지 못했습니다. 설정 파일 권한과 잠금을 확인하세요."
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn load(&self) -> Result<SettingsSnapshot> {
         let global = self.identity("--global")?;
-        let use_global = if self.repository.is_some() {
-            self.values(Some("--local"), "user.name")?.is_empty()
-                && self.values(Some("--local"), "user.email")?.is_empty()
-        } else {
-            true
-        };
         Ok(SettingsSnapshot {
             global,
             effective: self.effective_identity()?,
-            use_global,
+            use_global: self.repository.is_none()
+                || (self.values(Some("--local"), "user.name")?.is_empty()
+                    && self.values(Some("--local"), "user.email")?.is_empty()),
             info: self.remote_info()?,
         })
+    }
+
+    pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
+        let path = self
+            .repository
+            .as_deref()
+            .context("저장소를 먼저 열어 주세요.")?;
+        feather_git::native_git::add_remote(path, name, url)
+    }
+
+    pub fn remove_remote(&self, name: &str) -> Result<()> {
+        if self.repository.is_none() {
+            bail!("저장소를 먼저 열어 주세요.");
+        }
+        let output = self.command().args(["remote", "remove", name]).output()?;
+        if !output.status.success() {
+            bail!("원격 저장소를 삭제하지 못했습니다. 설정 잠금과 원격 이름을 확인하세요.");
+        }
+        Ok(())
     }
 
     pub fn remote_info(&self) -> Result<RepositoryInfo> {
@@ -234,33 +278,24 @@ impl GitContext {
                 push_urls: urls(true)?,
             });
         }
-        let output = self
-            .command()
-            .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .output()?;
-        let branch = output
-            .status
-            .success()
-            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        let upstream = if let Some(branch) = &branch {
-            let remote = self.values(None, &format!("branch.{branch}.remote"))?.pop();
-            let merge = self.values(None, &format!("branch.{branch}.merge"))?.pop();
-            remote.zip(merge).map(|(remote, merge)| {
-                format!(
-                    "{remote}/{}",
-                    merge.strip_prefix("refs/heads/").unwrap_or(&merge)
-                )
-            })
-        } else {
-            None
-        };
-        Ok(RepositoryInfo {
-            remotes,
-            branch,
-            upstream,
-        })
+        Ok(RepositoryInfo { remotes })
     }
 
+    #[cfg(test)]
+    fn oracle_command(&self) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        if let Some(path) = &self.repository {
+            command.current_dir(path);
+        }
+        if let Some(path) = &self.global_file {
+            command
+                .env("GIT_CONFIG_GLOBAL", path)
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+        }
+        command
+    }
+
+    #[cfg(test)]
     pub fn gcm_configured(&self) -> bool {
         let helpers = self.values(None, "credential.helper").unwrap_or_default();
         helpers
@@ -301,6 +336,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn removing_remote_preserves_other_remotes_and_local_work() {
+        let (_temp, context) = context();
+        context
+            .add_remote("origin", "https://example.invalid/origin.git")
+            .unwrap();
+        context
+            .add_remote("backup", "https://example.invalid/backup.git")
+            .unwrap();
+        context
+            .set_values("--local", "user.name", &["작성자".into()])
+            .unwrap();
+        context
+            .set_values("--local", "branch.main.remote", &["origin".into()])
+            .unwrap();
+        context
+            .set_values("--local", "branch.main.merge", &["refs/heads/main".into()])
+            .unwrap();
+        let path = context.repository.as_ref().unwrap();
+        let file = path.join("draft.txt");
+        std::fs::write(&file, "초안").unwrap();
+        let repo = git2::Repository::open(path).unwrap();
+        let tree_id = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("테스트", "test@example.invalid").unwrap();
+        let commit = repo
+            .commit(
+                Some("refs/heads/main"),
+                &signature,
+                &signature,
+                "초기",
+                &tree,
+                &[],
+            )
+            .unwrap();
+        for name in [
+            "refs/heads/feature",
+            "refs/remotes/origin/main",
+            "refs/remotes/backup/main",
+        ] {
+            repo.reference(name, commit, false, "검증").unwrap();
+        }
+        let config = path.join(".git/config");
+        let before = std::fs::read(&config).unwrap();
+        let lock = path.join(".git/config.lock");
+        std::fs::write(&lock, "locked").unwrap();
+        assert!(context.remove_remote("origin").is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        std::fs::remove_file(lock).unwrap();
+        context.remove_remote("origin").unwrap();
+        assert!(repo.find_reference("refs/remotes/origin/main").is_err());
+        for name in [
+            "refs/heads/main",
+            "refs/heads/feature",
+            "refs/remotes/backup/main",
+        ] {
+            assert_eq!(repo.find_reference(name).unwrap().target(), Some(commit));
+        }
+        let info = context.remote_info().unwrap();
+        assert_eq!(info.remotes.len(), 1);
+        assert_eq!(info.remotes[0].name, "backup");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "초안");
+        assert_eq!(
+            context.values(Some("--local"), "user.name").unwrap(),
+            vec!["작성자"]
+        );
+        assert!(
+            context
+                .values(Some("--local"), "branch.main.remote")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(context.remove_remote("origin").is_err());
+        context
+            .add_remote("origin", "https://example.invalid/again.git")
+            .unwrap();
+        assert_eq!(context.remote_info().unwrap().remotes.len(), 2);
+        assert!(GitContext::new(None).remove_remote("origin").is_err());
+    }
+
+    #[test]
+    fn adding_remotes_is_atomic_and_preserves_existing_configuration() {
+        let (_temp, context) = context();
+        context
+            .set_values("--local", "user.name", &["작성자".into()])
+            .unwrap();
+        context
+            .add_remote("origin", "https://example.invalid/main.git")
+            .unwrap();
+        context
+            .add_remote("backup", "git@example.invalid:backup.git")
+            .unwrap();
+        assert_eq!(
+            context
+                .values(Some("--local"), "remote.backup.url")
+                .unwrap(),
+            vec!["git@example.invalid:backup.git"]
+        );
+        assert_eq!(context.remote_info().unwrap().remotes.len(), 2);
+        assert_eq!(
+            context
+                .values(Some("--local"), "remote.origin.fetch")
+                .unwrap(),
+            vec!["+refs/heads/*:refs/remotes/origin/*"]
+        );
+        let config = context.repository.as_ref().unwrap().join(".git/config");
+        let before = std::fs::read(&config).unwrap();
+        for (name, url) in [
+            ("origin", "other"),
+            ("", "url"),
+            ("bad..name", "url"),
+            ("new", ""),
+            ("new", "url\nvalue"),
+        ] {
+            assert!(context.add_remote(name, url).is_err());
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+        }
+        let lock = config.with_extension("lock");
+        std::fs::write(&lock, "locked").unwrap();
+        assert!(
+            context
+                .add_remote("new", "https://example.invalid/new.git")
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        std::fs::remove_file(lock).unwrap();
+        context
+            .add_remote("new", "https://example.invalid/new.git?q=one;two#part")
+            .unwrap();
+        assert_eq!(
+            context.values(Some("--local"), "remote.new.url").unwrap(),
+            vec!["https://example.invalid/new.git?q=one;two#part"]
+        );
+        assert_eq!(
+            context.values(Some("--local"), "user.name").unwrap(),
+            vec!["작성자"]
+        );
+        assert!(GitContext::new(None).add_remote("origin", "url").is_err());
+    }
+
+    #[test]
     fn malformed_remote_credentials_are_redacted_and_helper_resets_are_respected() {
         assert_eq!(
             display_url("https://user:secret@example.invalid:bad/repo?token=secret"),
@@ -325,7 +500,7 @@ mod tests {
     }
 
     fn context() -> (tempfile::TempDir, GitContext) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         let context = GitContext {
@@ -334,7 +509,7 @@ mod tests {
         };
         assert!(
             context
-                .command()
+                .oracle_command()
                 .arg("init")
                 .output()
                 .unwrap()
@@ -345,7 +520,64 @@ mod tests {
     }
 
     #[test]
-    fn global_identity_removes_local_overrides_and_local_save_preserves_global() {
+    fn using_global_removes_only_local_identity_and_preserves_global_and_other_settings() {
+        let (_temp, context) = context();
+        let global = Identity {
+            name: "전역".into(),
+            email: "global@example.invalid".into(),
+        };
+        let local = Identity {
+            name: "개별".into(),
+            email: "local@example.invalid".into(),
+        };
+        context.save_identity(&global, true).unwrap();
+        context.save_identity(&local, false).unwrap();
+        context
+            .set_values("--local", "core.autocrlf", &["false".into()])
+            .unwrap();
+        assert!(!context.load().unwrap().use_global);
+        context.use_global_identity().unwrap();
+        assert_eq!(context.identity("--global").unwrap(), global);
+        assert_eq!(context.identity("--local").unwrap(), Identity::default());
+        assert_eq!(context.effective_identity().unwrap(), global);
+        assert!(context.load().unwrap().use_global);
+        assert_eq!(
+            context.values(Some("--local"), "core.autocrlf").unwrap(),
+            vec!["false"]
+        );
+        context.save_identity(&local, false).unwrap();
+        std::fs::write(
+            context
+                .repository
+                .as_ref()
+                .unwrap()
+                .join(".git/config.lock"),
+            "locked",
+        )
+        .unwrap();
+        assert!(context.use_global_identity().is_err());
+        assert_eq!(context.identity("--local").unwrap(), local);
+        assert_eq!(context.identity("--global").unwrap(), global);
+    }
+
+    #[test]
+    fn using_global_rejects_missing_global_identity_and_missing_repository_without_writes() {
+        let (_temp, mut context) = context();
+        let local = Identity {
+            name: "개별".into(),
+            email: "local@example.invalid".into(),
+        };
+        context.save_identity(&local, false).unwrap();
+        assert!(context.use_global_identity().is_err());
+        assert_eq!(context.identity("--local").unwrap(), local);
+        assert_eq!(context.identity("--global").unwrap(), Identity::default());
+        context.repository = None;
+        assert!(context.use_global_identity().is_err());
+        assert!(context.load().unwrap().use_global);
+    }
+
+    #[test]
+    fn global_and_local_saves_preserve_the_other_scope_and_reads_do_not_write() {
         let (_temp, context) = context();
         let global = Identity {
             name: "전역 사용자".into(),
@@ -359,9 +591,18 @@ mod tests {
         context.save_identity(&local, false).unwrap();
         assert_eq!(context.identity("--global").unwrap(), global);
         assert_eq!(context.effective_identity().unwrap(), local);
-        context.save_identity(&global, true).unwrap();
-        assert_eq!(context.identity("--local").unwrap(), Identity::default());
-        assert_eq!(context.effective_identity().unwrap(), global);
+        let updated_global = Identity {
+            name: "새 전역 사용자".into(),
+            email: "new-global@example.invalid".into(),
+        };
+        context.save_identity(&updated_global, true).unwrap();
+        assert_eq!(context.identity("--local").unwrap(), local);
+        assert_eq!(context.effective_identity().unwrap(), local);
+        assert_eq!(context.identity("--global").unwrap(), updated_global);
+        let snapshot = context.load().unwrap();
+        assert_eq!(snapshot.global, updated_global);
+        assert_eq!(snapshot.effective, local);
+        assert_eq!(context.identity("--local").unwrap(), local);
     }
 
     #[test]
@@ -400,6 +641,12 @@ mod tests {
         assert_eq!(context.identity("--global").unwrap(), valid);
         context.repository = None;
         assert!(context.save_identity(&valid, false).is_err());
+        let changed = Identity {
+            name: "저장소 없는 전역 사용자".into(),
+            email: "standalone@example.invalid".into(),
+        };
+        context.save_identity(&changed, true).unwrap();
+        assert_eq!(context.load().unwrap().effective, changed);
     }
 
     #[test]
@@ -410,13 +657,13 @@ mod tests {
             email: "before@example.invalid".into(),
         };
         context.save_identity(&before, true).unwrap();
-        // 로컬 잠금으로 전역 저장 후 로컬 제거 단계의 실패를 유도한다.
+        // 실제 전역 파일 대신 격리된 전역 설정 파일의 잠금을 사용한다.
         std::fs::write(
             context
-                .repository
+                .global_file
                 .as_ref()
                 .unwrap()
-                .join(".git/config.lock"),
+                .with_extension("config.lock"),
             "locked",
         )
         .unwrap();
@@ -452,7 +699,7 @@ mod tests {
         ] {
             assert!(
                 context
-                    .command()
+                    .oracle_command()
                     .args(args)
                     .output()
                     .unwrap()
@@ -471,7 +718,12 @@ mod tests {
             origin.push_urls,
             vec!["ssh://git@example.invalid/team/repo.git"]
         );
-        assert_eq!(info.upstream.as_deref(), Some("origin/main"));
+        assert_eq!(
+            context
+                .values(Some("--local"), "branch.main.remote")
+                .unwrap(),
+            vec!["origin"]
+        );
         assert_eq!(
             display_url(&origin.fetch_urls[0]),
             "https://example.invalid/team/repo.git"

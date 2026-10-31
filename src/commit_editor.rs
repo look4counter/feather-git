@@ -18,6 +18,44 @@ fn normalized_input(text: &str, single_line: bool) -> String {
     }
 }
 
+fn masked_text(text: &str) -> String {
+    "*".repeat(text.len())
+}
+fn source_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+pub fn read_only_key(key: &Keystroke) -> bool {
+    if key.modifiers.alt || key.modifiers.platform {
+        return false;
+    }
+    if key.modifiers.control {
+        return matches!(key.key.as_str(), "a" | "c");
+    }
+    matches!(
+        key.key.as_str(),
+        "left" | "right" | "up" | "down" | "home" | "end"
+    )
+}
+
+fn wrapped_ranges(text: &str, width: f32, x_for_index: impl Fn(usize) -> f32) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        if index > start && x_for_index(end) - x_for_index(start) > width.max(1.) {
+            rows.push(start..index);
+            start = index;
+        }
+    }
+    rows.push(start..text.len());
+    rows
+}
+
 #[derive(Default)]
 struct Buffer {
     text: String,
@@ -98,6 +136,8 @@ impl Buffer {
 pub struct CommitEditor {
     buffer: Buffer,
     single_line: bool,
+    read_only: bool,
+    secret: bool,
     pub focus: FocusHandle,
     pub enabled: bool,
     pub text_size: f32,
@@ -116,6 +156,8 @@ impl CommitEditor {
         Self {
             buffer: Buffer::default(),
             single_line: false,
+            read_only: false,
+            secret: false,
             focus: cx.focus_handle(),
             enabled: true,
             text_size: 14.,
@@ -132,6 +174,31 @@ impl CommitEditor {
     pub fn message(&self) -> &str {
         &self.buffer.text
     }
+
+    pub fn read_only(text: &str, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::new(cx);
+        editor.buffer.text = text.to_owned();
+        editor.read_only = true;
+        editor.text_size = 13.;
+        editor
+    }
+
+    fn editable(&self) -> bool {
+        self.enabled && !self.read_only
+    }
+
+    pub fn background_color(&self) -> u32 {
+        if self.read_only {
+            theme::BG
+        } else {
+            theme::INPUT
+        }
+    }
+
+    pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        self.read_only = read_only;
+        cx.notify();
+    }
     pub fn single_line(text: &str, cx: &mut Context<Self>) -> Self {
         let mut editor = Self::new(cx);
         editor.single_line = true;
@@ -139,6 +206,11 @@ impl CommitEditor {
         editor
     }
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.secret {
+            unsafe {
+                self.buffer.text.as_bytes_mut().fill(0);
+            }
+        }
         self.buffer = Buffer {
             text: self.input_text(text),
             ..Buffer::default()
@@ -147,6 +219,17 @@ impl CommitEditor {
     }
     fn input_text(&self, text: &str) -> String {
         normalized_input(text, self.single_line)
+    }
+    pub fn password(cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::single_line("", cx);
+        editor.secret = true;
+        editor
+    }
+    pub fn take_secret(&mut self, cx: &mut Context<Self>) -> feather_git::auth_profiles::Secret {
+        let text = std::mem::take(&mut self.buffer.text);
+        self.buffer = Buffer::default();
+        self.changed(cx);
+        feather_git::auth_profiles::Secret::new(text)
     }
     pub fn is_composing(&self) -> bool {
         self.buffer.marked.is_some()
@@ -164,7 +247,10 @@ impl CommitEditor {
         else {
             return 0;
         };
-        start + line.closest_index_for_x((position.x - bounds.origin.x).max(px(0.)))
+        source_boundary(
+            &self.buffer.text,
+            start + line.closest_index_for_x((position.x - bounds.origin.x).max(px(0.))),
+        )
     }
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.enabled {
@@ -172,6 +258,10 @@ impl CommitEditor {
             return;
         }
         let key = &event.keystroke;
+        if self.read_only && !read_only_key(key) {
+            cx.stop_propagation();
+            return;
+        }
         if self.buffer.marked.is_some() && !key.modifiers.control {
             return;
         }
@@ -183,7 +273,7 @@ impl CommitEditor {
                 }
                 "c" | "x" => {
                     let range = self.buffer.selection();
-                    if !range.is_empty() {
+                    if !self.secret && !range.is_empty() {
                         cx.write_to_clipboard(ClipboardItem::new_string(
                             self.buffer.text[range].to_owned(),
                         ));
@@ -241,34 +331,54 @@ impl CommitEditor {
                         "home" => start,
                         "end" => end,
                         "up" | "down" => {
-                            let target = if key.key == "up" {
-                                if start == 0 {
-                                    0
+                            if self.read_only && !self.lines.is_empty() {
+                                let row = self
+                                    .lines
+                                    .iter()
+                                    .rposition(|(start, _)| *start <= cursor)
+                                    .unwrap_or(0);
+                                let column =
+                                    self.buffer.text[self.lines[row].0..cursor].chars().count();
+                                let target = if key.key == "up" {
+                                    row.saturating_sub(1)
                                 } else {
-                                    self.buffer.text[..start - 1]
-                                        .rfind('\n')
-                                        .map_or(0, |index| index + 1)
-                                }
+                                    (row + 1).min(self.lines.len() - 1)
+                                };
+                                let (start, line) = &self.lines[target];
+                                let text = &self.buffer.text[*start..*start + line.len()];
+                                text.char_indices()
+                                    .nth(column)
+                                    .map_or(*start + text.len(), |(index, _)| *start + index)
                             } else {
-                                (end + 1).min(self.buffer.text.len())
-                            };
-                            self.buffer.text[target..]
-                                .split('\n')
-                                .next()
-                                .unwrap_or("")
-                                .char_indices()
-                                .nth(column)
-                                .map_or_else(
-                                    || {
-                                        target
-                                            + self.buffer.text[target..]
-                                                .split('\n')
-                                                .next()
-                                                .unwrap_or("")
-                                                .len()
-                                    },
-                                    |(index, _)| target + index,
-                                )
+                                let target = if key.key == "up" {
+                                    if start == 0 {
+                                        0
+                                    } else {
+                                        self.buffer.text[..start - 1]
+                                            .rfind('\n')
+                                            .map_or(0, |index| index + 1)
+                                    }
+                                } else {
+                                    (end + 1).min(self.buffer.text.len())
+                                };
+                                self.buffer.text[target..]
+                                    .split('\n')
+                                    .next()
+                                    .unwrap_or("")
+                                    .char_indices()
+                                    .nth(column)
+                                    .map_or_else(
+                                        || {
+                                            target
+                                                + self.buffer.text[target..]
+                                                    .split('\n')
+                                                    .next()
+                                                    .unwrap_or("")
+                                                    .len()
+                                        },
+                                        |(index, _)| target + index,
+                                    )
+                            }
                         }
                         _ => cursor,
                     };
@@ -324,7 +434,7 @@ impl CommitEditor {
                 "message-vertical-scroll"
             })
             .flex_shrink_0()
-            .bg(rgb(theme::INPUT))
+            .bg(rgb(self.background_color()))
             .cursor_pointer()
             .occlude()
             .when(horizontal, |bar| bar.h(px(12.)).w_full())
@@ -431,6 +541,16 @@ impl CommitEditor {
     }
 }
 
+impl Drop for CommitEditor {
+    fn drop(&mut self) {
+        if self.secret {
+            unsafe {
+                self.buffer.text.as_bytes_mut().fill(0);
+            }
+        }
+    }
+}
+
 impl EntityInputHandler for CommitEditor {
     fn text_for_range(
         &mut self,
@@ -439,6 +559,9 @@ impl EntityInputHandler for CommitEditor {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
+        if self.secret {
+            return None;
+        }
         let range = self.buffer.utf8_range(range);
         *actual = Some(self.buffer.utf16_range(range.clone()));
         Some(self.buffer.text[range].to_owned())
@@ -471,7 +594,7 @@ impl EntityInputHandler for CommitEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.enabled {
+        if self.editable() {
             self.buffer
                 .replace(range, &self.input_text(text), false, None);
             self.changed(cx);
@@ -485,7 +608,7 @@ impl EntityInputHandler for CommitEditor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.enabled {
+        if self.editable() {
             self.buffer
                 .replace(range, &self.input_text(text), true, selected);
             self.changed(cx);
@@ -522,36 +645,55 @@ impl EntityInputHandler for CommitEditor {
 
 impl Render for CommitEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let wrap = self.read_only && !self.single_line;
         let mut start = 0;
-        let lines: Vec<_> = self
-            .buffer
-            .text
-            .split('\n')
-            .map(|text| {
-                let run = TextRun {
-                    len: text.len(),
-                    font: font("Cascadia Mono"),
-                    color: rgb(theme::TEXT).into(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let line = window.text_system().shape_line(
-                    text.to_owned().into(),
-                    px(self.text_size),
-                    &[run],
-                    None,
-                );
-                let current = start;
-                start += text.len() + 1;
-                (current, line)
-            })
-            .collect();
-        let width = lines
-            .iter()
-            .map(|(_, line)| f32::from(line.width))
-            .fold(0., f32::max)
-            + 8.;
+        let wrap_width = if self.viewport.width > px(0.) {
+            f32::from(self.viewport.width) - 20.
+        } else {
+            560.
+        }
+        .max(1.);
+        let shape = |text: &str| {
+            let display = if self.secret {
+                masked_text(text)
+            } else {
+                text.to_owned()
+            };
+            let run = TextRun {
+                len: display.len(),
+                font: font("Cascadia Mono"),
+                color: rgb(theme::TEXT).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(display.into(), px(self.text_size), &[run], None)
+        };
+        let mut lines = Vec::new();
+        for text in self.buffer.text.split('\n') {
+            let line = shape(text);
+            if wrap {
+                for range in
+                    wrapped_ranges(text, wrap_width, |index| line.x_for_index(index).into())
+                {
+                    lines.push((start + range.start, shape(&text[range])));
+                }
+            } else {
+                lines.push((start, line));
+            }
+            start += text.len() + 1;
+        }
+        let width = if wrap {
+            (f32::from(self.viewport.width) - 12.).max(0.)
+        } else {
+            lines
+                .iter()
+                .map(|(_, line)| f32::from(line.width))
+                .fold(0., f32::max)
+                + 8.
+        };
         let height = lines.len() as f32 * 22.;
         let visible = if self.single_line {
             crate::scrolling::Visibility::default()
@@ -561,7 +703,7 @@ impl Render for CommitEditor {
                 self.viewport.height.into(),
                 width,
                 height,
-                true,
+                !self.read_only,
                 12.,
             )
         };
@@ -573,6 +715,10 @@ impl Render for CommitEditor {
             }
         }) {
             self.scroll_drag = None;
+        }
+        if wrap && self.scroll.offset().x != px(0.) {
+            self.scroll
+                .set_offset(point(px(0.), self.scroll.offset().y));
         }
         let selection = self.buffer.selection();
         let cursor = self.buffer.cursor;
@@ -586,8 +732,11 @@ impl Render for CommitEditor {
             .flex_1()
             .min_w_0()
             .overflow_scroll()
+            .when(wrap, |editor| {
+                editor.overflow_x_hidden().overflow_y_scroll()
+            })
             .track_scroll(&self.scroll)
-            .bg(rgb(theme::INPUT))
+            .bg(rgb(self.background_color()))
             .cursor(CursorStyle::IBeam)
             .on_key_down(cx.listener(Self::key))
             .on_mouse_down(
@@ -718,7 +867,7 @@ impl Render for CommitEditor {
                                     let viewport = this.scroll.bounds().size;
                                     let before = this.scroll.offset();
                                     let mut offset = before;
-                                    if viewport.width > px(0.) {
+                                    if !this.read_only && viewport.width > px(0.) {
                                         if caret.x < -offset.x {
                                             offset.x = -caret.x;
                                         } else if caret.x + px(3.) > -offset.x + viewport.width {
@@ -753,6 +902,7 @@ impl Render for CommitEditor {
             .flex_col()
             .w_full()
             .h(px(if self.single_line { 26. } else { 220. }))
+            .when(self.read_only, |editor| editor.h_full())
             .flex_shrink_0()
             .min_w_0()
             .min_h_0()
@@ -798,6 +948,69 @@ impl Render for CommitEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn password_mask_preserves_byte_offsets_and_mouse_indexes_stay_on_source_boundaries() {
+        for text in ["secret", "한글🙂password", ""] {
+            let mask = masked_text(text);
+            assert_eq!(mask.len(), text.len());
+            assert!(mask.chars().all(|c| c == '*'));
+            for index in 0..=mask.len() {
+                assert!(text.is_char_boundary(source_boundary(text, index)));
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn wrapping_preserves_unicode_source_offsets_empty_lines_and_long_words() {
+        for text in ["", "long/path/without/spaces", "한글🙂 오류  text", "a\t b"] {
+            for width in [0., 1., 3., 80.] {
+                let rows =
+                    wrapped_ranges(text, width, |index| text[..index].chars().count() as f32);
+                assert!(!rows.is_empty());
+                assert_eq!(
+                    rows.iter()
+                        .map(|range| &text[range.clone()])
+                        .collect::<String>(),
+                    text
+                );
+                for (index, range) in rows.iter().enumerate() {
+                    assert!(text.is_char_boundary(range.start) && text.is_char_boundary(range.end));
+                    assert!(text[range.clone()].chars().count() <= width.max(1.) as usize);
+                    if index > 0 {
+                        assert_eq!(rows[index - 1].end, range.start);
+                    }
+                }
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn read_only_mode_accepts_selection_and_copy_but_rejects_editing_keys() {
+        for key in [
+            "ctrl-c",
+            "ctrl-a",
+            "left",
+            "shift-right",
+            "shift-down",
+            "home",
+            "end",
+        ] {
+            assert!(read_only_key(&Keystroke::parse(key).unwrap()), "{key}");
+        }
+        for key in [
+            "ctrl-v",
+            "ctrl-x",
+            "backspace",
+            "delete",
+            "enter",
+            "tab",
+            "a",
+            "alt-v",
+        ] {
+            assert!(!read_only_key(&Keystroke::parse(key).unwrap()), "{key}");
+        }
+    }
     #[::core::prelude::v1::test]
     fn single_line_text_is_centered_without_moving_multiline_text() {
         assert_eq!(text_vertical_offset(true, 26.), 2.);

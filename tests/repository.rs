@@ -122,7 +122,8 @@ fn empty_repository_and_invalid_path() {
     let snapshot = git::load(dir.path(), None, None).unwrap();
     assert!(snapshot.stage[0].staged);
     let invalid = tempfile::tempdir().unwrap();
-    assert!(git::load(invalid.path(), None, None).is_err());
+    // 임시 폴더가 다른 저장소 내부에 있어도 존재하지 않는 경로는 항상 잘못된 입력이다.
+    assert!(git::load(&invalid.path().join("missing"), None, None).is_err());
 }
 
 #[test]
@@ -209,9 +210,19 @@ fn stash_reflog_packed_refs_and_missing_reference_refresh() {
     write(path, "file.txt", "base\n");
     commit(path, "기준");
     run(path, &["tag", "-a", "release", "-m", "릴리스"]);
+    let baseline: Vec<_> = git::load(path, None, None)
+        .unwrap()
+        .commits
+        .into_iter()
+        .map(|commit| commit.id)
+        .collect();
     for value in ["one\n", "two\n"] {
         write(path, "file.txt", value);
-        run(path, &["stash", "push", "-m", value.trim()]);
+        write(path, "new.txt", value);
+        run(
+            path,
+            &["stash", "push", "--include-untracked", "-m", value.trim()],
+        );
     }
     run(path, &["branch", "temporary"]);
     run(path, &["pack-refs", "--all"]);
@@ -224,7 +235,36 @@ fn stash_reflog_packed_refs_and_missing_reference_refresh() {
     assert_eq!(stash.len(), 2);
     assert!(stash[0].name.contains("stash@{0}") && stash[0].name.contains("two"));
     let snapshot = git::load(path, Some(&stash[0].revision), None).unwrap();
-    assert!(snapshot.commits.iter().any(|c| c.title.contains("two")));
+    assert_eq!(
+        snapshot
+            .commits
+            .iter()
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>(),
+        baseline
+    );
+    for reference in &stash {
+        let selected = git::load_commit(path, &reference.target).unwrap();
+        assert_eq!(selected.detail.id, reference.target);
+        assert!(selected.history.iter().any(|file| file.label == "file.txt"));
+        for suffix in ["", "^2", "^3"] {
+            let id = run(
+                path,
+                &["rev-parse", &format!("{}{suffix}", reference.target)],
+            );
+            assert!(!snapshot.commits.iter().any(|commit| commit.id == id));
+        }
+    }
+    // An ordinary tag still makes its target and ancestors part of the graph.
+    run(path, &["tag", "saved-stash", &stash[0].target]);
+    let tagged = git::load(path, None, None).unwrap();
+    assert!(
+        tagged
+            .commits
+            .iter()
+            .any(|commit| commit.id == stash[0].target)
+    );
+    run(path, &["tag", "-d", "saved-stash"]);
     run(path, &["branch", "-D", "temporary"]);
     let snapshot = git::load(
         path,
@@ -872,4 +912,20 @@ fn refresh_keeps_selected_commit_beyond_first_page_after_reference_creation() {
         && commit.branches.contains(&"added".to_owned())
         && commit.tags.contains(&"added".to_owned())));
     assert_eq!(snapshot.commit_detail.as_ref().unwrap().id, selected);
+}
+
+#[test]
+fn refreshing_selected_stash_keeps_normal_history_paged() {
+    let dir = imported_history(feather_git::paging::PAGE_SIZE + 3);
+    write(dir.path(), "new-stash-file.txt", "stash only\n");
+    run(
+        dir.path(),
+        &["stash", "push", "--include-untracked", "-m", "paged stash"],
+    );
+    let stash = run(dir.path(), &["rev-parse", "refs/stash"]);
+    let snapshot = git::load_for_refresh(dir.path(), Some(&stash)).unwrap();
+    assert_eq!(snapshot.commits.len(), feather_git::paging::PAGE_SIZE);
+    assert!(snapshot.has_more);
+    assert!(!snapshot.commits.iter().any(|commit| commit.id == stash));
+    assert_eq!(snapshot.commit_detail.as_ref().unwrap().id, stash);
 }

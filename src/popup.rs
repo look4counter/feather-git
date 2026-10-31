@@ -20,10 +20,15 @@ pub fn focus_next(inputs: &[FocusHandle], backwards: bool, window: &mut Window) 
     }
 }
 
+pub struct Body {
+    pub header: Option<Div>,
+    pub content: Div,
+}
+
 pub fn frame(
     title: &str,
     width: f32,
-    body: Div,
+    body: Body,
     footer: Option<AnyElement>,
     header_action: Option<AnyElement>,
     viewport_height: Pixels,
@@ -65,6 +70,9 @@ pub fn frame(
                 )
                 .when_some(header_action, |header, action| header.child(action)),
         )
+        .when_some(body.header, |card, header| {
+            card.child(div().flex_shrink_0().child(header))
+        })
         .child(
             div()
                 .id("popup-body")
@@ -72,7 +80,7 @@ pub fn frame(
                 .min_h_0()
                 .when(fixed_height.is_some(), |body| body.flex_1())
                 .overflow_y_scroll()
-                .child(body),
+                .child(body.content),
         )
         .when_some(footer, |card, footer| {
             card.child(

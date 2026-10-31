@@ -559,3 +559,270 @@ src/ui.rs에 미리보기 세대별 줄 선택을 보관한다. 구간 헤더의
 src/conflict.rs의 구간에 종료 원문 줄 번호를 저장하고 원문 줄 포함 여부를 제공한다. src/model.rs의 Diff가 표시 줄의 new 좌표로 현재 구간을 판정하며 좌표 없는 줄은 제외한다. src/git.rs의 합성 충돌 동작 행 삽입과 DiffLine의 해당 필드를 제거한다. src/ui.rs는 충돌 미리보기에서 상단 고정 도구 모음과 대상 구간/안내·세 버튼을 렌더링하며 클릭 직전 현재 커서를 재판정한다. 구간 밖에서는 실행하지 않는다. 원문 마커와 22px 가상 목록 및 5,000줄 제한은 그대로다. US97의 본문 동작 행 설계는 대체한다.
 
 파일 조회 결과 적용 시 DiffViewer가 포커스 중이면 첫 표시 줄의 초기 Selection을 만들어 재조회 이후 방향키를 계속 쓸 수 있게 한다. 오래된 세대 결과는 기존 가드로 버린다. 새 의존성·영속 데이터·외부 API는 없고 헌법은 미작성 템플릿이다. 한글 문서와 전체 워크플로우를 준수한다. 테스트는 단축키 범위/재지정과 실제 충돌의 표시 줄→구간 경계 매핑·부분 Stage/충돌 회귀를 사용한다.
+
+## 버튼 옆 단축키 안내 설계 (US99)
+
+기존 Rust·GPUI·Bindings를 사용한다. src/shortcut.rs의 hint는 대체 키를 구분하고 빈 키캡을 생략한다. 명령 ID 기반 버튼 안내를 src/ui.rs의 기존 실행·확인·취소·부분 Stage 버튼에 연결한다. 이벤트·포커스·비활성 조건은 보존한다. 새 의존성·저장 상태·외부 API는 없다. 헌법은 미작성 템플릿이며 한글 문서와 전체 절차를 준수한다.
+
+## 오류 표시와 열람 설계 (US100)
+
+기존 Rust·GPUI를 유지한다. src/error_history.rs에 출처별 오류 전이 관찰·순서 보관·페이지 경계를 두고 src/main.rs에 등록한다. src/ui.rs에서 변경 알림 시와 렌더링 시 오류를 수집하며 탭과 팝업별 출처를 구분한다. src/settings.rs의 오류는 읽기 접근자와 부모 관찰로 연결한다. 기존 3초 오류 상태를 제거하고 정상 상태 표시를 유지한다. 최상위 왼쪽 하단의 느낌표와 그 위의 스크롤 가능한 열람 카드로 다른 작업 팝업의 상태를 보존한다. 저장 상태와 외부 API는 없다. 헌법은 미작성 템플릿이므로 확정 원칙은 없고 한글 문서·전체 절차를 준수한다.
+
+## 오류 확인완료·최신 열기 설계 (US101)
+
+src/error_history.rs의 open을 마지막 인덱스로 변경하고 현재 항목 제거 후 페이지를 보정한다. observed는 유지해 같은 발생 상태의 재추가를 억제한다. src/ui.rs의 카드에 GPUI on_mouse_down_out을 연결하고 캡처 단계에서 바깥 입력을 소비한다. 확인완료 버튼과 확인 단축키는 같은 삭제 경로를 사용하고 Esc는 닫기만 수행한다. 빈 기록이면 창을 닫고 스크롤은 페이지 전환 때 초기화한다. 새 의존성·저장 상태는 없고 헌법은 미작성 템플릿이다.
+
+## 오른쪽 오류 표시·키 설정 설계 (US102)
+
+src/ui.rs에서 두 하단 도움말 링크를 제거하고 오류 overlay/card를 right 기준으로 배치한다. 하단은 오류가 있을 때만 오른쪽 공간을 확보하고 왼쪽 상태 문자열 여백을 복구한다. 아이콘은 14px/10px를 사용한다. 토글 경로를 클릭/F10이 공유하며 입력 캡처/진행 중에는 기존 보호를 유지한다. src/shortcut.rs에 공통 오류 기록 명령과 전역 충돌 범위를 등록하고 confirm의 두 번째 기본 슬롯을 비운다. 내부 확인 명령 변환은 유지한다. 새 저장 상태·의존성은 없고 헌법은 미작성 템플릿이다.
+
+## DiffViewer 범위·커서·버튼 설계 (US103)
+
+src/text_selection.rs에 범위 행 계산과 유효 행 집합 기반 커서 이동을 둔다. src/ui.rs에서 DiffLine의 old/new 좌표가 있는 행 목록을 사용하여 초기화·키보드·마우스/드래그·전체 선택을 제한한다. 범위 체크는 기존 세대/Stage 보호를 통과한 추가/삭제 행 집합만 기존 partial_selection에 반영하며 클릭 체크는 기존 한 줄 동작을 유지한다. 선택한 줄 Stage 버튼은 최소 220px와 줄바꿈 금지/축소 금지를 적용하고 바깥 도구 모음의 줄바꿈을 유지한다. 새 의존성·저장 상태는 없다. 헌법은 미작성 템플릿이다.
+
+## 하단 오류 순서·자동 너비 설계 (US104)
+
+src/ui.rs에서 오류 표시와 기록 카드 렌더링을 분리한다. 공통 error_indicator는 고정 너비 없이 느낌표/건수만 렌더링하고 두 하단 행에서 shortcuts_link 앞에 둔다. GPUI deferred를 사용해 하단의 실제 레이아웃을 유지하면서 기존 팝업보다 위에 표시한다. 카드만 기존 최상위 overlay를 사용하고 닫힌 상태의 빈 overlay와 160px 예약 여백을 제거한다. 새 상태/의존성은 없고 기존 명령·오류 모델은 유지한다. 헌법은 미작성 템플릿이다.
+
+## 오류 표시 왼쪽·배경 설계 (US105)
+
+src/ui.rs의 error_indicator는 px_2와 BG 배경을 사용한다. 두 하단 바에도 BG를 지정하여 공통 바탕을 유지한다. 저장소 하단은 오류 표시를 상태 문자열 앞에 두고 빈 탭은 오류와 오른쪽 링크 사이에 유연한 공간을 둔다. 카드 overlay는 왼쪽 16px와 left_0 기준으로 전환한다. 기존 deferred·내용 너비·이벤트는 유지한다. 새 상태/의존성은 없고 헌법은 미작성 템플릿이다.
+
+## 오류 발생 기록·복사 설계 (US106)
+
+src/error_history.rs에 오류 발생 시 report를 추가해 메시지를 기록하고 동일 출처의 관찰 기준도 함께 갱신한다. src/ui.rs의 새 오류 대입은 이 경로를 사용하고 렌더/notify 관찰은 중복을 추가하지 않는다. src/settings.rs는 오류 대입마다 발생 버전을 증가시키고 부모는 엔티티/버전으로 관찰한다. src/commit_editor.rs에 읽기 전용 모드를 두어 선택/복사/탐색만 허용하고 키/붙여넣기/IME 변경을 차단한다. 오류 창은 현재 페이지의 읽기 전용 편집기를 캐시하고 전체 복사 버튼/본문 포커스에 따른 Ctrl+C를 제공한다. 새 의존성/영속 데이터는 없으며 기존 정상 입력 편집기를 보존한다. 헌법은 미작성 템플릿이다.
+
+## US107 명시적 투명 배경 설계
+
+src/ui.rs의 error_indicator 기본 BG를 rgba(0x00000000)로 바꾸고 내부 느낌표 배경도 명시적으로 투명하게 한다. deferred는 유지하여 팝업 위에서도 접근하되 아래의 backdrop이 그대로 보이게 한다. DANGER_HOVER는 유지한다. 새 상태/의존성은 없고 헌법은 미작성 템플릿이다.
+
+## 오류 메시지 줄바꿈 설계 (US108)
+
+src/commit_editor.rs의 읽기 전용 모드에만 가용 너비/실측 글자 폭 기반 표시 행을 생성한다. 표시 행은 원문 바이트 시작 좌표를 보관하여 기존 선택/복사/히트 테스트를 유지한다. 세로 바 너비를 예약해 줄바꿈하고 가로 overflow와 가로 바/커서 가로 이동을 차단한다. 일반 편집기의 기존 레이아웃은 유지한다. 새 의존성/상태는 없고 헌법은 미작성 템플릿이다.
+
+## 오류 전달·Revert 파일 설계 (US109)
+
+src/error_history.rs에 기록을 추가하지 않고 출처 관찰 상태만 갱신하는 mirror를 둔다. src/ui.rs의 submit_branch 실패 결과는 refresh_after_branch에서 한 번 report하고 팝업은 mirror로 전달한다. 브랜치 확인의 is_held 이벤트를 차단한다. src/branches.rs의 revert_commit은 실패 후 기존 gix revert_state의 실제 충돌 목록을 진단에 추가하고 원래 오류를 보존한다. src/ui.rs의 Revert 배너 아래에는 현재 conflicts 경로를 최대 높이 목록으로 표시한다. 새 저장 상태/의존성은 없고 헌법은 미작성 템플릿이다.
+
+## 대괄호 영역 탭 이동 설계 (US110)
+
+src/shortcut.rs에 branch-tab-previous/next(scope branches), files-tab-previous/next(scope files)를 등록하고 파일 History 분류에도 노출한다. 기존 applies가 local-branches/stage-files를 포함한다. src/ui.rs는 탭 순환 계산과 참조/파일 전환 메서드를 분리해 키/클릭이 공유한다. 해당 목록 포커스와 Window focus를 유지하고 기존 파일 선택/차이 세대를 초기화한다. 새 상태/의존성/외부 API는 없고 헌법은 미작성 템플릿이다.
+
+## 체크박스 입력 소유권 설계 (US111)
+
+src/controls.rs에 체크박스 클릭의 마우스 여부/키 반복 정책을 둔다. src/ui.rs에서 수동 키 토글이 있는 다섯 클릭 핸들러(생성 두 체크박스는 한 핸들러)를 마우스 클릭으로 제한한다. 키 처리에서는 해당 체크박스가 포커스된 입력전환 반복만 소비해 상태 변경을 막는다. GPUI의 자동 keyup 클릭은 이 핸들러에서 변경을 만들지 않으며 기본/재지정 keydown은 기존 경로를 사용한다. 설정은 자동 keyup 한 경로이므로 변경하지 않는다. 새 상태/의존성은 없고 헌법은 미작성 템플릿이다.
+
+## 설정/프로젝트 탭과 원격 키 설계 (US112)
+
+src/shortcut.rs에서 기존 branch/files 이전/다음 명령을 공통 tab-previous/next(scope tabs)로 통합하여 목록/shortcuts-modal에서 공유하고 project-tabs 범위 Ctrl 대괄호 명령을 추가한다. shortcuts-modal은 공통 대화상자 범위와 충돌 검사에 포함하고 project-tabs는 일반 목록/뷰어/main/clone에 적용한다. 원격 작업은 기본 입력만 바꾸고 내부 target f/p/Shift+P는 유지한다. src/ui.rs에서 설정 탭 클릭/키와 프로젝트 클릭/키를 각각 공유 경로로 통합하고 기존 adjacent_tab을 재사용한다. 프로젝트 전환은 활성 탭 스크롤·조회·포커스/선택 정리·세션 저장을 수행한다. 새 영속 데이터/의존성은 없고 헌법은 미작성 템플릿이다.
+
+## 공유 단축키 통합 설계 (US113)
+
+src/shortcut.rs에서 files-all을 공통 selection 범위(파일/뷰어), branch-checkout을 공통 checkout-action 범위(브랜치/히스토리)로 확장하고 viewer-all/history-checkout 중복 명령을 제거한다. slots는 기준 ID 우선/이전 ID 보완 승계를 제공한다. 공통화된 체크아웃은 브랜치 우선순위 예외 대신 일반 충돌 검사를 따른다. subsections/in_subsection은 브랜치 공통/Local/Remote와 파일목록 공통/Stage로 중복 없이 분류한다. src/ui.rs의 공유 섹션 제목에 적용 대상을 표시한다. 기존 target과 키 실행 분기는 유지하고 새 영속 모델/의존성은 없다. 헌법은 미작성 템플릿이다.
+## 공통 섹션 명칭 설계 (US114)
+
+src/ui.rs의 제목 생성에서 적용 대상 접미사 매핑을 제거하고 기존 subsection을 그대로 사용한다. 도움말의 그룹 경로와 명령 분류·설정 저장은 유지한다. US113의 적용 대상 제목 설계를 대체한다. 새 모델이나 의존성은 없다.
+
+## 해제 버튼 높이 설계 (US115)
+
+src/ui.rs의 단축키 지정/해제 버튼 높이를 기존 배지 20px와 상하 패딩 16px에 해당하는 36px로 명시한다. 해제 버튼은 세로 패딩을 제거하고 flex 가운데 정렬해 기본 글줄 높이에 따른 팽창을 방지한다. 공용 button과 다른 화면은 수정하지 않는다.
+
+## 기본값 복원 단축키 설계 (US116)
+
+src/shortcut.rs에 공통 shortcuts-reset 명령을 shortcuts-modal 범위, ctrl-d 기본/target으로 등록한다. 기존 충돌·두 슬롯·저장을 재사용한다. src/ui.rs에 초안 초기화 메서드를 추출해 버튼과 키가 공유하며 기존 캡처 분기를 우선한다. 버튼에 button_hint를 표시한다. 신규 데이터 구조나 의존성은 없다.
+
+## 기본값 복원 배경 설계 (US117)
+
+src/ui.rs의 reset-shortcuts 버튼에 기존 BUTTON 회색을 지정하고 BUTTON_HOVER를 적용한다. 공용 버튼과 다른 화면은 변경하지 않으며 신규 모델·의존성은 없다.
+
+## 중복 호버 오류 수정 설계 (US118)
+
+공용 button은 이미 hover를 등록하므로 src/ui.rs의 reset-shortcuts 호출부에서 추가 hover를 제거한다. BUTTON 배경은 유지한다. US117의 별도 BUTTON_HOVER 적용 설계를 대체한다. 공용 버튼이나 의존성은 변경하지 않는다.
+
+## 단축키 설정 탭 고정 설계 (US119)
+
+src/popup.rs에 Body 구조체로 선택적 고정 헤더와 스크롤 콘텐츠를 전달한다. frame은 제목 아래·popup-body 스크롤 위에 flex_shrink_0 헤더를 배치한다. src/ui.rs에서 탭 생성 메서드를 분리해 설정 팝업에만 헤더를 전달하고 shortcuts_table에는 목록/메시지만 둔다. 기존 고정 높이·본문 flex/min_h·하단 버튼을 유지한다. 다른 팝업은 헤더 None으로 기존 동작을 유지하며 신규 의존성/영속 데이터는 없다.
+
+## 세팅 재구성과 내부 탭 방향키 설계 (US120)
+
+src/settings.rs의 SettingsTab/use_global/preferred_global/체크 포커스를 제거한다. 한 본문에 작성자·remote_info·인증 메서드를 결합한다. 세 버튼용 FocusHandle 배열을 두고 Tab 순환과 수동 Enter/Space 처리·마우스 전용 클릭을 적용한다. 불러오기는 GitContext에서 최신 전역 identity를 읽어 draft만 갱신한다. 저장은 명시적 global bool을 받고 진행/IME/오류 처리를 공유한다. 전역 저장 후 snapshot만 갱신해 편집값을 유지한다. 저장소 저장은 repository 존재 시만 가능하다. src/ui.rs는 새 생성자 및 키 활성화 경로를 사용하고 옛 체크 선호값을 읽거나 갱신하지 않는다. 세션의 기존 직렬화 필드는 호환 목적으로 유지한다.
+
+src/settings_git.rs의 global 저장이 local 값을 지우지 않도록 수정하고 저장 대상 scope의 identity를 검증한다. SettingsSnapshot의 체크박스용 use_global은 제거한다. rollback은 저장 대상 범위만 복구한다. 임시 저장소와 격리한 전역 파일 테스트로 상호 보존·불러오기 읽기 전용·잘못된 입력/잠금 오류를 검증한다.
+
+src/shortcut.rs에서 tab-previous/next 기본값만 left/right로 변경하고 내부 target [/]는 유지한다. nav-left/right는 horizontal-navigation scope로 분리해 내부 탭 영역에서는 적용하지 않고 main/history/viewer/reset/upstream에서 유지한다. 공통 scope 충돌·두 슬롯과 기존 재지정은 유지한다. popup의 고정 탭 구조는 유지한다. 새 의존성은 없다.
+
+## 공통 방향으로 내부 탭 전환 설계 (US121)
+
+src/shortcut.rs에서 tab-previous/next 정의와 tabs scope를 제거하고 horizontal-navigation 범위를 branches/local-branches/files/stage-files/shortcuts-modal로 확장한다. nav-left/right는 내부 탭과 동일한 충돌 정책을 따른다. 기존 별도 내부 탭 override는 참조하지 않는다. src/ui.rs의 분류/패널 탭 전환은 해석된 left/right target을 사용하고 기존 순환·고정 헤더·캡처 우선을 유지한다. 프로젝트 명령은 별도로 유지하고 1번 기본값 Ctrl+left/right·2번 Ctrl+j/l, 기존 내부 target Ctrl+[/]를 사용한다. 기존 프로젝트 override는 보존한다. 새 모델·의존성은 없다.
+
+## 전역 작성자 체크 설계 (US122)
+
+src/settings.rs에 use_global/local_draft와 체크/저장용 두 포커스를 둔다. snapshot에서 override 유무를 읽어 초기 체크를 정하고 체크 전환은 draft를 보존해 global/local을 표시한다. 세 버튼을 체크박스와 저장으로 대체하고 기존 수동 keydown/마우스 전용 클릭 보호를 재사용한다. 저장은 전역 사용이면 새 GitContext::use_global_identity, 아니면 기존 local save_identity를 사용한다. src/settings_git.rs의 새 메서드는 global을 읽고 local 두 키만 제거하며 실패 시 local 값을 복구한다. snapshot에 use_global 상태를 다시 제공하지만 옛 세션 선호는 사용하지 않는다.
+
+src/commit_editor.rs에 읽기 전용 전환 메서드를 제공한다. 기존 read_only 입력 보호를 재사용하되 자동 줄바꿈/가로 스크롤 금지는 여러 줄 읽기 전용에서만 적용해 단일행 이름/이메일의 레이아웃과 복사를 유지한다. 새 의존성은 없다.
+
+## 세팅 하단 저장 설계 (US123)
+
+src/settings.rs의 작성자 저장 렌더링을 공개 save_button 메서드로 분리해 같은 포커스/가드/마우스 전용 클릭을 유지하고 현재 확인 키 안내를 받는다. focus_next 순서에서 저장을 인증 URL 다음에 배치한다. src/ui.rs의 세팅 분기에서 header_action을 제거하고 settings.update로 생성한 버튼을 공용 popup footer에 전달한다. 저장/닫기 및 backend는 변경하지 않고 새 의존성은 없다.
+
+## 저장 강조 색상 설계 (US124)
+
+src/settings.rs의 save_button에 SELECT 배경·ACCENT 글자색을 적용한다. 기존 action의 단일 hover를 유지하고 포커스 때 테두리를 표시해 강조 배경과 구분한다. 신규 의존성/동작 변경은 없다.
+
+## 전역 작성자 안내 제거 설계 (US125)
+
+src/settings.rs의 identity_section에서 해당 안내를 담은 child를 제거한다. 나머지 체크·저장·입력 및 레이아웃은 유지한다. 신규 의존성/상태는 없다.
+
+## 세팅 섹션 제목 스타일 설계 (US126)
+
+단축키 섹션 제목은 상속 text_sm·ACCENT·SEMIBOLD를 사용한다. src/settings.rs의 세 제목에도 같은 스타일을 적용한다. 레이아웃·기능과 기존 글꼴 가족 상속은 유지하며 새 의존성은 없다.
+
+## git2 실행 백엔드 설계 (US127)
+
+Cargo.toml/Cargo.lock에 git2 0.21.0을 추가한다. src의 공유 라이브러리 백엔드에 repository/config/index/ref/remote/통합 API를 제공하고 기존 제품 호출부를 교체한다. 기존 문자열 기반 경계가 필요한 곳은 인프로세스 요청 어댑터를 사용하되 임의 셸이나 Git fallback은 제공하지 않는다. gix 객체 조회와 UI 모델은 유지하고 쓰기 후 기존 refresh 경로로 갱신한다.
+
+src/setup.rs의 생성/원격/커밋/index/폐기, src/branches.rs의 참조·체크아웃·안전 삭제·통합 제어, src/settings_git.rs의 config, src/partial_stage.rs의 속성 검사/index 쓰기, src/stash_recovery.rs의 stash/index/worktree 작업을 전환한다. credentials.rs는 helper 실행을 직접 수행하고 원격 콜백은 저장된 자격 증명/SSH agent를 사용한다. 충돌 상태 파일·작업 중 세션·abort 시 보존 정책은 기존 조회 모델과 맞춘다. unknown/비호환 작업은 변경 전 거부한다.
+
+기존 테스트의 외부 Git은 픽스처/정답 생성용으로 분리하고 제품 함수는 실제 git2를 호출하게 한다. 임시 저장소·로컬 bare remote·격리 global 파일로 동작을 비교하며 실제 계정 인증은 자동 검증하지 않는다. 헌법은 미작성 템플릿이다.
+
+### US127 확정 라이브러리 역할
+
+기본 조회·config 파싱/쓰기·ref transaction·객체/index/커밋은 gix 기반 공유 모듈에서 처리한다. git2는 clone/fetch/push/인증 콜백과 체크아웃/restore/reset·Merge/Rebase/Revert·Stash 복합 흐름에서 사용한다. 기존 문자열 요청 경계를 받는 어댑터는 운영체제 명령이 아닌 인프로세스 dispatcher이며 지원 요청만 처리하고 외부 Git fallback을 제공하지 않는다.
+
+### US127 구현 파일과 추가 보호
+
+src/native_git.rs는 고정된 인프로세스 요청 dispatcher, native_local.rs는 gix config/index/commit(서명 포함), native_refs.rs는 gix ref/설정 기반 upstream, native_remote.rs는 git2 원격/인증 콜백, native_operations.rs는 git2 체크아웃/통합/Stash를 담당한다. 읽기 전 index lock과 부분 Stage 이전 ID 비교를 사용한다. split-index는 gix로 원자적으로 펼치고 복구 백업은 gix 전체 index로 보완한다. Windows 테스트는 프로젝트 내부 임시 디렉터리를 사용한다. 통합 테스트의 잘못된 경로 fixture는 상위 저장소 유무와 무관하도록 존재하지 않는 경로를 명시한다.
+
+Windows의 gix 시스템 설정 위치 탐색도 Git 실행을 유발할 수 있어 config/attributes의 git_binary와 자동 system 탐색을 비활성화했다. 알려진 시스템 설정 및 GIT_CONFIG_SYSTEM 파일은 직접 읽어 gix 설정 앞에 병합하고 user/local/환경 설정의 우선순위를 유지한다. 생성/조회/쓰기 모두 이 옵션을 공유한다.
+
+## US128 전체 스테이징 상태 복구 계획
+
+상태 조회와 쓰기 저장소를 같은 시스템 설정 병합 함수로 열되 조회는 필터 신뢰 함수를 계속 차단한다. src/native_local.rs에 공통 열기 함수를 제공하고 src/git.rs가 사용한다. src/setup.rs에서 별도 자식 테스트 프로세스로 시스템 설정 환경을 격리하여 CRLF 신규/수정 파일 및 로컬 재정의를 검증한다. 설정 파일이나 실제 사용자 인덱스는 테스트로 변경하지 않는다.
+
+## US129 스태시 추가 팝업 계획
+
+src/ui.rs의 stash_dialog 표시 분기만 수정한다. 추가 제목을 바꾸고 MUTED 스타일의 입력 라벨을 editor 앞에 배치한다. 설명은 삭제 팝업에서만 표시하며 추가 취소 버튼을 제거한다. 확인·오류·busy 및 외부 클릭/단축키 닫기 로직을 유지한다. 표시 변경이므로 구현을 반복하는 테스트는 추가하지 않고 포맷·컴파일과 코드 검토로 검증한다.
+
+## US130 일반 그래프 스태시 제외 계획
+
+src/git.rs에서 tips 구성 시 RefTab::Stash만 제외한다. 목록은 유지하고 HEAD와 일반 브랜치·태그 도달성은 보존한다. src/ui.rs의 select_reference는 스태시를 직접 select_commit한 뒤 그래프 탐색 대상을 해제하고 반환한다. tests/repository.rs의 스태시 회귀를 신규 파일·두 스태시 및 공유 도달성 검증으로 갱신한다. 페이징 자체 구현은 변경하지 않는다.
+
+US130 보완: 선택한 스태시를 유지한 새로고침도 src/git.rs에서 일반 그래프의 추가 페이지 탐색 대상에서 제외하고 다중 페이지 회귀를 검증한다.
+
+## US131 읽기 전용 입력 배경 계획
+
+src/commit_editor.rs의 입력 영역과 스크롤바 배경을 read_only 상태에 따라 theme::BG 또는 theme::INPUT으로 지정한다. 기존 연한 회색 테마를 사용하여 색을 새로 추가하지 않는다. 이벤트·선택·복사 처리는 유지한다. 표시 변경이므로 별도 동작 테스트를 추가하지 않고 포맷·컴파일 및 두 배경 경로를 검토한다.
+
+## US132 입력 패딩 배경 계획
+
+src/commit_editor.rs에서 상태별 배경색을 공개 메서드로 공유한다. 기존 입력과 스크롤바가 이를 사용하고 src/settings.rs의 field 래퍼도 editor 상태를 읽어 같은 배경을 테두리 안쪽 전체에 적용한다. field 호출에는 읽기 컨텍스트를 전달한다. 입력 및 포커스 동작은 유지하고 포맷·컴파일로 검증한다.
+
+## US133 저장 버튼 포커스 제외 계획
+
+src/settings.rs의 identity_focus를 체크박스 전용 단일 핸들로 변경한다. 저장 버튼의 track_focus·포커스 테두리·클릭 focus·Tab 대상을 제거한다. activate_focused는 체크박스만 처리한다. src/ui.rs의 save_button 호출에서 window 인자를 제거한다. 클릭·확인 단축키와 저장 조건을 보존하고 포맷·cargo check --offline으로 검증한다. 헌법은 미작성 템플릿이며 신규 의존성은 없다.
+
+## US134 원격 추가 계획
+
+src/native_local.rs의 설정 잠금·원자 교체를 공통 편집 함수로 추출하고 원격 추가에서 URL·fetch를 한 번에 기록한다. 중복은 유효 설정과 잠금 이후 로컬 설정에서 검사한다. src/native_git.rs가 원격 추가 함수를 재노출하고 src/settings_git.rs는 원격 추가 진입과 격리 회귀를 제공한다. src/settings.rs가 추가 핸들·두 입력·팝업 상태를 보유하며 기존 세팅 카드 내부를 추가 팝업 내용으로 전환한다. src/ui.rs는 제목·닫기·키 처리에 하위 팝업을 연결한다. 성공 후 remote_info만 갱신해 작성자 초안을 보존한다. 기존 원격 상세를 이름·URL 목록으로 교체한다. 신규 의존성·외부 Git·네트워크는 없다. 미작성 헌법은 추가 제약을 부여하지 않는다.
+
+## US135 세팅 유지 계획
+
+src/settings.rs는 원격 제목·목록 뒤에 별도 버튼 줄을 추가한다. SettingsPanel 본문은 항상 세팅을 렌더하고 추가 팝업 본문은 별도 메서드로 분리한다. src/ui.rs는 세팅 제목과 너비를 고정하고 기존 세팅 overlay 다음에 추가 팝업 overlay를 렌더한다. popup::frame으로 클릭 전파를 차단하고 최상위 backdrop은 close_remote만 호출한다. 기존 Esc·Tab·Space·저장 입력은 하위 팝업 상태로 제한한다. 오류·진행 표시는 위 팝업에만 표시한다. 새 의존성·데이터 변경은 없으며 미작성 헌법의 제약은 없다. 표시 변경은 포맷·컴파일과 경로 검토로 검증한다.
+
+## US136 입력 테두리 보완 계획
+
+src/settings.rs의 remote_popup 본문에 하단 여백을 추가하여 마지막 입력 테두리가 overflow_y_scroll 경계에 닿지 않게 한다. 두 field 래퍼는 flex_shrink_0으로 자연 높이를 유지한다. 공용 팝업과 다른 입력 스타일은 변경하지 않는다. 기존 GPUI 스타일만 사용하고 포맷·컴파일과 경로 검토로 검증한다. 헌법은 미작성 템플릿이다.
+
+## US137 원격 삭제 계획
+
+src/native_refs.rs의 원격 요청 분기에 remove를 추가하고 git2의 remote_delete로 표준 원격 삭제를 인프로세스로 수행한다. src/settings_git.rs는 삭제 메서드와 격리 회귀를 제공한다. src/settings.rs의 원격별 행 묶음에 삭제 아이콘을 하나씩 배치하고 비동기 삭제 후 remote_info만 갱신한다. 작업 상태와 팝업 표시 상태로 실행을 제한한다. 기존 아이콘 문자와 공용 버튼 스타일을 사용하며 네트워크·외부 Git·신규 의존성은 없다. 미작성 헌법은 제약이 없다.
+
+### US137 빈 원격 섹션 보완
+
+git2 삭제 후 빈 원격 섹션이 남을 수 있으므로 src/native_refs.rs는 값 없는 섹션을 목록에서 제외한다. src/native_local.rs의 중복 검사도 빈 섹션을 무시하여 같은 이름으로 재등록할 수 있게 한다. Windows의 git2 테스트는 프로젝트 내부 임시 디렉터리에서 실행한다.
+
+## US138 삭제 버튼 포커스 계획
+
+src/settings.rs에 원격 이름별 FocusHandle 맵을 두고 스냅샷 갱신 시 기존 핸들을 유지·추가·제거한다. Tab 배열에 목록 순서대로 삭제 핸들을 넣고 버튼 track_focus·포커스 스타일·마우스 포커스를 연결한다. 포커스 실행은 Space에서만 삭제하도록 src/ui.rs에서 실행 종류를 전달한다. 반복 키 판정은 삭제 핸들도 포함한다. 성공 후 기존 추가 버튼 복귀 플래그를 사용하고 실패 시 핸들을 보존한다. 기존 GPUI 기반을 재사용하며 신규 의존성·데이터 변경은 없다. 헌법은 미작성 템플릿이다.
+
+## US139 Fetch 오류 진단 계획
+
+src/native_remote.rs에서 전송 오류를 원격 이름·git2 오류 class/code·원문 진단으로 구성한다. URL은 사용자 정보·쿼리·프래그먼트를 제거하고 해당 비밀값도 진단에서 가린다. Fetch의 원격 조회/전송 실패에 같은 진단 경계를 적용한다. 외부 네트워크 없이 합성 오류와 존재하지 않는 로컬 원격을 이용해 전달 경로를 검증한다. 기존 setup Fetch 로컬 회귀로 성공 경로를 확인한다. 신규 의존성이나 인증/인증서 정책 변경은 없다. 헌법은 미작성 템플릿이다.
+
+### US139 HTTPS 기능 활성화
+
+Cargo.toml의 git2 의존성에 https 기능을 명시하고 Cargo.lock을 갱신한다. native_remote 진단 회귀에 git2::Version::get().https() 검증을 추가한다. 로컬 원격 실패 회귀는 file URL을 사용하고 기존 Fetch 회귀는 프로젝트 내부 임시 디렉터리에서 실행하여 Windows 환경 경계를 격리한다. 이번 변경은 HTTPS만 활성화하며 SSH 의존성을 새로 추가하지 않는다.
+
+## US140 인증 목록 구현 계획
+
+src/auth_profiles.rs를 공용 라이브러리에 공개한다. 앱 데이터의 auth.json에는 id·정규화 HTTPS URL·username·방식만 저장하고 프로세스 파일 잠금/원자 교체를 사용한다. Windows Credential API의 앱 네임스페이스에 직접/OAuth 비밀을 저장하고 메타데이터 쓰기 실패 시 롤백한다. 저장소 경로별 최장 일치와 username 조건으로 전송 인증을 선택한다. native_remote는 직접 비밀 또는 등록된 GCM 계정 힌트를 기존 콜백에서 사용한다.
+
+src/credentials.rs는 기존 GCM을 재사용하되 계정 선택을 지원한다. src/oauth.rs는 reqwest blocking HTTPS로 GitHub Device Flow 요청·poll·slow_down·만료·취소와 계정 조회를 구현한다. GitHub 고정 endpoint와 검증된 브라우저 URL만 연다. GCM은 공유 인증을 변경하지 않고 읽기/브라우저 로그인하며 앱 삭제는 해당 메타데이터만 지운다.
+
+src/settings.rs는 인증 목록·이름별 포커스·추가 팝업 상태·방식/브라우저 선택·동적 입력·비동기 실행·취소를 보유한다. src/ui.rs는 상위 팝업 렌더·닫기·기존 확인 라우팅에 연결한다. CommitEditor에 비밀 모드를 추가하고 byte 길이 보존 마스크와 UTF-8 경계 보정·클립보드/IME 원문 읽기 차단·비밀 지우기를 적용한다. 기존 비밀 아닌 입력은 유지한다.
+
+Cargo.toml은 Windows Credentials API와 reqwest blocking/json/rustls 기능을 추가한다. 가짜 보안 저장소와 HTTP 전송 추상화로 비밀을 쓰거나 실제 OAuth 계정 없이 회귀를 검증한다. 헌법은 미작성 템플릿이다. 실제 브라우저 로그인·사용자 계정·보안 저장소 조작은 자동 검증하지 않는다.
+
+### US140 인증 UI 분리
+
+인증 목록·작업·팝업은 src/auth_settings.rs의 AuthPanel 엔티티로 분리한다. SettingsPanel은 관찰과 키/닫기/최상위 팝업 라우팅을 위임하며 작성자·원격 입력과 수명을 분리한다. 공용 resolve 함수는 가짜 보안 저장소로 실제 전송 인증 선택 경로를 검증한다.
+
+## US141 기존 인증 조회와 버튼 보완 계획
+
+src/auth_settings.rs의 button은 빈 라벨 child를 만들지 않고 인증 목록 로드에서 auth_profiles::load_with_existing을 사용한다. src/auth_profiles.rs는 CredEnumerateW의 git:* 메타데이터에서 TargetName·UserName만 읽고 CredentialBlob에는 접근하지 않는다. URL 자격 증명·쿼리/프래그먼트는 제거하고 HTTPS만 정규화한다. 기존 AuthProfile에 serde 기본값 imported·hidden을 추가해 과거 파일을 유지한다. 대상과 계정의 안정적인 id로 병합하며 직접 등록과 같은 URL/계정이면 직접 등록을 우선 표시한다. 자동 가져온 항목은 전송 계정 강제 선택에서 제외하고 기존 GCM 흐름을 유지한다. 삭제 시 hidden tombstone으로 재등장을 막고 공유 비밀은 유지한다. 조회/저장 실패는 기존 앱 목록과 경고를 반환한다. 가짜 메타데이터 입력으로 회귀를 검증한다. 새 의존성·헌법 제약은 없다.
+
+## US142 인증 표시 필터 계획
+
+src/auth_profiles.rs에 현재 원격 URL 배열에 대해 정확 주소부터 호스트까지 부모 범위를 탐색하고 처음 일치하는 범위의 활성 프로필을 반환하는 순수 함수를 추가한다. 표시 함수는 imported도 포함하며 전송의 select는 변경하지 않는다. 원격 URL의 사용자 정보는 비교용으로 제거하고 .git/끝 슬래시를 정규화한다. URL segment 경계로 부모를 계산한다.
+
+AuthPanel은 전체 활성 인증과 표시용 인증 및 원격 URL 배열을 분리한다. 모든 로드/등록/삭제 결과에서 표시 목록과 핸들을 재계산한다. SettingsPanel은 최초 스냅샷과 원격 갱신 후 가져오기/푸시 URL을 AuthPanel에 전달한다. 빈 목록은 원격 없음/일치 인증 없음으로 구분한다. 인증 저장은 전역 그대로 유지한다. 신규 의존성·영속 데이터·헌법 제약은 없다.
+
+## US143 삭제 로그아웃 계획
+
+credentials::logout을 제품 코드에서 사용하고 LoginTarget::for_account로 protocol/host/path/username을 포함한 GCM erase를 호출한다. auth_profiles에 목록 파일 잠금 안에서 GCM 제거 콜백을 먼저 실행하는 remove_after_logout 경계를 추가한다. GCM 실패는 메타데이터를 쓰기 전에 반환하며 성공 후 메타데이터 실패는 부분 성공으로 명확히 보고한다. 실제 로그아웃한 imported 항목은 hidden 표식을 남기지 않는다. AuthPanel 삭제는 프로필 방식에 따라 직접 비밀 제거 또는 GCM 제거+등록 제거를 선택하고 목록을 다시 필터링한다. 가짜 runner/보안 저장소와 임시 파일로 검증하며 실제 사용자 계정 로그아웃은 테스트하지 않는다. 새 의존성·헌법 제약은 없다.
+
+## US144 오류 키 배지 계획
+
+src/ui.rs의 error_indicator에서 Bindings::label("errors")를 읽고 오류 개수 다음에 shortcut::keys 배지를 추가한다. 여러 바인딩은 구분하여 개별 배지를 생성하고 비어 있는 슬롯은 생략한다. 두 하단 영역이 같은 함수를 사용하므로 기존 조건·클릭·이벤트 처리를 유지한다. 표시 변경은 경로 검토·포맷·컴파일·기존 단축키 회귀로 검증한다. 신규 의존성·데이터·헌법 제약은 없다.
+
+## US145 오류 표시와 키 변경 계획
+
+src/ui.rs의 두 하단에서 error_indicator의 deferred/priority 래퍼를 제거하여 팝업 backdrop 아래에 일반 자식으로 렌더한다. src/shortcut.rs의 errors target/default를 f1로 변경하고 ui.rs의 전역 오류 키 디스패치도 f1을 확인한다. 배지는 기존 label 조회로 자동 갱신한다. 회귀는 F1 전역·기본 F10 미해결·alt-z 재지정·충돌 보호를 검증한다. 기존 사용자 바인딩 파일은 변경하지 않는다. 신규 의존성·데이터·헌법 제약은 없다.
+
+## US146 GCM 실제 제거 검증 계획
+
+auth_profiles에 기존 Windows 메타데이터 열거/정확 target 제거를 추상화한 ExistingCredentialStore를 추가한다. 프로필 URL·계정 또는 imported id로 선택 대상을 찾고 CredDeleteW로 지운 뒤 다시 열거해 잔존하면 실패한다. 기존 메타데이터 normalizer를 재사용하고 CredentialBlob은 접근하지 않는다. credentials에 GCM erase와 검증된 Windows 제거를 결합하는 logout_profile 경계를 추가한다. GCM 없어도 정확한 Windows 대상 제거가 확인되면 성공하며 둘 다 증거가 없으면 오류다. AuthPanel은 잠금 콜백에서 이 경계를 사용하여 실제 제거 후에만 앱 목록을 변경한다. 가짜 저장소/runner로 검증하고 실제 사용자 계정은 테스트에서 제거하지 않는다. 새 의존성·헌법 제약은 없다.
+
+## US147 경로와 GCM 조회 계획
+
+auth_profiles::normalize_url은 검증과 표준 URL 직렬화만 하고 .git/경로 구성요소를 삭제하지 않는다. 등록·중복·표시·전송 선택은 URL 파싱 기준으로 비교하여 root 표준형과 경계만 처리하고 .git 없는 구주소에 대한 예외는 추가하지 않는다. ResolvedAuth::Gcm에 실제 등록 url을 포함한다.
+
+native_remote::callbacks는 프로젝트 경로를 소유해 GCM 명령의 current_dir에 전달한다. 선택된 GCM 프로필의 URL로 요청하고 원격 기본 조회는 실제 원격 URL 그대로 사용한다. credential_request는 HTTPS host/port/path/username을 안전하게 구성한다. Clone은 대상 부모 문맥을 넘긴다. helper 명령 생성과 요청은 순수 검증 가능한 경계로 분리한다.
+
+Fetch 진단 formatter를 전송 공통 formatter로 확장해 Push 원인과 서버 callback의 거부 이유를 보존한다. 비밀 가림과 기존 안전한 Push/lease 정책은 유지한다. 실제 D:/Project/zit·사용자 인증 파일은 수정하지 않는다. 경로/문맥과 서버 오류 회귀는 가짜 요청·임시 저장소로 검증한다. 새 의존성·헌법 제약은 없다.
+
+### US147 로컬 전송 회귀 환경
+
+src/setup.rs의 configured_repository 테스트 fixture는 프로젝트 내부 임시 디렉터리를 사용한다. Windows 진단 환경에서 기본 OS 임시 디렉터리에 대한 libgit2 접근이 거부되어 로컬 clone 회귀가 실패했으므로 테스트 경계를 작업 공간으로 한정했다. 실제 프로젝트 경로나 인증 정책의 예외는 추가하지 않았다.
+
+## US148 추가 방식 정리 계획
+
+src/auth_settings.rs의 최상위 방식/핸들 배열을 BrowserGcm·Password 두 항목으로 바꾸고 기본을 BrowserGcm으로 설정한다. 별도 GCM 버튼/설명을 제거하고 GCM 등록은 대화식 authenticate로만 실행한다. 내부 AuthMethod::Gcm은 자동 조회/기존 프로필/전송/삭제에 필요하므로 유지한다. 표시 변경은 경로 검토·포맷·컴파일·Clippy·기존 인증 회귀로 검증한다. 신규 의존성·영속 데이터·헌법 제약은 없다.
+
+US148 입력 보완: 브라우저 GCM의 username field와 Tab 대상을 제거하고 LoginTarget에 수동 계정 힌트를 주지 않는다. username은 Password 방식에서만 읽는다. 독립 OAuth는 기존 Client ID만 사용한다.
+
+
+
+## US149 독립 OAuth 제거 계획
+
+src/auth_settings.rs의 하위 선택·Client ID·기기 코드·OAuth 비동기 등록과 토큰 안내를 제거한다. 브라우저 GCM URL 로그인과 Password 등록을 유지한다. src/main.rs의 모듈 선언·src/oauth.rs·Cargo.toml의 전용 reqwest 의존성을 제거하고 Cargo.lock을 갱신한다. auth_profiles의 기존 BrowserOAuth 저장·전송·삭제는 유지한다. 새 의존성이나 데이터 변환은 없다. 헌법은 미작성 템플릿으로 추가 제약이 없다.
+
+
+## US150 구현 계획
+
+src/file_manager.rs에서 플랫폼별 프로그램과 단일 경로 인수를 구성하고 실행한다. Windows는 숨겨진 프로세스로 실행해 콘솔 창을 방지한다. 프로세스 대기는 백그라운드에서 처리한다. src/ui.rs는 활성 프로젝트 경로를 캡처하고 버튼과 키가 같은 메서드를 호출하며 실패를 오류 기록으로 전달한다. src/shortcut.rs에 공통 explorer/f10 명령을 등록한다. 프로젝트 footer에서만 단축키 왼쪽에 표시한다. 새 의존성은 없고 헌법 템플릿에 추가 제약은 없다.
+
+
+## US151 구현 계획
+
+src/terminal.rs에서 실행 파일 탐색과 플랫폼별 Command 구성을 분리한다. Windows는 PATH 및 Git 실행 파일 주변·Program Files·LocalAppData의 Git Bash를 탐색하고 --cd= 인수로 프로젝트 경로를 전달한다. Linux는 x-terminal-emulator·gnome-terminal·konsole·xfce4-terminal·xterm 중 설치된 도구를 사용하고 Bash에 고정 스크립트와 별도 위치 인수로 프로젝트 경로를 전달한다. macOS는 고정 AppleScript에 경로/Bash를 argv로 전달하고 quoted form으로 Terminal 명령을 구성한다. 프로세스 실행과 대기는 백그라운드에서 수행하고 실패는 오류 기록에 전달한다. src/ui.rs의 footer와 key 처리에 연결하고 src/shortcut.rs의 공통 terminal/f9 등록으로 재설정을 지원한다. 신규 의존성·영속 데이터·헌법 제약은 없다.

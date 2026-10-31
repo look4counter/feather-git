@@ -1,4 +1,4 @@
-use crate::{git, model::StashRestoreState};
+use crate::{git, model::StashRestoreState, native_git::Command};
 use anyhow::{Context, Result, bail};
 use gix::bstr::ByteSlice;
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,6 @@ use std::{
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::atomic::AtomicBool,
 };
 
@@ -132,14 +131,7 @@ fn git_path(path: &Path) -> std::ffi::OsString {
 }
 
 fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.current_dir(root).env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command
+    Command::at(root)
 }
 
 fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
@@ -764,9 +756,20 @@ fn control(path: &Path, expected: &StashRestoreState, cancel: bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn oracle_command(root: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(root);
+        command
+    }
 
     fn git(root: &Path, args: &[&str]) -> Vec<u8> {
-        run(root, args).unwrap()
+        let output = oracle_command(root).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
     fn fixture() -> (tempfile::TempDir, String) {
         let temp = tempfile::tempdir().unwrap();
@@ -811,6 +814,24 @@ mod tests {
         fs::write(root.join("prior.txt"), "prior worktree\n").unwrap();
         fs::write(root.join("local-untracked.txt"), "local\n").unwrap();
         (temp, stash)
+    }
+
+    #[test]
+    fn split_index_recovery_keeps_original_stage_without_git_execution() {
+        let (temp, stash) = fixture();
+        let root = temp.path();
+        git(root, &["update-index", "--split-index"]);
+        let before = git(root, &["ls-files", "--stage", "-z"]);
+        assert!(restore(root, &stash).is_err());
+        let pending = state(root).unwrap().unwrap();
+        assert!(!pending.conflicts.is_empty(), "{:?}", pending.error);
+        cancel(root, &pending).unwrap();
+        assert_eq!(git(root, &["ls-files", "--stage", "-z"]), before);
+        assert_eq!(
+            fs::read(root.join("prior.txt")).unwrap(),
+            b"prior worktree\n"
+        );
+        assert!(state(root).unwrap().is_none());
     }
 
     #[test]

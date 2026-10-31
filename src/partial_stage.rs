@@ -1,13 +1,7 @@
 use crate::model::{Content, DiffLine, FileChange};
 use anyhow::{Context, Result, bail};
 use gix::bstr::ByteSlice;
-use std::{
-    collections::BTreeSet,
-    io::Write,
-    path::Path,
-    process::{Command, Stdio},
-    time::Duration,
-};
+use std::{collections::BTreeSet, path::Path, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct Preview {
@@ -101,78 +95,6 @@ impl Preview {
     }
 }
 
-fn command(root: &Path) -> Command {
-    let mut command = Command::new("git");
-    command.current_dir(root).env("GIT_TERMINAL_PROMPT", "0");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command
-}
-
-fn quoted(prefix: &str, raw: &[u8]) -> String {
-    let mut result = format!("\"{prefix}");
-    for byte in raw {
-        match byte {
-            b'"' => result.push_str("\\\""),
-            b'\\' => result.push_str("\\\\"),
-            b' '..=b'~' => result.push(*byte as char),
-            _ => result.push_str(&format!("\\{byte:03o}")),
-        }
-    }
-    result.push('"');
-    result
-}
-
-fn patch_lines(patch: &mut String, source: &str, prefix: char) {
-    for line in source.split_inclusive('\n') {
-        patch.push(prefix);
-        patch.push_str(line);
-        if !line.ends_with('\n') {
-            patch.push_str("\n\\ No newline at end of file\n");
-        }
-    }
-}
-
-fn patch(file: &FileChange, before: &str, selected: &str) -> String {
-    let old = quoted("a/", &file.path);
-    let new = quoted("b/", &file.path);
-    let mut result = format!("diff --git {old} {new}\n");
-    let remove = matches!(file.after, Content::Empty) && selected.is_empty();
-    if matches!(file.before, Content::Empty) {
-        result.push_str("new file mode 100644\n");
-    } else if remove {
-        let mode = match file.before {
-            Content::Object(_, mode) => mode,
-            _ => 0o100644,
-        };
-        result.push_str(&format!("deleted file mode {mode:o}\n"));
-    }
-    result.push_str(&format!(
-        "--- {}\n+++ {}\n",
-        if matches!(file.before, Content::Empty) {
-            "/dev/null"
-        } else {
-            &old
-        },
-        if remove { "/dev/null" } else { &new }
-    ));
-    let old_count = before.split_inclusive('\n').count();
-    let new_count = selected.split_inclusive('\n').count();
-    result.push_str(&format!(
-        "@@ -{},{} +{},{} @@\n",
-        usize::from(old_count > 0),
-        old_count,
-        usize::from(new_count > 0),
-        new_count
-    ));
-    patch_lines(&mut result, before, '-');
-    patch_lines(&mut result, selected, '+');
-    result
-}
-
 fn validate_path(root: &Path, raw: &[u8]) -> Result<()> {
     if raw.is_empty() || raw.contains(&0) {
         bail!("잘못된 파일 경로입니다.");
@@ -239,24 +161,19 @@ pub fn apply(
         bail!("인덱스가 변경되었습니다. 다시 조회하세요.");
     }
     let path = gix::path::from_bstr(file.path.as_bstr());
-    let attrs = command(root)
-        .args(["check-attr", "-z", "filter", "working-tree-encoding", "--"])
-        .arg(path.as_ref())
-        .output()?;
-    if !attrs.status.success() {
-        bail!("파일 속성을 확인하지 못했습니다.");
-    }
-    for record in attrs
-        .stdout
-        .split(|byte| *byte == 0)
-        .collect::<Vec<_>>()
-        .chunks(3)
+    let mut attributes = repo.attributes_only(
+        &index,
+        gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+    )?;
+    let mut matches = attributes.selected_attribute_matches(["filter", "working-tree-encoding"]);
+    attributes
+        .at_path(path.as_ref(), None)?
+        .matching_attributes(&mut matches);
+    if matches
+        .iter_selected()
+        .any(|m| !m.assignment.state.is_unspecified() && !m.assignment.state.is_unset())
     {
-        if record.len() == 3
-            && ![b"unspecified".as_slice(), b"unset".as_slice()].contains(&record[2])
-        {
-            bail!("변환 필터가 있는 파일입니다. 파일 전체 Stage를 사용하세요.");
-        }
+        bail!("변환 필터가 있는 파일입니다. 파일 전체 Stage를 사용하세요.");
     }
     let before = crate::git::read_content(&repo, file, &file.before)?;
     let after = crate::git::read_content(&repo, file, &file.after)?;
@@ -274,32 +191,21 @@ pub fn apply(
     std::str::from_utf8(&before)?;
     std::str::from_utf8(&after)?;
     let selected = preview.selected_content(lines, selected)?;
-    let patch = patch(file, &preview.before, &selected);
-    let mut child = command(root)
-        .args([
-            "apply",
-            "--cached",
-            "--unidiff-zero",
-            "--whitespace=nowarn",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let written = child
-        .stdin
-        .take()
-        .context("패치 입력을 열 수 없습니다.")?
-        .write_all(patch.as_bytes());
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "부분 Stage 실패: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    written.context("패치를 전달하지 못했습니다.")?;
+    let removed = matches!(file.after, Content::Empty) && selected.is_empty();
+    let mode = match file.before {
+        Content::Object(_, mode) => u32::from(mode),
+        _ => 0o100644,
+    };
+    crate::native_git::set_index_content(
+        root,
+        &file.path,
+        (!removed).then_some(selected.as_bytes()),
+        mode,
+        match file.before {
+            Content::Object(id, mode) => Some((id, u32::from(mode))),
+            _ => None,
+        },
+    )?;
     Ok(())
 }
 
@@ -307,9 +213,14 @@ pub fn apply(
 mod tests {
     use super::*;
     use std::fs;
+    fn oracle_command(root: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(root);
+        command
+    }
 
     fn git(root: &Path, args: &[&str]) -> Vec<u8> {
-        let output = command(root).args(args).output().unwrap();
+        let output = oracle_command(root).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "{args:?}: {}",
@@ -450,7 +361,6 @@ mod tests {
             );
             assert_eq!(fs::read(root.join(name)).unwrap(), after.as_bytes());
         }
-        assert_eq!(quoted("a/", b"x\t\"\\\xff"), "\"a/x\\011\\\"\\\\\\377\"");
     }
 
     #[test]

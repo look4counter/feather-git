@@ -121,6 +121,18 @@ fn navigation_key(key: &str) -> &str {
     }
 }
 
+fn adjacent_tab(current: usize, count: usize, next: bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let current = current % count;
+    Some(if next {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    })
+}
+
 fn candidate_shortcut(key: &str) -> Option<usize> {
     match key {
         "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
@@ -243,9 +255,9 @@ pub struct Workspace {
     next_id: u64,
     error: Option<String>,
     layout: SplitLayout,
-    observed_status_error: (Option<String>, Option<(u64, String)>),
-    status_error: Option<String>,
-    status_error_generation: u64,
+    error_history: crate::error_history::ErrorHistory,
+    error_history_open: bool,
+    error_editor: Option<(usize, String, Entity<CommitEditor>)>,
     body_bounds: Bounds<Pixels>,
     resize_drag: Option<(SplitAxis, Pixels)>,
     start_pages: HashMap<u64, StartPage>,
@@ -428,6 +440,208 @@ fn trash_icon() -> impl IntoElement {
 }
 
 impl Workspace {
+    fn error_indicator(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let keys = self.shortcuts.label("errors");
+        div()
+            .id("open-error-history")
+            .h_8()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .text_xs()
+            .whitespace_nowrap()
+            .bg(rgba(0x00000000))
+            .text_color(rgb(ERROR))
+            .cursor_pointer()
+            .occlude()
+            .hover(|style| style.bg(rgb(DANGER_HOVER)))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_error_history(cx);
+                cx.stop_propagation();
+            }))
+            .child(
+                div()
+                    .size(px(14.))
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(ERROR))
+                    .bg(rgba(0x00000000))
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(10.))
+                    .child("!"),
+            )
+            .child(self.error_history.len().to_string())
+            .children(
+                keys.split(" / ")
+                    .filter(|keys| !keys.is_empty())
+                    .map(crate::shortcut::keys),
+            )
+    }
+
+    fn error_overlay(&self, window: &Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        let count = self.error_history.len();
+        let mut overlay = div()
+            .id("error-history-overlay")
+            .absolute()
+            .left(px(16.))
+            .bottom_0()
+            .h_8()
+            .w(px(0.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation());
+        if self.error_history_open
+            && let Some(entry) = self.error_history.current()
+        {
+            let page = self.error_history.page();
+            let mut controls = div().flex().flex_wrap().items_center().gap_2();
+            for (id, label, previous, enabled) in [
+                ("previous-error", "← 이전", true, page > 0),
+                ("next-error", "다음 →", false, page + 1 < count),
+            ] {
+                controls = controls.child(
+                    button(id, label, false)
+                        .when(!enabled, |button| button.opacity(0.4).cursor_default())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if enabled {
+                                if previous {
+                                    this.error_history.previous();
+                                } else {
+                                    this.error_history.next();
+                                }
+                                this.error_editor = None;
+                                cx.notify();
+                            }
+                        })),
+                );
+            }
+            controls = controls
+                .child(
+                    button("copy-error", "", false)
+                        .child(crate::shortcut::hint("전체 복사", "ctrl + c"))
+                        .on_click(cx.listener(|this, _, _, cx| this.copy_error(cx))),
+                )
+                .child(div().text_sm().child(format!("{} / {count}", page + 1)))
+                .child(
+                    self.shortcut_button("acknowledge-error", "확인완료", "confirm", false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.acknowledge_error(cx);
+                        })),
+                );
+            let available = (window.viewport_size().height - px(180.)).max(px(80.));
+            overlay = overlay.child(
+                div()
+                    .id("error-history-card")
+                    .absolute()
+                    .bottom(px(40.))
+                    .left_0()
+                    .w(px(640.))
+                    .max_w((window.viewport_size().width - px(24.)).max(px(0.)))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(ERROR))
+                    .rounded_lg()
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.error_history_open = false;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .child(div().text_sm().text_color(rgb(ERROR)).child("오류 기록"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .text_ellipsis()
+                            .child(entry.source.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("error-history-message")
+                            .h(available.min(px(220.)))
+                            .min_h_0()
+                            .overflow_hidden()
+                            .when_some(
+                                self.error_editor
+                                    .as_ref()
+                                    .map(|(_, _, editor)| editor.clone()),
+                                |body, editor| body.child(editor),
+                            ),
+                    )
+                    .child(controls),
+            );
+        }
+        overlay
+    }
+
+    fn sync_error_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .error_history
+            .current()
+            .filter(|_| self.error_history_open)
+        else {
+            self.error_editor = None;
+            return;
+        };
+        let page = self.error_history.page();
+        if self
+            .error_editor
+            .as_ref()
+            .is_none_or(|(previous, message, _)| *previous != page || *message != entry.message)
+        {
+            let message = entry.message.clone();
+            let editor = cx.new(|cx| CommitEditor::read_only(&message, cx));
+            self.error_editor = Some((page, message, editor));
+        }
+    }
+
+    fn copy_error(&self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.error_history.current() {
+            cx.write_to_clipboard(ClipboardItem::new_string(entry.message.clone()));
+        }
+    }
+
+    fn toggle_error_history(&mut self, cx: &mut Context<Self>) {
+        if self.error_history.len() == 0 {
+            return;
+        }
+        if !self.error_history_open {
+            self.error_history.open();
+            self.error_editor = None;
+        }
+        self.error_history_open = !self.error_history_open;
+        cx.notify();
+    }
+
+    fn acknowledge_error(&mut self, cx: &mut Context<Self>) {
+        self.error_history.acknowledge();
+        self.error_editor = None;
+        if self.error_history.len() == 0 {
+            self.error_history_open = false;
+        }
+        cx.notify();
+    }
+
+    fn shortcut_button(
+        &self,
+        id: impl Into<ElementId>,
+        label: &str,
+        command: &str,
+        active: bool,
+    ) -> Stateful<Div> {
+        button(id, "", active).child(self.shortcuts.button_hint(label, command))
+    }
+
     fn open_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.shortcut_draft = Some(self.shortcuts.clone());
         self.shortcut_settings = true;
@@ -435,7 +649,7 @@ impl Workspace {
         self.shortcut_capture = None;
         self.shortcut_message = None;
         self.focus.focus(window);
-        cx.notify();
+        self.notify(cx);
     }
 
     fn close_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -444,7 +658,14 @@ impl Workspace {
         self.shortcut_capture = None;
         self.shortcut_message = None;
         self.focus.focus(window);
-        cx.notify();
+        self.notify(cx);
+    }
+
+    fn reset_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcut_draft = Some(crate::shortcut::Bindings::default());
+        self.shortcut_capture = None;
+        self.shortcut_message = None;
+        self.notify(cx);
     }
 
     fn apply_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -452,8 +673,12 @@ impl Workspace {
             return;
         };
         let Some(path) = &self.state_path else {
-            self.shortcut_message = Some("설정 저장 경로를 사용할 수 없습니다.".into());
-            cx.notify();
+            self.shortcut_message = self.error_history.report(
+                "shortcut-settings",
+                "단축키 설정",
+                Some("설정 저장 경로를 사용할 수 없습니다.".into()),
+            );
+            self.notify(cx);
             return;
         };
         let mut state = self.session_state();
@@ -463,10 +688,88 @@ impl Workspace {
                 self.close_shortcuts(window, cx);
             }
             Err(error) => {
-                self.shortcut_message = Some(format!("단축키 저장 실패: {error:#}"));
-                cx.notify();
+                self.shortcut_message = self.error_history.report(
+                    "shortcut-settings",
+                    "단축키 설정",
+                    Some(format!("단축키 저장 실패: {error:#}")),
+                );
+                self.notify(cx);
             }
         }
+    }
+
+    fn open_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.project().map(|project| project.path.clone()) else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::terminal::open(&path) });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                this.update(cx, |this, cx| {
+                    this.error_history.report(
+                        "terminal",
+                        "터미널",
+                        Some(format!("터미널 열기 실패: {error:#}")),
+                    );
+                    this.notify(cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn terminal_link(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("open-terminal")
+            .ml_3()
+            .text_xs()
+            .text_color(rgb(ACCENT))
+            .cursor_pointer()
+            .child(crate::shortcut::hint(
+                "터미널",
+                &self.shortcuts.label("terminal"),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.open_terminal(cx)))
+    }
+
+    fn open_file_manager(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.project().map(|project| project.path.clone()) else {
+            return;
+        };
+        let task = cx
+            .background_executor()
+            .spawn(async move { crate::file_manager::open(&path) });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                this.update(cx, |this, cx| {
+                    this.error_history.report(
+                        "file-manager",
+                        "탐색기",
+                        Some(format!("폴더 열기 실패: {error:#}")),
+                    );
+                    this.notify(cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn explorer_link(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("open-file-manager")
+            .ml_3()
+            .text_xs()
+            .text_color(rgb(ACCENT))
+            .cursor_pointer()
+            .child(crate::shortcut::hint(
+                "탐색기",
+                &self.shortcuts.label("explorer"),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.open_file_manager(cx)))
     }
 
     fn shortcuts_link(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -485,26 +788,34 @@ impl Workspace {
             }))
     }
 
+    fn switch_shortcuts_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= crate::shortcut::GROUPS.len() {
+            return;
+        }
+        self.shortcut_tab = index;
+        self.shortcut_capture = None;
+        self.shortcut_message = None;
+        cx.notify();
+    }
+
+    fn shortcut_tabs(&self, cx: &mut Context<Self>) -> Div {
+        let mut tabs = div().flex().flex_wrap().gap_1();
+        for (index, group) in crate::shortcut::GROUPS.into_iter().enumerate() {
+            tabs = tabs.child(
+                button(("shortcut-tab", index), group, self.shortcut_tab == index).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.switch_shortcuts_tab(index, cx);
+                    }),
+                ),
+            );
+        }
+        tabs
+    }
+
     fn shortcuts_table(&self, editable: bool, cx: &mut Context<Self>) -> Div {
         let mut table = div().flex().flex_col().gap_3();
-        if editable {
-            let mut tabs = div().flex().flex_wrap().gap_1();
-            for (index, group) in crate::shortcut::GROUPS.into_iter().enumerate() {
-                tabs = tabs.child(
-                    button(("shortcut-tab", index), group, self.shortcut_tab == index).on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.shortcut_tab = index;
-                            this.shortcut_capture = None;
-                            this.shortcut_message = None;
-                            cx.notify();
-                        }),
-                    ),
-                );
-            }
-            table = table.child(tabs);
-            if let Some(message) = &self.shortcut_message {
-                table = table.child(div().text_color(rgb(ACCENT)).child(message.clone()));
-            }
+        if editable && let Some(message) = &self.shortcut_message {
+            table = table.child(div().text_color(rgb(ACCENT)).child(message.clone()));
         }
         let bindings = if editable {
             self.shortcut_draft.as_ref().unwrap_or(&self.shortcuts)
@@ -602,6 +913,7 @@ impl Workspace {
                                         "",
                                         capturing,
                                     )
+                                    .h(px(36.))
                                     .child(crate::shortcut::badge(&label))
                                     .on_click(cx.listener(
                                         move |this, _, window, cx| {
@@ -623,6 +935,11 @@ impl Workspace {
                                         "×",
                                         false,
                                     )
+                                    .h(px(36.))
+                                    .py_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             if let Some(draft) = &mut this.shortcut_draft
@@ -690,9 +1007,9 @@ impl Workspace {
             next_id: 0,
             error: None,
             layout: SplitLayout::default(),
-            observed_status_error: (None, None),
-            status_error: None,
-            status_error_generation: 0,
+            error_history: crate::error_history::ErrorHistory::default(),
+            error_history_open: false,
+            error_editor: None,
             body_bounds: Bounds::default(),
             resize_drag: None,
             start_pages: HashMap::new(),
@@ -760,12 +1077,14 @@ impl Workspace {
                 this.ensure_active_loaded(cx);
                 this.persist();
                 if !errors.is_empty() {
-                    this.error = Some(errors.join("\n"));
+                    this.error =
+                        this.error_history
+                            .report("workspace", "앱 작업", Some(errors.join("\n")));
                 }
                 if let Some(index) = this.tabs.iter().position(|tab| Some(tab.id()) == active) {
                     this.tabs_scroll.scroll_to_item(index);
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
@@ -797,7 +1116,9 @@ impl Workspace {
         };
         let state = self.session_state();
         if let Err(error) = session::save(path, &state) {
-            self.error = Some(format!("{error:#}"));
+            self.error =
+                self.error_history
+                    .report("workspace", "앱 작업", Some(format!("{error:#}")));
         }
     }
 
@@ -818,48 +1139,91 @@ impl Workspace {
             .any(Project::history_in_progress)
     }
 
-    fn update_status_error(&mut self, cx: &mut Context<Self>) {
-        let current = (
-            self.error.clone(),
-            self.project()
-                .and_then(|project| project.error.clone().map(|error| (project.id, error))),
-        );
-        if current == self.observed_status_error {
-            return;
-        }
-        let new_error = if current.0 != self.observed_status_error.0 {
-            current.0.clone()
-        } else {
-            None
-        }
-        .or_else(|| {
-            if current.1 != self.observed_status_error.1 {
-                current.1.as_ref().map(|(_, error)| error.clone())
-            } else {
-                None
+    fn collect_errors(&mut self, cx: &App) {
+        let mut errors = Vec::new();
+        let mut add = |key: String, source: String, error: Option<&str>| {
+            if let Some(error) = error {
+                errors.push((key, source, error.to_owned()));
             }
-        });
-        self.observed_status_error = current;
-        let Some(error) = new_error else {
-            return;
         };
-        self.status_error = Some(error);
-        self.status_error_generation += 1;
-        let generation = self.status_error_generation;
-        let timer = cx
-            .background_executor()
-            .timer(std::time::Duration::from_secs(3));
-        cx.spawn(async move |this, cx| {
-            timer.await;
-            this.update(cx, |this, cx| {
-                if this.status_error_generation == generation {
-                    this.status_error = None;
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
+        add("workspace".into(), "앱 작업".into(), self.error.as_deref());
+        for project in self.tabs.iter().filter_map(WorkspaceTab::project) {
+            let source = format!(
+                "{} · {}",
+                project.name,
+                session::display_path(&project.path)
+            );
+            add(
+                format!("project-{}", project.id),
+                source.clone(),
+                project.error.as_deref(),
+            );
+            add(
+                format!("page-{}", project.id),
+                format!("{source} · 이력 추가 조회"),
+                project.page_error.as_deref(),
+            );
+        }
+        let mut pages: Vec<_> = self.start_pages.iter().collect();
+        pages.sort_by_key(|(id, _)| **id);
+        for (id, page) in pages {
+            add(
+                format!("start-{id}"),
+                "저장소 시작".into(),
+                page.error.as_deref(),
+            );
+        }
+        if let Some(dialog) = &self.branch_dialog {
+            add(
+                "branch-dialog".into(),
+                format!("브랜치 작업 · {}", session::display_path(&dialog.path)),
+                dialog.error.as_deref(),
+            );
+        }
+        if let Some(dialog) = &self.commit_dialog {
+            add(
+                "commit-dialog".into(),
+                "커밋".into(),
+                dialog.error.as_deref(),
+            );
+        }
+        if let Some(dialog) = &self.stash_dialog {
+            add(
+                "stash-dialog".into(),
+                "Stash".into(),
+                dialog.error.as_deref(),
+            );
+        }
+        if let Some(dialog) = &self.discard_dialog {
+            add(
+                "discard-dialog".into(),
+                "변경 폐기".into(),
+                dialog.error.as_deref(),
+            );
+        }
+        if let Some(settings) = &self.settings {
+            let panel = settings.read(cx);
+            add(
+                format!(
+                    "settings-{:?}-{}",
+                    settings.entity_id(),
+                    panel.error_revision()
+                ),
+                "설정".into(),
+                panel.error(),
+            );
+        }
+        add(
+            "shortcut-settings".into(),
+            "단축키 설정".into(),
+            self.shortcut_message.as_deref(),
+        );
+        self.error_history.observe(errors);
+    }
+
+    fn notify(&mut self, cx: &mut Context<Self>) {
+        self.collect_errors(cx);
+        cx.notify();
     }
 
     fn text_lines(&self, key: ListKey) -> Vec<String> {
@@ -876,6 +1240,43 @@ impl Workspace {
                 .map(|p| p.diff.lines.iter().map(|line| line.text.clone()).collect())
                 .unwrap_or_default()
         }
+    }
+
+    fn cursor_rows(&self, key: ListKey) -> Vec<usize> {
+        if key.1 == 31 {
+            return (0..self
+                .detail_items
+                .get(&key.0)
+                .map_or(0, |rows| rows.lines.len()))
+                .collect();
+        }
+        self.tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .find(|project| project.id == key.0)
+            .map(|project| {
+                project
+                    .diff
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| line.old.is_some() || line.new.is_some())
+                    .map(|(row, _)| row)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn initial_text_selection(&self, key: ListKey) -> Option<(ListKey, Selection)> {
+        let row = self.cursor_rows(key).into_iter().next()?;
+        let position = Position { row, column: 0 };
+        Some((
+            key,
+            Selection {
+                anchor: position,
+                cursor: position,
+            },
+        ))
     }
 
     fn selection_color(&self, section: ListFocus, window: &Window) -> u32 {
@@ -903,6 +1304,42 @@ impl Workspace {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.history_in_progress()
+            && !self.branch_busy
+            && self.shortcut_capture.is_none()
+            && self
+                .shortcuts
+                .resolve("error-history", &event.keystroke)
+                .is_some_and(|key| key.key == "f1")
+        {
+            self.toggle_error_history(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.error_history_open {
+            let text_focused = self
+                .error_editor
+                .as_ref()
+                .is_some_and(|(_, _, editor)| editor.read(cx).focus.is_focused(window));
+            if text_focused && crate::commit_editor::read_only_key(&event.keystroke) {
+                return;
+            }
+            if event.keystroke.modifiers.control && event.keystroke.key == "c" {
+                self.copy_error(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(key) = self.shortcuts.resolve("modal", &event.keystroke) {
+                if key.key == "escape" {
+                    self.error_history_open = false;
+                    cx.notify();
+                } else if key.key == "enter" {
+                    self.acknowledge_error(cx);
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.history_in_progress() || self.branch_busy {
             cx.stop_propagation();
             return;
@@ -922,18 +1359,34 @@ impl Workspace {
                             self.shortcut_capture = None;
                             self.shortcut_message = None;
                         }
-                        Err(error) => self.shortcut_message = Some(error),
+                        Err(error) => {
+                            self.shortcut_message = self.error_history.report(
+                                "shortcut-settings",
+                                "단축키 설정",
+                                Some(error),
+                            )
+                        }
                     }
                 }
-            } else if let Some(action) = self.shortcuts.resolve("modal", key) {
-                if action.key == "escape" {
+            } else if let Some(action) = self.shortcuts.resolve("shortcuts-modal", key) {
+                if crate::shortcut::chord(&action) == "ctrl-d" {
+                    self.reset_shortcuts(cx);
+                } else if action.key == "escape" {
                     self.close_shortcuts(window, cx);
                 } else if action.key == "enter" {
                     self.apply_shortcuts(window, cx);
+                } else if ["left", "right"].contains(&action.key.as_str())
+                    && let Some(index) = adjacent_tab(
+                        self.shortcut_tab,
+                        crate::shortcut::GROUPS.len(),
+                        action.key == "right",
+                    )
+                {
+                    self.switch_shortcuts_tab(index, cx);
                 }
             }
             cx.stop_propagation();
-            cx.notify();
+            self.notify(cx);
             return;
         }
         let scope = if self.settings.is_some() {
@@ -1003,10 +1456,60 @@ impl Workspace {
             return;
         };
         let key = &mapped_key;
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && ["[", "]"].contains(&key.key.as_str())
+        {
+            if let Some(current) = self
+                .tabs
+                .iter()
+                .position(|tab| Some(tab.id()) == self.active)
+                && let Some(index) = adjacent_tab(current, self.tabs.len(), key.key == "]")
+            {
+                let id = self.tabs[index].id();
+                self.activate_project_tab(id, window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let checkbox_focused = (self.commit_dialog.is_some()
+            && self.commit_push_focus.is_focused(window))
+            || (self.branch_dialog.is_some()
+                && self
+                    .branch_checks_focus
+                    .iter()
+                    .any(|focus| focus.is_focused(window)));
+        if crate::controls::checkbox_key_repeat(key, event.is_held, checkbox_focused) {
+            cx.stop_propagation();
+            return;
+        }
+        if event.is_held
+            && self.branch_dialog.is_some()
+            && (key.key == "enter" || (key.modifiers.control && key.key == "s"))
+        {
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "f9" {
+            if !event.is_held {
+                self.open_terminal(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key.key == "f10" {
+            if !event.is_held {
+                self.open_file_manager(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if key.key == "f11" && scope != "modal" {
             self.open_shortcuts(window, cx);
             cx.stop_propagation();
-            cx.notify();
+            self.notify(cx);
             return;
         }
 
@@ -1065,7 +1568,7 @@ impl Workspace {
                 }
             }
             cx.stop_propagation();
-            cx.notify();
+            self.notify(cx);
             return;
         }
         if let Some(dialog) = &self.stash_dialog {
@@ -1087,7 +1590,7 @@ impl Workspace {
                 self.stash_dialog = None;
                 self.focus.focus(window);
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
             }
             return;
         }
@@ -1100,7 +1603,7 @@ impl Workspace {
             if !dialog.busy && key.key == "escape" {
                 self.discard_dialog = None;
                 self.focus.focus(window);
-                cx.notify();
+                self.notify(cx);
             }
             cx.stop_propagation();
             return;
@@ -1118,7 +1621,7 @@ impl Workspace {
                     dialog.push_after = !dialog.push_after;
                 }
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
                 return;
             }
             if key.modifiers.control && key.key == "s" {
@@ -1133,16 +1636,28 @@ impl Workspace {
                 self.commit_dialog = None;
                 self.focus.focus(window);
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
             }
             return;
         }
         if let Some(settings) = self.settings.clone() {
-            if key.key == "escape" && !settings.read(cx).is_composing(cx) {
+            if (key.key == "space" || (key.modifiers.control && key.key == "s"))
+                && !settings.read(cx).is_composing(cx)
+                && settings.update(cx, |settings, cx| {
+                    if event.is_held {
+                        return settings.action_focused(window, cx);
+                    }
+                    settings.activate_focused(window, key.key == "space", cx)
+                })
+            {
+                cx.stop_propagation();
+            } else if key.key == "escape" && !settings.read(cx).is_composing(cx) {
                 self.close_settings(window, cx);
                 cx.stop_propagation();
             } else if key.modifiers.control && key.key == "s" {
-                settings.update(cx, |settings, cx| settings.save(cx));
+                if !event.is_held && !settings.read(cx).is_composing(cx) {
+                    settings.update(cx, |settings, cx| settings.save(cx));
+                }
                 cx.stop_propagation();
             } else if key.key == "tab" && !key.modifiers.control && !key.modifiers.alt {
                 settings
@@ -1205,7 +1720,7 @@ impl Workspace {
                 if changed {
                     self.persist();
                     cx.stop_propagation();
-                    cx.notify();
+                    self.notify(cx);
                     return;
                 }
             }
@@ -1251,7 +1766,7 @@ impl Workspace {
                     self.upstream_scroll.scroll_to_item(next);
                     self.upstream_focus.focus(window);
                     cx.stop_propagation();
-                    cx.notify();
+                    self.notify(cx);
                     return;
                 }
             }
@@ -1294,7 +1809,7 @@ impl Workspace {
                     }
                     self.reset_mode_focus.focus(window);
                     cx.stop_propagation();
-                    cx.notify();
+                    self.notify(cx);
                     return;
                 }
                 if self.reset_mode_focus.is_focused(window) && key.key == "space" {
@@ -1331,7 +1846,7 @@ impl Workspace {
             if key.key == "escape" {
                 self.help = false;
                 self.delete_target = None;
-                cx.notify();
+                self.notify(cx);
             }
             cx.stop_propagation();
             return;
@@ -1371,6 +1886,17 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
+        if ["branches", "local-branches", "files", "stage-files"].contains(&scope)
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && ["left", "right"].contains(&key.key.as_str())
+        {
+            self.cycle_panel_tab(key.key == "right", window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
             if self
                 .project()
@@ -1378,9 +1904,9 @@ impl Workspace {
                 && ["c", "s", "o", "d", "b", "t", "x", "v", "m", "r", "p"]
                     .contains(&key.key.as_str())
             {
-                self.error = Some("진행 중인 작업이나 미해결 충돌이 있습니다. 파일을 수정하고 Stage한 뒤 진행 표시줄에서 완료하거나 취소하세요.".into());
+                self.error = self.error_history.report("workspace", "앱 작업", Some("진행 중인 작업이나 미해결 충돌이 있습니다. 파일을 수정하고 Stage한 뒤 진행 표시줄에서 완료하거나 취소하세요.".into()));
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
                 return;
             }
             if key.key == "`" && !key.modifiers.shift && ["files", "stage-files"].contains(&scope) {
@@ -1388,7 +1914,7 @@ impl Workspace {
                 self.selected_folder = None;
                 self.rebuild_file_rows(true);
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
                 return;
             }
             if !key.modifiers.shift
@@ -1407,17 +1933,11 @@ impl Workspace {
                         .as_ref()
                         .is_none_or(|(selected, _)| *selected != text_key)
                 {
-                    self.text_selection = Some((
-                        text_key,
-                        Selection {
-                            anchor: Position::default(),
-                            cursor: Position::default(),
-                        },
-                    ));
+                    self.text_selection = self.initial_text_selection(text_key);
                 }
                 self.focus.focus(window);
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
                 return;
             }
 
@@ -1494,7 +2014,7 @@ impl Workspace {
             if key.key == "?" || key.key_char.as_deref() == Some("?") {
                 self.help = true;
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
                 return;
             }
             if key.key == "s" && !key.modifiers.shift && scope == "stage-files" {
@@ -1559,8 +2079,13 @@ impl Workspace {
             {
                 let (id, generation) = (project.id, project.diff_generation);
                 if key.key == "space" {
-                    if let Some(row) = self.diff_cursor_row(id) {
-                        self.toggle_partial_line(id, generation, row, cx);
+                    if let Some((_, selection)) = self
+                        .text_selection
+                        .as_ref()
+                        .filter(|(key, _)| *key == text_key)
+                    {
+                        let rows = selection.rows(project.diff.lines.len());
+                        self.toggle_partial_rows(id, generation, rows, cx);
                     }
                     cx.stop_propagation();
                     return;
@@ -1572,25 +2097,40 @@ impl Workspace {
                 }
             }
             let lines = self.text_lines(text_key);
+            let cursor_rows = self.cursor_rows(text_key);
+            if cursor_rows.is_empty() {
+                self.text_selection = None;
+                cx.stop_propagation();
+                return;
+            }
             if let Some((selection_key, selection)) = &mut self.text_selection
                 && *selection_key == text_key
             {
                 if key.modifiers.control && key.key == "c" {
                     cx.write_to_clipboard(ClipboardItem::new_string(selection.text(&lines)));
                 } else if key.modifiers.control && key.key == "a" {
-                    selection.anchor = Position::default();
+                    selection.anchor = Position {
+                        row: cursor_rows[0],
+                        column: 0,
+                    };
+                    let last = *cursor_rows.last().unwrap();
                     selection.cursor = Position {
-                        row: lines.len().saturating_sub(1),
-                        column: lines.last().map_or(0, |line| line.chars().count()),
+                        row: last,
+                        column: lines[last].chars().count(),
                     };
                 } else if ["up", "down", "left", "right", "home", "end"].contains(&nav_key) {
-                    selection.move_cursor(&lines, nav_key, key.modifiers.shift);
+                    selection.move_cursor_on_rows(
+                        &lines,
+                        &cursor_rows,
+                        nav_key,
+                        key.modifiers.shift,
+                    );
                     if let Some(scroll) = self.list_scroll.get(&text_key) {
                         scroll.scroll_to_item(selection.cursor.row, ScrollStrategy::Center);
                     }
                 }
                 cx.stop_propagation();
-                cx.notify();
+                self.notify(cx);
             }
             return;
         }
@@ -1606,7 +2146,7 @@ impl Workspace {
                 if project.selected_file.is_none() && !project.snapshot.stage.is_empty() {
                     self.select_file(0, cx);
                 }
-                cx.notify();
+                self.notify(cx);
                 cx.stop_propagation();
             }
             return;
@@ -1814,14 +2354,20 @@ impl Workspace {
                         this.active = active;
                     }
                     Ok(()) => {}
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn open_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1856,8 +2402,12 @@ impl Workspace {
         }
         let message = dialog.editor.read(cx).message().to_owned();
         if message.trim().is_empty() {
-            dialog.error = Some("커밋 메시지를 입력하세요.".into());
-            cx.notify();
+            dialog.error = self.error_history.report(
+                "commit-dialog",
+                "커밋",
+                Some("커밋 메시지를 입력하세요.".into()),
+            );
+            self.notify(cx);
             return;
         }
         let id = dialog.project_id;
@@ -1868,8 +2418,12 @@ impl Workspace {
             .find(|project| project.id == id)
             .is_some_and(|project| project.snapshot.stage.iter().any(|file| file.staged))
         {
-            dialog.error = Some("staged 변경사항이 없습니다.".into());
-            cx.notify();
+            dialog.error = self.error_history.report(
+                "commit-dialog",
+                "커밋",
+                Some("staged 변경사항이 없습니다.".into()),
+            );
+            self.notify(cx);
             return;
         }
         let Some(path) = self
@@ -1899,7 +2453,9 @@ impl Workspace {
                 match result {
                     Ok(push_error) => {
                         this.commit_dialog = None;
-                        this.error = push_error;
+                        this.error = this
+                            .error_history
+                            .report("workspace", "앱 작업", push_error);
                         let active = this.active;
                         this.active = Some(id);
                         if let Some(project) = this.project_mut() {
@@ -1913,7 +2469,11 @@ impl Workspace {
                             && dialog.project_id == id
                         {
                             dialog.busy = false;
-                            dialog.error = Some(format!("{error:#}"));
+                            dialog.error = this.error_history.report(
+                                "commit-dialog",
+                                "커밋",
+                                Some(format!("{error:#}")),
+                            );
                             dialog.editor.update(cx, |editor, cx| {
                                 editor.enabled = true;
                                 cx.notify();
@@ -1921,12 +2481,12 @@ impl Workspace {
                         }
                     }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn stage_selected(&mut self, cx: &mut Context<Self>) {
@@ -1972,17 +2532,27 @@ impl Workspace {
                 }
                 match refreshed {
                     Ok(files) => this.apply_stage_files(id, files, &targets, cx),
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
                 if let Err(error) = operation {
-                    this.error = Some(format!("{error:#}"));
+                    this.error = this.error_history.report(
+                        "workspace",
+                        "앱 작업",
+                        Some(format!("{error:#}")),
+                    );
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn diff_cursor_row(&self, id: u64) -> Option<usize> {
@@ -2040,17 +2610,27 @@ impl Workspace {
                 this.pending = this.pending.saturating_sub(1);
                 match refreshed {
                     Ok(files) => this.apply_stage_files(id, files, &Default::default(), cx),
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
                 if let Err(error) = operation {
-                    this.error = Some(format!("{error:#}"));
+                    this.error = this.error_history.report(
+                        "workspace",
+                        "앱 작업",
+                        Some(format!("{error:#}")),
+                    );
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn toggle_partial_line(
@@ -2060,19 +2640,38 @@ impl Workspace {
         row: usize,
         cx: &mut Context<Self>,
     ) {
+        self.toggle_partial_rows(id, generation, row..row.saturating_add(1), cx);
+    }
+
+    fn toggle_partial_rows(
+        &mut self,
+        id: u64,
+        generation: u64,
+        range: std::ops::Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy() || self.branch_busy || self.branch_dialog.is_some() {
             return;
         }
-        if !self.project().is_some_and(|p| {
+        let Some(project) = self.project().filter(|p| {
             p.id == id
                 && p.diff_generation == generation
                 && p.file_tab == FileTab::Stage
                 && p.diff.partial.is_some()
-                && p.diff
-                    .lines
-                    .get(row)
-                    .is_some_and(|line| matches!(line.kind, '+' | '-'))
-        }) {
+        }) else {
+            return;
+        };
+        let rows: Vec<_> = project
+            .diff
+            .lines
+            .iter()
+            .enumerate()
+            .skip(range.start)
+            .take(range.end.saturating_sub(range.start))
+            .filter(|(_, line)| matches!(line.kind, '+' | '-'))
+            .map(|(row, _)| row)
+            .collect();
+        if rows.is_empty() {
             return;
         }
         let entry = self
@@ -2082,9 +2681,7 @@ impl Workspace {
         if entry.0 != generation {
             *entry = (generation, Default::default());
         }
-        if !entry.1.remove(&row) {
-            entry.1.insert(row);
-        }
+        toggle_checked_rows(&mut entry.1, &rows);
         cx.notify();
     }
 
@@ -2148,17 +2745,27 @@ impl Workspace {
                         let targets = std::collections::BTreeMap::from([(raw_path, staged)]);
                         this.apply_stage_files(id, files, &targets, cx);
                     }
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
                 if let Err(error) = operation {
-                    this.error = Some(format!("{error:#}"));
+                    this.error = this.error_history.report(
+                        "workspace",
+                        "앱 작업",
+                        Some(format!("{error:#}")),
+                    );
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn apply_stage_files(
@@ -2380,8 +2987,12 @@ impl Workspace {
             .as_ref()
             .map(|editor| editor.read(cx).message().trim().to_owned());
         if name.as_ref().is_some_and(|name| name.is_empty()) {
-            dialog.error = Some("스태시 이름을 입력하세요.".into());
-            cx.notify();
+            dialog.error = self.error_history.report(
+                "stash-dialog",
+                "Stash",
+                Some("스태시 이름을 입력하세요.".into()),
+            );
+            self.notify(cx);
             return;
         }
         let deletion = dialog.deletion.clone();
@@ -2431,7 +3042,9 @@ impl Workspace {
                 if let Some(error) = error {
                     if let Some(dialog) = &mut this.stash_dialog {
                         dialog.busy = false;
-                        dialog.error = Some(error);
+                        dialog.error =
+                            this.error_history
+                                .report("stash-dialog", "Stash", Some(error));
                         if let Some(editor) = &dialog.editor {
                             editor.update(cx, |editor, cx| {
                                 editor.enabled = true;
@@ -2443,12 +3056,12 @@ impl Workspace {
                     this.stash_dialog = None;
                     this.refresh_after_branch(id, false, None, cx);
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn discard_selected(&mut self, cx: &mut Context<Self>) {
@@ -2495,17 +3108,19 @@ impl Workspace {
                 if let Some(error) = error {
                     if let Some(dialog) = &mut this.discard_dialog {
                         dialog.busy = false;
-                        dialog.error = Some(error);
+                        dialog.error =
+                            this.error_history
+                                .report("discard-dialog", "변경 폐기", Some(error));
                     }
                 } else {
                     this.discard_dialog = None;
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn delete_repository(&mut self, cx: &mut Context<Self>) {
@@ -2565,15 +3180,19 @@ impl Workspace {
                             this.reload(cx);
                         }
                         this.active = active;
-                        this.error = Some(format!("{error:#}"));
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        );
                     }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn scroll_handle(&mut self, key: ListKey) -> UniformListScrollHandle {
@@ -2828,9 +3447,16 @@ impl Workspace {
         }
         let Some(session) = p.snapshot.session.clone() else {
             if p.history_target.take().is_some() {
-                p.page_error =
-                    Some("히스토리 조회 세션이 없습니다. 저장소를 다시 조회해 주세요.".into());
-                cx.notify();
+                p.page_error = self.error_history.report(
+                    format!("page-{}", p.id),
+                    format!(
+                        "{} · {} · 이력 추가 조회",
+                        p.name,
+                        session::display_path(&p.path)
+                    ),
+                    Some("히스토리 조회 세션이 없습니다. 저장소를 다시 조회해 주세요.".into()),
+                );
+                self.notify(cx);
             }
             return;
         };
@@ -2859,7 +3485,15 @@ impl Workspace {
                         target_index = p.resolve_history_target();
                     }
                     Err(error) => {
-                        p.page_error = Some(format!("{error:#}"));
+                        p.page_error = this.error_history.report(
+                            format!("page-{}", p.id),
+                            format!(
+                                "{} · {} · 이력 추가 조회",
+                                p.name,
+                                session::display_path(&p.path)
+                            ),
+                            Some(format!("{error:#}")),
+                        );
                     }
                 }
                 let continue_loading = p.history_target.is_some() && p.page_error.is_none();
@@ -2874,12 +3508,12 @@ impl Workspace {
                 if continue_loading {
                     this.load_more(id, cx);
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn project(&self) -> Option<&Project> {
@@ -3174,14 +3808,20 @@ impl Workspace {
                         this.focus_after_popup = true;
                     }
                     Ok(_) => {}
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn open_reference_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3235,14 +3875,20 @@ impl Workspace {
                         this.focus_after_popup = true;
                     }
                     Ok(_) => {}
-                    Err(error) => this.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        this.error = this.error_history.report(
+                            "workspace",
+                            "앱 작업",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn close_branch_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3271,7 +3917,7 @@ impl Workspace {
         }
         self.reload(cx);
         self.active = active;
-        self.error = error;
+        self.error = self.error_history.report("workspace", "앱 작업", error);
     }
 
     fn choose_checkout_candidate(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3457,7 +4103,9 @@ impl Workspace {
                     Err(error) => {
                         this.refresh_after_branch(id, false, Some(error.to_string()), cx);
                         if let Some(dialog) = &mut this.branch_dialog {
-                            dialog.error = Some(error.to_string());
+                            dialog.error = this
+                                .error_history
+                                .mirror("branch-dialog", Some(error.to_string()));
                             if let Some(editor) = &dialog.editor {
                                 editor.update(cx, |editor, cx| {
                                     editor.enabled = true;
@@ -3467,12 +4115,12 @@ impl Workspace {
                         }
                     }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn restore_stash_reference(&mut self, id: u64, commit: String, cx: &mut Context<Self>) {
@@ -3672,23 +4320,25 @@ impl Workspace {
         }
         let path = self.project().map(|project| project.path.clone());
         self.help = false;
-        self.settings =
-            Some(cx.new(|cx| SettingsPanel::new(path, self.popup_options.use_global, cx)));
+        let settings = cx.new(|cx| SettingsPanel::new(path, cx));
+        cx.observe(&settings, |this, _, cx| this.notify(cx))
+            .detach();
+        self.settings = Some(settings);
         self.focus.focus(window);
         cx.notify();
     }
 
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(settings) = self.settings.clone()
+            && settings.update(cx, |settings, cx| settings.close_child_popup(window, cx))
+        {
+            return;
+        }
         if let Some(settings) = &self.settings {
-            if !settings.read(cx).can_close() {
+            if !settings.read(cx).can_close(cx) {
                 return;
             }
             settings.read(cx).cancel();
-        }
-        if let Some(settings) = &self.settings
-            && let Some(preference) = settings.read(cx).use_global_preference()
-        {
-            self.popup_options.use_global = Some(preference);
         }
         self.persist();
         self.settings = None;
@@ -3708,6 +4358,20 @@ impl Workspace {
                 &self.shortcuts.label("settings"),
             ))
             .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))
+    }
+
+    fn activate_project_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id() == id) else {
+            return;
+        };
+        self.active = Some(id);
+        self.ensure_active_loaded(cx);
+        self.list_focus = None;
+        self.text_selection = None;
+        self.focus.focus(window);
+        self.tabs_scroll.scroll_to_item(index);
+        self.persist();
+        self.notify(cx);
     }
 
     fn add_empty_tab(&mut self) {
@@ -3962,7 +4626,7 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 this.pending = this.pending.saturating_sub(1);
                 let Some(page) = this.start_pages.get_mut(&source) else {
-                    cx.notify();
+                    this.notify(cx);
                     return;
                 };
                 page.busy = false;
@@ -3970,14 +4634,20 @@ impl Workspace {
                     Ok(path) => {
                         this.finish_open(source, path, cx);
                     }
-                    Err(err) => page.error = Some(format!("{err:#}")),
+                    Err(err) => {
+                        page.error = this.error_history.report(
+                            format!("start-{source}"),
+                            "저장소 시작",
+                            Some(format!("{err:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn finish_open(&mut self, source: u64, path: PathBuf, cx: &mut Context<Self>) {
@@ -4032,8 +4702,12 @@ impl Workspace {
                 .unwrap_or_default()
         });
         if source.as_ref().is_some_and(|s| s.is_empty()) {
-            page.error = Some("저장소 URL을 입력하세요.".into());
-            cx.notify();
+            page.error = self.error_history.report(
+                format!("start-{id}"),
+                "저장소 시작",
+                Some("저장소 URL을 입력하세요.".into()),
+            );
+            self.notify(cx);
             return;
         }
         page.busy = true;
@@ -4109,15 +4783,21 @@ impl Workspace {
                     Some(Ok(path)) => {
                         this.finish_open(id, path, cx);
                     }
-                    Some(Err(error)) => page.error = Some(format!("{error:#}")),
+                    Some(Err(error)) => {
+                        page.error = this.error_history.report(
+                            format!("start-{id}"),
+                            "저장소 시작",
+                            Some(format!("{error:#}")),
+                        )
+                    }
                     None => {}
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn start_page(&self, cx: &Context<Self>) -> Stateful<Div> {
@@ -4175,9 +4855,13 @@ impl Workspace {
                     )
                 })
                 .child(
-                    button("execute-clone", "Clone 실행 · 저장 위치 선택", true).on_click(
-                        cx.listener(move |this, _, _, cx| this.start_repository(id, 2, cx)),
-                    ),
+                    self.shortcut_button(
+                        "execute-clone",
+                        "Clone 실행 · 저장 위치 선택",
+                        "confirm",
+                        true,
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.start_repository(id, 2, cx))),
                 );
         }
         if page.busy {
@@ -4416,7 +5100,11 @@ impl Workspace {
                         this.history_scroll.entry(id).or_default();
                     }
                     Err(err) => {
-                        p.error = Some(format!("{err:#}"));
+                        p.error = this.error_history.report(
+                            format!("project-{}", p.id),
+                            format!("{} · {}", p.name, session::display_path(&p.path)),
+                            Some(format!("{err:#}")),
+                        );
                         p.snapshot = Snapshot::default();
                         p.commit = None;
                         this.file_items.remove(&(id, 20));
@@ -4425,12 +5113,12 @@ impl Workspace {
                         this.graphs.remove(&id);
                     }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn select_commit(&mut self, commit: String, cx: &mut Context<Self>) {
@@ -4486,14 +5174,20 @@ impl Workspace {
                         p.snapshot.history = selection.history;
                         p.snapshot.commit_detail = Some(selection.detail);
                     }
-                    Err(error) => p.error = Some(format!("{error:#}")),
+                    Err(error) => {
+                        p.error = this.error_history.report(
+                            format!("project-{}", p.id),
+                            format!("{} · {}", p.name, session::display_path(&p.path)),
+                            Some(format!("{error:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn select_reference(
@@ -4512,6 +5206,13 @@ impl Workspace {
         let Some(p) = self.project_mut() else {
             return;
         };
+        if p.snapshot.references.iter().any(|reference| {
+            reference.kind == RefTab::Stash && Some(&reference.revision) == p.revision.as_ref()
+        }) {
+            p.history_target = None;
+            self.notify(cx);
+            return;
+        }
         p.history_target = Some(target.clone());
         p.page_error = None;
         let index = p.resolve_history_target();
@@ -4549,7 +5250,7 @@ impl Workspace {
                 self.load_more(id, cx);
             }
         }
-        cx.notify();
+        self.notify(cx);
     }
 
     fn select_file(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -4637,19 +5338,38 @@ impl Workspace {
                         p.diff = diff;
                         if this.active == Some(id)
                             && this.list_focus == Some(ListFocus::Text((id, 30)))
-                            && !p.diff.lines.is_empty()
                         {
-                            this.text_selection = Some(((id, 30), Selection::default()));
+                            this.text_selection = p
+                                .diff
+                                .lines
+                                .iter()
+                                .position(|line| line.old.is_some() || line.new.is_some())
+                                .map(|row| {
+                                    let position = Position { row, column: 0 };
+                                    (
+                                        (id, 30),
+                                        Selection {
+                                            anchor: position,
+                                            cursor: position,
+                                        },
+                                    )
+                                });
                         }
                     }
-                    Err(err) => p.error = Some(format!("{err:#}")),
+                    Err(err) => {
+                        p.error = this.error_history.report(
+                            format!("project-{}", p.id),
+                            format!("{} · {}", p.name, session::display_path(&p.path)),
+                            Some(format!("{err:#}")),
+                        )
+                    }
                 }
-                cx.notify();
+                this.notify(cx);
             })
             .ok();
         })
         .detach();
-        cx.notify();
+        self.notify(cx);
     }
 
     fn show_detail(&mut self) {
@@ -4664,6 +5384,58 @@ impl Workspace {
             p.diff_generation += 1;
             p.diff_loading = false;
             p.diff = Diff::default();
+        }
+    }
+
+    fn switch_reference_tab(&mut self, tab: RefTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(project) = self.project_mut() {
+            project.ref_tab = tab;
+            self.list_focus = Some(ListFocus::Branches(project.id));
+            self.focus.focus(window);
+            cx.notify();
+        }
+    }
+
+    fn switch_file_tab(&mut self, tab: FileTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.text_selection = None;
+        self.selected_folder = None;
+        if let Some(project) = self.project_mut() {
+            project.file_tab = tab;
+            project.stage_selection.clear();
+            project.show_commit_detail = tab == FileTab::History;
+            if tab == FileTab::History && project.snapshot.commit_detail.is_some() {
+                project.error = None;
+            }
+            project.selected_file = None;
+            project.diff = Diff::default();
+            project.diff_generation += 1;
+            project.diff_loading = false;
+            self.list_focus = Some(ListFocus::Files(project.id));
+            self.focus.focus(window);
+            self.notify(cx);
+        }
+    }
+
+    fn cycle_panel_tab(&mut self, next: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.project() else {
+            return;
+        };
+        match self.list_focus {
+            Some(ListFocus::Branches(id)) if id == project.id => {
+                let index = adjacent_tab(project.ref_tab.index(), RefTab::ALL.len(), next).unwrap();
+                self.switch_reference_tab(RefTab::ALL[index], window, cx);
+            }
+            Some(ListFocus::Files(id)) if id == project.id => {
+                let tabs = [FileTab::Stage, FileTab::History];
+                let index = adjacent_tab(
+                    usize::from(project.file_tab == FileTab::History),
+                    tabs.len(),
+                    next,
+                )
+                .unwrap();
+                self.switch_file_tab(tabs[index], window, cx);
+            }
+            _ => {}
         }
     }
 
@@ -4686,11 +5458,8 @@ impl Workspace {
                     tab.label(),
                     self.project().is_some_and(|p| p.ref_tab == tab),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(p) = this.project_mut() {
-                        p.ref_tab = tab;
-                    }
-                    cx.notify();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.switch_reference_tab(tab, window, cx);
                 })),
             );
         }
@@ -5032,7 +5801,7 @@ impl Workspace {
                                             .max(0.),
                                         ));
                                         cx.stop_propagation();
-                                        cx.notify();
+                                        this.notify(cx);
                                     }),
                                 ),
                         )
@@ -5105,7 +5874,7 @@ impl Workspace {
                                     if (this.grid_width - width).abs() > 0.1 {
                                         this.grid_width = width;
                                         this.column_drag = None;
-                                        cx.notify();
+                                        this.notify(cx);
                                     }
                                 })
                                 .ok();
@@ -5186,22 +5955,8 @@ impl Workspace {
                     },
                     self.project().is_some_and(|p| p.file_tab == tab),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.text_selection = None;
-                    this.selected_folder = None;
-                    if let Some(p) = this.project_mut() {
-                        p.file_tab = tab;
-                        p.stage_selection.clear();
-                        p.show_commit_detail = tab == FileTab::History;
-                        if tab == FileTab::History && p.snapshot.commit_detail.is_some() {
-                            p.error = None;
-                        }
-                        p.selected_file = None;
-                        p.diff = Diff::default();
-                        p.diff_generation += 1;
-                        p.diff_loading = false;
-                    }
-                    cx.notify();
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.switch_file_tab(tab, window, cx);
                 })),
             );
         }
@@ -5271,7 +6026,7 @@ impl Workspace {
                             this.list_focus = Some(ListFocus::Files(id));
                             this.focus.focus(window);
                             this.show_detail();
-                            cx.notify();
+                            this.notify(cx);
                         })),
                 )
             })
@@ -5617,21 +6372,22 @@ impl Workspace {
                         .text_xs()
                         .child(format!("변경 줄 {selected_count}개 선택"))
                         .child(
-                            button(
+                            self.shortcut_button(
                                 "stage-selected-lines",
-                                format!(
-                                    "선택한 줄 Stage · {}",
-                                    self.shortcuts.label("viewer-stage-lines")
-                                ),
+                                "선택한 줄 Stage",
+                                "viewer-stage-lines",
                                 selected_count > 0 && !blocked,
                             )
+                            .min_w(px(220.))
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
                             .when(selected_count == 0 || blocked, |button| button.opacity(0.4))
                             .on_click(cx.listener(
                                 move |this, _, _, cx| this.stage_partial(id, generation, None, cx),
                             )),
                         )
                         .child(div().text_color(rgb(MUTED)).child(format!(
-                            "{}: 현재 줄 체크/해제",
+                            "{}: 선택 범위/현재 줄 체크·해제",
                             self.shortcuts.label("viewer-toggle-line")
                         ))),
                 )
@@ -5857,12 +6613,20 @@ impl Workspace {
             .filter(|(selected, _)| *selected == key)
             .map(|(_, selection)| selection.clone());
         let focused = matches!(self.list_focus, Some(ListFocus::Text(selected)) if selected == key);
+        let cursor_allowed = key.1 == 31
+            || self
+                .tabs
+                .iter()
+                .filter_map(WorkspaceTab::project)
+                .find(|project| project.id == key.0)
+                .and_then(|project| project.diff.lines.get(row))
+                .is_some_and(|line| line.old.is_some() || line.new.is_some());
         let view = cx.weak_entity();
         div()
             .flex_1()
             .min_w_0()
             .h_full()
-            .cursor(CursorStyle::IBeam)
+            .when(cursor_allowed, |line| line.cursor(CursorStyle::IBeam))
             .child(
                 canvas(
                     |_, _, _| (),
@@ -5894,7 +6658,7 @@ impl Workspace {
                                     rgb(TEXT_SELECTION),
                                 ));
                             }
-                            if focused && selection.cursor.row == row {
+                            if focused && cursor_allowed && selection.cursor.row == row {
                                 window.paint_quad(fill(
                                     Bounds::new(
                                         bounds.origin
@@ -5920,7 +6684,8 @@ impl Workspace {
                             }
                             down_view
                                 .update(cx, |this, cx| {
-                                    if this.history_in_progress()
+                                    if !cursor_allowed
+                                        || this.history_in_progress()
                                         || this.help
                                         || this.commit_dialog.is_some()
                                         || this.discard_dialog.is_some()
@@ -5974,7 +6739,8 @@ impl Workspace {
                             }
                             move_view
                                 .update(cx, |this, cx| {
-                                    if !this.text_drag
+                                    if !cursor_allowed
+                                        || !this.text_drag
                                         || this.history_in_progress()
                                         || this.help
                                         || this.commit_dialog.is_some()
@@ -6045,6 +6811,16 @@ impl Workspace {
                 )
                 .size_full(),
             )
+    }
+}
+
+fn toggle_checked_rows(selected: &mut std::collections::BTreeSet<usize>, rows: &[usize]) {
+    if rows.iter().all(|row| selected.contains(row)) {
+        for row in rows {
+            selected.remove(row);
+        }
+    } else {
+        selected.extend(rows.iter().copied());
     }
 }
 
@@ -6437,7 +7213,7 @@ impl Workspace {
         let revert = project.snapshot.revert.is_some();
         let blocked = self.busy() || self.branch_busy;
         let ready = conflicts == 0 && !blocked;
-        div()
+        let banner = div()
             .px_3()
             .py_2()
             .flex()
@@ -6565,6 +7341,34 @@ impl Workspace {
                         this.open_merge_control(crate::branches::MergeControl::Abort, window, cx)
                     }
                 })),
+            );
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .child(banner)
+            .when_some(
+                project
+                    .snapshot
+                    .revert
+                    .as_ref()
+                    .filter(|state| !state.conflicts.is_empty()),
+                |banner, state| {
+                    let mut files = div()
+                        .id("revert-conflict-files")
+                        .max_h(px(120.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .bg(rgb(PANEL))
+                        .text_sm()
+                        .child(div().text_color(rgb(ERROR)).child("되돌리기 충돌 파일"));
+                    for path in &state.conflicts {
+                        files =
+                            files.child(div().child(String::from_utf8_lossy(path).into_owned()));
+                    }
+                    banner.child(files)
+                },
             )
     }
 
@@ -6631,13 +7435,8 @@ impl Workspace {
                                 cx.notify();
                             })),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.active = Some(id);
-                        this.ensure_active_loaded(cx);
-                        this.list_focus = None;
-                        this.text_selection = None;
-                        this.persist();
-                        cx.notify();
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_project_tab(id, window, cx);
                     })),
             );
         }
@@ -6681,39 +7480,18 @@ impl Workspace {
                 .font_family("Segoe UI")
                 .child(top)
                 .child(self.start_page(cx))
-                .when_some(self.status_error.clone(), |page, error| {
-                    page.child(
-                        div()
-                            .px_4()
-                            .py_2()
-                            .text_sm()
-                            .text_color(rgb(ERROR))
-                            .child(error),
-                    )
-                })
                 .child(
                     div()
                         .flex()
-                        .justify_end()
+                        .items_center()
                         .h_8()
                         .flex_shrink_0()
                         .px_4()
-                        .child(
-                            div()
-                                .id("start-help")
-                                .text_xs()
-                                .text_color(rgb(ACCENT))
-                                .cursor_pointer()
-                                .child(crate::shortcut::hint(
-                                    "도움말",
-                                    &self.shortcuts.label("help"),
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.help = true;
-                                    this.focus.focus(window);
-                                    cx.notify();
-                                })),
-                        )
+                        .bg(rgb(BG))
+                        .when(self.error_history.len() > 0, |footer| {
+                            footer.child(self.error_indicator(cx))
+                        })
+                        .child(div().flex_1().min_w_0())
                         .child(self.shortcuts_link(cx))
                         .child(self.settings_link(cx)),
                 );
@@ -6828,9 +7606,7 @@ impl Workspace {
                         }),
                 )
             });
-        let status = if let Some(error) = &self.status_error {
-            error.clone()
-        } else if let Some(project) = self.project() {
+        let status = if let Some(project) = self.project() {
             let loading =
                 if let Some((_, label)) = self.remote_status.filter(|(id, _)| *id == project.id) {
                     format!("  ·  {label}")
@@ -6873,36 +7649,22 @@ impl Workspace {
                     .flex_shrink_0()
                     .border_t_1()
                     .border_color(rgb(LINE))
+                    .bg(rgb(BG))
+                    .when(self.error_history.len() > 0, |footer| {
+                        footer.child(self.error_indicator(cx))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .text_xs()
                             .text_ellipsis()
-                            .text_color(rgb(if self.status_error.is_some() {
-                                ERROR
-                            } else {
-                                MUTED
-                            }))
+                            .text_color(rgb(MUTED))
+                            .when(self.error_history.len() > 0, |status| status.ml_2())
                             .child(status),
                     )
-                    .child(
-                        div()
-                            .ml_3()
-                            .text_xs()
-                            .text_color(rgb(ACCENT))
-                            .cursor_pointer()
-                            .child(crate::shortcut::hint(
-                                "도움말",
-                                &self.shortcuts.label("help"),
-                            ))
-                            .id("show-help")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.help = true;
-                                this.focus.focus(window);
-                                cx.notify();
-                            })),
-                    )
+                    .child(self.terminal_link(cx))
+                    .child(self.explorer_link(cx))
                     .child(self.shortcuts_link(cx))
                     .child(self.settings_link(cx)),
             )
@@ -6911,7 +7673,8 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_status_error(cx);
+        self.collect_errors(cx);
+        self.sync_error_editor(cx);
         if self.focus_after_popup || window.focused(cx).is_none() {
             self.focus_after_popup = false;
             if matches!(self.branch_dialog.as_ref().map(|dialog| &dialog.action), Some(BranchAction::Connect { plan, .. }) if !plan.candidates.is_empty())
@@ -6950,7 +7713,8 @@ impl Render for Workspace {
             let title;
             let mut width = 500.;
             let mut footer: Option<AnyElement> = None;
-            let mut header_action: Option<AnyElement> = None;
+            let header_action: Option<AnyElement> = None;
+            let mut body_header = None;
             let mut card = div().flex().flex_col().gap_3().min_w_0().text_sm();
             if busy {
                 let message = if self.branch_busy {
@@ -7086,7 +7850,10 @@ impl Render for Workspace {
                                         )
                                         .when(!can_delete_related, |button| button.opacity(0.45))
                                         .child(crate::controls::checkbox(*delete_related, checkbox))
-                                        .on_click(cx.listener(|this, _, window, cx| {
+                                        .on_click(cx.listener(|this, event, window, cx| {
+                                            if !crate::controls::checkbox_click(event) {
+                                                return;
+                                            }
                                             if this.branch_busy {
                                                 return;
                                             }
@@ -7099,7 +7866,7 @@ impl Render for Workspace {
                                             {
                                                 *delete_related = !*delete_related;
                                                 this.branch_checks_focus[0].focus(window);
-                                                cx.notify();
+                                                this.notify(cx);
                                             }
                                         })),
                                 );
@@ -7157,7 +7924,7 @@ impl Render for Workspace {
                                             *selected = index;
                                         }
                                         this.upstream_focus.focus(window);
-                                        cx.notify();
+                                        this.notify(cx);
                                     })),
                             );
                         }
@@ -7228,7 +7995,7 @@ impl Render for Workspace {
                                             *mode = option;
                                         }
                                         this.reset_mode_focus.focus(window);
-                                        cx.notify();
+                                        this.notify(cx);
                                     })),
                             );
                         }
@@ -7251,7 +8018,10 @@ impl Render for Workspace {
                                     button.bg(rgb(SELECT))
                                 })
                                 .child(crate::controls::checkbox(*no_commit, "no commit"))
-                                .on_click(cx.listener(|this, _, window, cx| {
+                                .on_click(cx.listener(|this, event, window, cx| {
+                                    if !crate::controls::checkbox_click(event) {
+                                        return;
+                                    }
                                     if this.branch_busy {
                                         return;
                                     }
@@ -7264,7 +8034,7 @@ impl Render for Workspace {
                                     }
                                     this.branch_checks_focus[0].focus(window);
                                     this.persist();
-                                    cx.notify();
+                                    this.notify(cx);
                                 })),
                         );
                     }
@@ -7310,14 +8080,14 @@ impl Render for Workspace {
                                     .track_focus(&self.branch_checks_focus[0])
                                     .child(crate::controls::checkbox(*no_commit, "커밋하지 않기"))
                                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                                        if !matches!(event, ClickEvent::Mouse(_)) { return; }
+                                        if !crate::controls::checkbox_click(event) { return; }
                                         if this.branch_busy { return; }
                                         if let Some(dialog) = &mut this.branch_dialog
                                             && let BranchAction::RevertControl { no_commit, .. } = &mut dialog.action {
                                             *no_commit = !*no_commit;
                                         }
                                         this.branch_checks_focus[0].focus(window);
-                                        cx.notify();
+                                        this.notify(cx);
                                     })));
                         }
                     }
@@ -7364,7 +8134,10 @@ impl Render for Workspace {
                                 .items_center()
                                 .text_size(px(13.))
                                 .child(crate::controls::checkbox(checked, label))
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                                .on_click(cx.listener(move |this, event, window, cx| {
+                                    if !crate::controls::checkbox_click(event) {
+                                        return;
+                                    }
                                     this.branch_checks_focus[usize::from(switching)].focus(window);
                                     if let Some(dialog) = &mut this.branch_dialog
                                         && let BranchAction::Create {
@@ -7385,7 +8158,7 @@ impl Render for Workspace {
                                             this.popup_options.branch_checkout = *checkout;
                                         }
                                         this.persist();
-                                        cx.notify();
+                                        this.notify(cx);
                                     }
                                 })),
                         );
@@ -7403,21 +8176,17 @@ impl Render for Workspace {
                             .gap_2()
                             .when(minimal, |footer| footer.justify_end())
                             .child(
-                                button("confirm-branch", "확인", true)
+                                self.shortcut_button("confirm-branch", "확인", "confirm", true)
                                     .when(!can_submit, |button| button.opacity(0.4))
                                     .when(create, |button| button.text_size(px(13.)))
                                     .on_click(cx.listener(|this, _, _, cx| this.submit_branch(cx))),
                             )
                             .when(!minimal, |footer| {
                                 footer.child(
-                                    button(
-                                        "cancel-branch",
-                                        format!("취소 · {}", self.shortcuts.label("cancel")),
-                                        false,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| this.close_branch_dialog(window, cx),
-                                    )),
+                                    self.shortcut_button("cancel-branch", "취소", "cancel", false)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_branch_dialog(window, cx)
+                                        })),
                                 )
                             })
                             .into_any_element(),
@@ -7426,32 +8195,27 @@ impl Render for Workspace {
             } else if let Some(settings) = &self.settings {
                 title = "세팅";
                 width = 760.;
-                header_action = Some(
-                    button(
-                        "close-settings",
-                        format!("취소 · {}", self.shortcuts.label("cancel")),
-                        false,
-                    )
-                    .when(!settings.read(cx).can_close(), |button| {
-                        button.opacity(0.45)
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.close_settings(window, cx)))
-                    .into_any_element(),
+                let keys = self.shortcuts.label("confirm");
+                footer = Some(
+                    settings
+                        .update(cx, |settings, cx| settings.save_button(&keys, cx))
+                        .into_any_element(),
                 );
                 card = card.child(settings.clone());
             } else if let Some(dialog) = &self.stash_dialog {
                 title = if dialog.deletion.is_some() {
                     "Stash 삭제"
                 } else {
-                    "스태시 이름 입력"
+                    "스태시 추가"
                 };
                 width = 640.;
                 card = card
-                    .when_some(dialog.editor.clone(), |card, editor| card.child(editor))
-                    .child(if let Some((_, _, name)) = &dialog.deletion {
-                        format!("{name}\n스태시를 목록에서 영구히 삭제합니다. 현재 파일과 stage 상태는 유지됩니다.")
-                    } else {
-                        "이름을 입력하세요. 모든 tracked 파일의 staged·unstaged 변경과 untracked 파일을 저장합니다. Stage 상태도 보관하며 ignored 파일은 제외합니다.".to_owned()
+                    .when_some(dialog.editor.clone(), |card, editor| {
+                        card.child(div().text_color(rgb(MUTED)).child("스태시 이름"))
+                            .child(editor)
+                    })
+                    .when_some(dialog.deletion.as_ref(), |card, (_, _, name)| {
+                        card.child(format!("{name}\n스태시를 목록에서 영구히 삭제합니다. 현재 파일과 stage 상태는 유지됩니다."))
                     })
                     .when_some(dialog.error.clone(), |card, error| card.child(div().text_color(rgb(ERROR)).child(error)));
                 if dialog.busy {
@@ -7462,31 +8226,15 @@ impl Render for Workspace {
                     });
                 } else {
                     footer = Some(
-                        (div()
+                        div()
                             .flex()
                             .flex_row_reverse()
                             .gap_2()
                             .child(
-                                button("confirm-stash", "확인", true)
+                                self.shortcut_button("confirm-stash", "확인", "confirm", true)
                                     .on_click(cx.listener(|this, _, _, cx| this.stash_changes(cx))),
                             )
-                            .when(dialog.deletion.is_none(), |footer| {
-                                footer.child(
-                                    button(
-                                        "cancel-stash",
-                                        format!("취소 · {}", self.shortcuts.label("cancel")),
-                                        false,
-                                    )
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| {
-                                            this.stash_dialog = None;
-                                            this.focus.focus(window);
-                                            cx.notify();
-                                        },
-                                    )),
-                                )
-                            }))
-                        .into_any_element(),
+                            .into_any_element(),
                     );
                 }
             } else if let Some(dialog) = &self.discard_dialog {
@@ -7497,7 +8245,7 @@ impl Render for Workspace {
                     .when_some(dialog.error.clone(), |card, error| card.child(div().text_color(rgb(ERROR)).child(error)))
                     .when(dialog.busy, |card| card.child("변경사항을 폐기하는 중입니다…"));
                 footer = Some(
-                    button("confirm-discard", "확인", true)
+                    self.shortcut_button("confirm-discard", "확인", "confirm", true)
                         .when(dialog.busy, |button| button.opacity(0.45))
                         .on_click(cx.listener(|this, _, _, cx| this.discard_selected(cx)))
                         .into_any_element(),
@@ -7516,14 +8264,17 @@ impl Render for Workspace {
                             })
                             .when(dialog.busy, |button| button.opacity(0.45))
                             .child(crate::controls::checkbox(dialog.push_after, "커밋 후 푸시"))
-                            .on_click(cx.listener(|this, _, window, cx| {
+                            .on_click(cx.listener(|this, event, window, cx| {
+                                if !crate::controls::checkbox_click(event) {
+                                    return;
+                                }
                                 if let Some(dialog) = &mut this.commit_dialog
                                     && !dialog.busy
                                     && !dialog.editor.read(cx).is_composing()
                                 {
                                     dialog.push_after = !dialog.push_after;
                                     this.commit_push_focus.focus(window);
-                                    cx.notify();
+                                    this.notify(cx);
                                 }
                             })),
                     )
@@ -7538,7 +8289,7 @@ impl Render for Workspace {
                         })
                     });
                 footer = Some(
-                    button("confirm-commit", "확인", true)
+                    self.shortcut_button("confirm-commit", "확인", "confirm", true)
                         .when(dialog.busy, |button| button.opacity(0.45))
                         .on_click(cx.listener(|this, _, _, cx| this.submit_commit(cx)))
                         .into_any_element(),
@@ -7550,34 +8301,34 @@ impl Render for Workspace {
                 card = card
                     .child(session::display_path(path))
                     .child("목록에서만 제거하거나 저장소 폴더를 삭제할 수 있습니다.");
-                footer =
-                    Some(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(button("forget-recent", "목록에서 제거", false).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    if let Some(path) = this.delete_target.take() {
-                                        this.recent.retain(|item| *item != path);
-                                        this.persist();
-                                    }
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(button("choose-delete", "저장소 삭제…", false).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.delete_confirm = true;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(button("cancel-recent-action", "취소", false).on_click(
-                                cx.listener(|this, _, _, cx| {
+                footer = Some(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(button("forget-recent", "목록에서 제거", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(path) = this.delete_target.take() {
+                                    this.recent.retain(|item| *item != path);
+                                    this.persist();
+                                }
+                                this.notify(cx);
+                            }),
+                        ))
+                        .child(button("choose-delete", "저장소 삭제…", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.delete_confirm = true;
+                                this.notify(cx);
+                            }),
+                        ))
+                        .child(
+                            self.shortcut_button("cancel-recent-action", "취소", "cancel", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
                                     this.delete_target = None;
-                                    cx.notify();
-                                }),
-                            ))
-                            .into_any_element(),
-                    );
+                                    this.notify(cx);
+                                })),
+                        )
+                        .into_any_element(),
+                );
             } else if let Some(path) = &self.delete_target {
                 title = "저장소 삭제";
                 card = card
@@ -7587,12 +8338,13 @@ impl Render for Workspace {
                     div()
                         .flex()
                         .gap_2()
-                        .child(button("cancel-delete", "취소", false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.delete_target = None;
-                                cx.notify();
-                            },
-                        )))
+                        .child(
+                            self.shortcut_button("cancel-delete", "취소", "cancel", false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.delete_target = None;
+                                    this.notify(cx);
+                                })),
+                        )
                         .child(
                             button("confirm-delete", "휴지통으로 이동", true)
                                 .on_click(cx.listener(|this, _, _, cx| this.delete_repository(cx))),
@@ -7608,22 +8360,31 @@ impl Render for Workspace {
                 width = 820.;
                 card = card.child(self.shortcuts_table(self.shortcut_settings, cx));
                 if self.shortcut_settings {
+                    body_header = Some(self.shortcut_tabs(cx));
                     footer = Some(
                         div()
                             .flex()
                             .gap_2()
-                            .child(button("reset-shortcuts", "기본값 복원", false).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.shortcut_draft =
-                                        Some(crate::shortcut::Bindings::default());
-                                    this.shortcut_capture = None;
-                                    this.shortcut_message = None;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(button("confirm-shortcuts", "확인", true).on_click(
-                                cx.listener(|this, _, window, cx| this.apply_shortcuts(window, cx)),
-                            ))
+                            .child(
+                                self.shortcut_button(
+                                    "reset-shortcuts",
+                                    "기본값 복원",
+                                    "shortcuts-reset",
+                                    false,
+                                )
+                                .bg(rgb(BUTTON))
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.reset_shortcuts(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                self.shortcut_button("confirm-shortcuts", "확인", "confirm", true)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.apply_shortcuts(window, cx)
+                                    })),
+                            )
                             .into_any_element(),
                     );
                 }
@@ -7631,7 +8392,10 @@ impl Render for Workspace {
             let card = crate::popup::frame(
                 title,
                 width,
-                card,
+                crate::popup::Body {
+                    header: body_header,
+                    content: card,
+                },
                 footer,
                 header_action,
                 window.viewport_size().height,
@@ -7688,12 +8452,22 @@ impl Render for Workspace {
                             this.discard_dialog = None;
                             this.stash_dialog = None;
                             this.focus.focus(window);
-                            cx.notify();
+                            this.notify(cx);
                         }
                         cx.stop_propagation();
                     }))
                     .child(card),
             );
+        }
+        if let Some(settings) = &self.settings
+            && settings.read(cx).child_popup_open(cx)
+        {
+            let keys = self.shortcuts.label("confirm");
+            root = root
+                .child(settings.update(cx, |settings, cx| settings.child_popup(&keys, window, cx)));
+        }
+        if self.error_history_open && self.error_history.len() > 0 {
+            root = root.child(self.error_overlay(window, cx));
         }
         root
     }
@@ -7702,6 +8476,48 @@ impl Render for Workspace {
 #[cfg(test)]
 mod detail_tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn panel_tabs_cycle_forward_and_backward_and_handle_empty_or_single_tabs() {
+        let mut current = 0;
+        for expected in [1, 2, 3, 0] {
+            current = adjacent_tab(current, RefTab::ALL.len(), true).unwrap();
+            assert_eq!(current, expected);
+        }
+        for expected in [3, 2, 1, 0] {
+            current = adjacent_tab(current, RefTab::ALL.len(), false).unwrap();
+            assert_eq!(current, expected);
+        }
+        for next in [true, false] {
+            assert_eq!(adjacent_tab(0, 2, next), Some(1));
+            assert_eq!(adjacent_tab(1, 2, next), Some(0));
+            assert_eq!(adjacent_tab(0, 1, next), Some(0));
+            assert_eq!(adjacent_tab(0, 0, next), None);
+        }
+        assert_eq!(
+            adjacent_tab(0, crate::shortcut::GROUPS.len(), false),
+            Some(4)
+        );
+        assert_eq!(
+            adjacent_tab(4, crate::shortcut::GROUPS.len(), true),
+            Some(0)
+        );
+        assert_eq!(adjacent_tab(0, 3, false), Some(2));
+        assert_eq!(adjacent_tab(2, 3, true), Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn range_check_completes_mixed_rows_then_clears_them_without_touching_other_rows() {
+        let mut checked = std::collections::BTreeSet::from([1, 9]);
+        toggle_checked_rows(&mut checked, &[1, 3, 6]);
+        assert_eq!(checked, std::collections::BTreeSet::from([1, 3, 6, 9]));
+        toggle_checked_rows(&mut checked, &[1, 3, 6]);
+        assert_eq!(checked, std::collections::BTreeSet::from([9]));
+        toggle_checked_rows(&mut checked, &[]);
+        assert_eq!(checked, std::collections::BTreeSet::from([9]));
+        toggle_checked_rows(&mut checked, &[9]);
+        assert!(checked.is_empty());
+    }
 
     #[::core::prelude::v1::test]
     fn ijkl_and_checkout_digit_shortcuts_map_correctly() {

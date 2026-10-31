@@ -1,6 +1,7 @@
 use crate::settings_git::GitContext;
 use anyhow::{Context, Result, bail};
-use std::{path::Path, process::Command};
+use feather_git::native_git::Command;
+use std::path::Path;
 
 #[derive(Clone)]
 pub struct CheckoutTarget {
@@ -257,8 +258,27 @@ fn validate_operation(path: &Path, commit: &str) -> Result<()> {
     Ok(())
 }
 
+fn revert_failure(path: &Path, error: anyhow::Error) -> anyhow::Error {
+    let conflicts = feather_git::git::revert_state(path)
+        .ok()
+        .flatten()
+        .map(|state| state.conflicts)
+        .unwrap_or_default();
+    if conflicts.is_empty() {
+        return error;
+    }
+    anyhow::anyhow!(
+        "{error:#}\n\n되돌리기 충돌 파일:\n{}",
+        conflicts
+            .iter()
+            .map(|path| format!("- {}", String::from_utf8_lossy(path)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 pub fn revert_commit(path: &Path, commit: &str, no_commit: bool) -> Result<()> {
-    validate_operation(path, commit)?;
+    validate_operation(path, commit).map_err(|error| revert_failure(path, error))?;
     let selection = format!("{commit}^!");
     execute(
         path,
@@ -271,7 +291,8 @@ pub fn revert_commit(path: &Path, commit: &str, no_commit: bool) -> Result<()> {
             },
             &selection,
         ],
-    )?;
+    )
+    .map_err(|error| revert_failure(path, error))?;
     if no_commit {
         execute(path, &["revert", "--quit"])?;
     }
@@ -1134,9 +1155,14 @@ pub fn checkout(path: &Path, target: &CheckoutTarget, allow_create: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn oracle_command(path: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(path).env("GIT_TERMINAL_PROMPT", "0");
+        command
+    }
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let output = command(repo).args(args).output().unwrap();
+        let output = oracle_command(repo).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -1675,7 +1701,7 @@ mod tests {
             let path = repo.path();
             let first = feather_git::git::revert_state(path).unwrap().unwrap();
             control_revert(path, &first, RevertControl::Abort, false).unwrap();
-            let output = command(path)
+            let output = oracle_command(path)
                 .args([
                     "revert",
                     if no_commit {
@@ -1736,7 +1762,7 @@ mod tests {
         std::fs::write(path.join("second.txt"), "later second").unwrap();
         git(path, &["commit", "-am", "later"]);
         let head = git(path, &["rev-parse", "HEAD"]);
-        let output = command(path)
+        let output = oracle_command(path)
             .args([
                 "revert",
                 if no_commit {
@@ -1818,7 +1844,7 @@ mod tests {
         let path = repo.path();
         let state = feather_git::git::revert_state(path).unwrap().unwrap();
         control_revert(path, &state, RevertControl::Abort, false).unwrap();
-        let output = command(path)
+        let output = oracle_command(path)
             .args(["cherry-pick", &target])
             .output()
             .unwrap();
@@ -1852,6 +1878,57 @@ mod tests {
                 no_commit
             );
         }
+    }
+
+    #[test]
+    fn revert_diagnostic_lists_real_unicode_conflicts_but_not_dirty_worktree_rejection() {
+        let repo = repository();
+        let path = repo.path();
+        std::fs::create_dir(path.join("nested")).unwrap();
+        let files = ["nested/한글.txt", "top.txt"];
+        for name in files {
+            std::fs::write(path.join(name), "base\n").unwrap();
+        }
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base files"]);
+        for name in files {
+            std::fs::write(path.join(name), "target\n").unwrap();
+        }
+        git(path, &["commit", "-am", "target"]);
+        let target = git(path, &["rev-parse", "HEAD"]);
+        for name in files {
+            std::fs::write(path.join(name), "later\n").unwrap();
+        }
+        git(path, &["commit", "-am", "later"]);
+        let head = git(path, &["rev-parse", "HEAD"]);
+        let message = revert_commit(path, &target, false).unwrap_err().to_string();
+        assert!(message.contains("브랜치 작업 실패:"));
+        assert!(message.contains("되돌리기 충돌 파일:\n- nested/한글.txt\n- top.txt"));
+        let state = feather_git::git::revert_state(path).unwrap().unwrap();
+        assert_eq!(state.conflicts, files.map(|name| name.as_bytes().to_vec()));
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), head);
+        for name in files {
+            assert!(
+                std::fs::read_to_string(path.join(name))
+                    .unwrap()
+                    .contains("<<<<<<<")
+            );
+        }
+
+        let dirty = repository();
+        let path = dirty.path();
+        std::fs::write(path.join("file.txt"), "target\n").unwrap();
+        git(path, &["commit", "-am", "target"]);
+        let target = git(path, &["rev-parse", "HEAD"]);
+        std::fs::write(path.join("file.txt"), "uncommitted\n").unwrap();
+        let message = revert_commit(path, &target, false).unwrap_err().to_string();
+        assert!(!message.contains("되돌리기 충돌 파일:"));
+        assert_eq!(
+            std::fs::read_to_string(path.join("file.txt")).unwrap(),
+            "uncommitted\n"
+        );
+        assert_eq!(git(path, &["rev-parse", "HEAD"]), target);
+        assert!(git(path, &["ls-files", "-u"]).is_empty());
     }
 
     #[test]
@@ -2040,7 +2117,7 @@ mod tests {
         git(path, &["commit", "-am", "main"]);
         let patch_path = repo.path().join("incoming.patch");
         std::fs::write(&patch_path, patch).unwrap();
-        let output = command(path)
+        let output = oracle_command(path)
             .args(["am", patch_path.to_str().unwrap()])
             .output()
             .unwrap();
@@ -2174,7 +2251,8 @@ mod tests {
                 .replace("\r\n", "\n"),
             "main\n"
         );
-        assert!(git(path, &["status", "--porcelain"]).is_empty());
+        let status = git(path, &["status", "--porcelain"]);
+        assert!(status.is_empty(), "{status}");
         assert!(control_merge(path, &state, MergeControl::Abort).is_err());
     }
 
@@ -2551,7 +2629,7 @@ mod tests {
             "first"
         );
         assert!(
-            !command(path)
+            !oracle_command(path)
                 .args(["symbolic-ref", "--quiet", "HEAD"])
                 .output()
                 .unwrap()

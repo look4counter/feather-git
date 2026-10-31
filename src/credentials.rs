@@ -10,6 +10,7 @@ use std::{
 pub struct LoginTarget {
     host: String,
     path: String,
+    username: Option<String>,
 }
 
 impl LoginTarget {
@@ -41,11 +42,29 @@ impl LoginTarget {
         Ok(Self {
             host,
             path: url.path().trim_start_matches('/').to_owned(),
+            username: None,
         })
     }
 
     fn input(&self) -> Vec<u8> {
-        format!("protocol=https\nhost={}\npath={}\n\n", self.host, self.path).into_bytes()
+        format!(
+            "protocol=https\nhost={}\npath={}\n{}\n",
+            self.host,
+            self.path,
+            self.username
+                .as_ref()
+                .map(|name| format!("username={name}\n"))
+                .unwrap_or_default()
+        )
+        .into_bytes()
+    }
+
+    pub fn for_account(mut self, username: &str) -> Result<Self> {
+        if username.chars().any(|c| c.is_control()) {
+            bail!("계정 ID에 제어문자를 사용할 수 없습니다.");
+        }
+        self.username = (!username.trim().is_empty()).then(|| username.trim().to_owned());
+        Ok(self)
     }
 }
 
@@ -67,9 +86,9 @@ pub struct Gcm {
 
 impl Gcm {
     pub fn detect(context: &GitContext) -> Option<Self> {
-        for name in ["credential-manager", "credential-manager-core"] {
-            let mut command = context.command();
-            command.args([name, "--version"]);
+        for name in feather_git::native_git::credential_helpers() {
+            let mut command = helper_command(context, &name);
+            command.arg("--version");
             if run_process(
                 command,
                 &[],
@@ -79,16 +98,12 @@ impl Gcm {
             .is_ok()
             {
                 return Some(Self {
-                    command: name.into(),
+                    command: name.to_string_lossy().into_owned(),
                     context: context.clone(),
                 });
             }
         }
         None
-    }
-
-    pub fn configure(&self, cancel: &AtomicBool) -> Result<()> {
-        self.run("configure", &[], false, cancel).map(|_| ())
     }
 }
 
@@ -100,38 +115,21 @@ impl CredentialRunner for Gcm {
         interactive: bool,
         cancel: &AtomicBool,
     ) -> Result<Vec<u8>> {
-        let mut command = self.context.command();
-        command.args([
-            "-c",
-            "credential.trace=false",
-            "-c",
-            "credential.traceSecrets=false",
-            "-c",
-            "credential.msauthFlow=system",
-            "-c",
-            "credential.msauthUseBroker=false",
-        ]);
-        if action == "configure" {
-            command.args([&self.command, action]);
-        } else {
-            let helper = self
-                .command
-                .strip_prefix("credential-")
-                .unwrap_or("manager");
-            command.args([
-                "-c",
-                "credential.helper=",
-                "-c",
-                &format!("credential.helper={helper}"),
-                "credential",
-            ]);
-            command.arg(match action {
-                "get" => "fill",
-                "store" => "approve",
-                "erase" => "reject",
-                _ => bail!("지원하지 않는 인증 작업입니다."),
-            });
+        if !["get", "store", "erase"].contains(&action) {
+            bail!("지원하지 않는 인증 작업입니다.");
         }
+        let mut command = helper_command(&self.context, std::path::Path::new(&self.command));
+        command
+            .arg(action)
+            .env("GIT_CONFIG_COUNT", "4")
+            .env("GIT_CONFIG_KEY_0", "credential.trace")
+            .env("GIT_CONFIG_VALUE_0", "false")
+            .env("GIT_CONFIG_KEY_1", "credential.traceSecrets")
+            .env("GIT_CONFIG_VALUE_1", "false")
+            .env("GIT_CONFIG_KEY_2", "credential.msauthFlow")
+            .env("GIT_CONFIG_VALUE_2", "system")
+            .env("GIT_CONFIG_KEY_3", "credential.msauthUseBroker")
+            .env("GIT_CONFIG_VALUE_3", "false");
         command
             .env(
                 "GCM_INTERACTIVE",
@@ -146,6 +144,9 @@ impl CredentialRunner for Gcm {
             .env("GIT_TRACE", "0")
             .env("GIT_TRACE_CURL", "0")
             .env("GIT_CURL_VERBOSE", "0");
+        if interactive {
+            command.env("GCM_GITHUB_ALWAYS_REFRESH_CREDENTIALS", "true");
+        }
         run_process(
             command,
             input,
@@ -153,6 +154,19 @@ impl CredentialRunner for Gcm {
             cancel,
         )
     }
+}
+
+fn helper_command(context: &GitContext, executable: &std::path::Path) -> Command {
+    let mut command = Command::new(executable);
+    if let Some(path) = &context.repository {
+        command.current_dir(path);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
 }
 
 fn run_process(
@@ -286,6 +300,40 @@ pub fn logout(
         .map(|_| ())
 }
 
+pub fn logout_profile(
+    runner: Option<&impl CredentialRunner>,
+    profile: &feather_git::auth_profiles::AuthProfile,
+    store: &dyn feather_git::auth_profiles::ExistingCredentialStore,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("로그아웃을 취소했습니다.");
+    }
+    let helper_result = if let Some(runner) = runner
+        && !profile.username.is_empty()
+        && profile.username != "저장된 계정"
+    {
+        let target = LoginTarget::parse(&profile.url)?.for_account(&profile.username)?;
+        Some(logout(runner, &target, cancel))
+    } else {
+        None
+    };
+    if cancel.load(Ordering::Relaxed) {
+        bail!("로그아웃을 취소했습니다.");
+    }
+    let removed = feather_git::auth_profiles::erase_existing_for(profile, store)?;
+    if removed > 0
+        || profile.imported
+        || helper_result.as_ref().is_some_and(|result| result.is_ok())
+    {
+        return Ok(());
+    }
+    if let Some(Err(error)) = helper_result {
+        return Err(error);
+    }
+    bail!("GCM 도구나 제거할 저장 인증을 확인하지 못했습니다. 앱 인증 등록은 유지합니다.")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +395,156 @@ mod tests {
     struct FakeGcm {
         calls: Mutex<Vec<(String, Vec<u8>, bool)>>,
     }
+
+    struct ExistingStore {
+        entries: Mutex<Vec<feather_git::auth_profiles::ExistingCredential>>,
+        ignore_delete: bool,
+        fail_delete: bool,
+    }
+    impl feather_git::auth_profiles::ExistingCredentialStore for ExistingStore {
+        fn entries(&self) -> Result<Vec<feather_git::auth_profiles::ExistingCredential>> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+        fn erase(&self, target: &str) -> Result<()> {
+            if self.fail_delete {
+                bail!("권한 오류");
+            }
+            if !self.ignore_delete {
+                self.entries
+                    .lock()
+                    .unwrap()
+                    .retain(|entry| entry.target != target);
+            }
+            Ok(())
+        }
+    }
+    fn windows_profile() -> feather_git::auth_profiles::AuthProfile {
+        feather_git::auth_profiles::AuthProfile {
+            id: "existing".into(),
+            url: "https://github.com".into(),
+            username: "alice".into(),
+            method: feather_git::auth_profiles::AuthMethod::Gcm,
+            imported: true,
+            hidden: false,
+        }
+    }
+    fn windows_entries() -> Vec<feather_git::auth_profiles::ExistingCredential> {
+        vec![
+            feather_git::auth_profiles::ExistingCredential {
+                target: "git:https://alice@github.com".into(),
+                username: "alice".into(),
+            },
+            feather_git::auth_profiles::ExistingCredential {
+                target: "git:https://bob@github.com".into(),
+                username: "bob".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn helper_noop_success_still_removes_exact_windows_account_and_supports_no_helper() {
+        let runner = FakeGcm::default();
+        let profile = windows_profile();
+        let store = ExistingStore {
+            entries: Mutex::new(windows_entries()),
+            ignore_delete: false,
+            fail_delete: false,
+        };
+        logout_profile(Some(&runner), &profile, &store, &AtomicBool::new(false)).unwrap();
+        assert_eq!(store.entries.lock().unwrap().len(), 1);
+        assert_eq!(store.entries.lock().unwrap()[0].username, "bob");
+        assert_eq!(runner.calls.lock().unwrap()[0].0, "erase");
+        let store = ExistingStore {
+            entries: Mutex::new(windows_entries()),
+            ignore_delete: false,
+            fail_delete: false,
+        };
+        logout_profile(None::<&FakeGcm>, &profile, &store, &AtomicBool::new(false)).unwrap();
+        assert_eq!(store.entries.lock().unwrap().len(), 1);
+        struct FailedHelper;
+        impl CredentialRunner for FailedHelper {
+            fn run(&self, _: &str, _: &[u8], _: bool, _: &AtomicBool) -> Result<Vec<u8>> {
+                bail!("GCM 실행 실패");
+            }
+        }
+        let store = ExistingStore {
+            entries: Mutex::new(windows_entries()),
+            ignore_delete: false,
+            fail_delete: false,
+        };
+        logout_profile(
+            Some(&FailedHelper),
+            &profile,
+            &store,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(store.entries.lock().unwrap().len(), 1);
+        let mut unknown = profile.clone();
+        unknown.username = "저장된 계정".into();
+        let store = ExistingStore {
+            entries: Mutex::new(vec![
+                feather_git::auth_profiles::ExistingCredential {
+                    target: "git:https://github.com".into(),
+                    username: String::new(),
+                },
+                feather_git::auth_profiles::ExistingCredential {
+                    target: "git:https://bob@github.com".into(),
+                    username: "bob".into(),
+                },
+            ]),
+            ignore_delete: false,
+            fail_delete: false,
+        };
+        logout_profile(None::<&FakeGcm>, &unknown, &store, &AtomicBool::new(false)).unwrap();
+        assert_eq!(store.entries.lock().unwrap()[0].username, "bob");
+    }
+
+    #[test]
+    fn helper_success_does_not_mask_windows_delete_failure_or_remaining_account() {
+        let runner = FakeGcm::default();
+        for (ignore_delete, fail_delete) in [(true, false), (false, true)] {
+            let store = ExistingStore {
+                entries: Mutex::new(windows_entries()),
+                ignore_delete,
+                fail_delete,
+            };
+            assert!(
+                logout_profile(
+                    Some(&runner),
+                    &windows_profile(),
+                    &store,
+                    &AtomicBool::new(false)
+                )
+                .is_err()
+            );
+            assert_eq!(store.entries.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn logout_erases_only_the_requested_account_without_reading_or_sending_secrets() {
+        let runner = FakeGcm::default();
+        let target = LoginTarget::parse("https://github.com/team/repo.git")
+            .unwrap()
+            .for_account("alice")
+            .unwrap();
+        logout(&runner, &target, &AtomicBool::new(false)).unwrap();
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "erase");
+        assert!(!calls[0].2);
+        let request = std::str::from_utf8(&calls[0].1).unwrap();
+        for field in [
+            "protocol=https\n",
+            "host=github.com\n",
+            "path=team/repo.git\n",
+            "username=alice\n",
+        ] {
+            assert!(request.contains(field));
+        }
+        assert!(!request.contains("password="));
+    }
     impl CredentialRunner for FakeGcm {
         fn run(
             &self,
@@ -387,6 +585,21 @@ mod tests {
             String::from_utf8(target.input())
                 .unwrap()
                 .contains("host=example.invalid:8443")
+        );
+        let target = LoginTarget::parse("https://github.com/team/repo")
+            .unwrap()
+            .for_account("account")
+            .unwrap();
+        assert!(
+            String::from_utf8(target.input())
+                .unwrap()
+                .contains("username=account\n")
+        );
+        assert!(
+            LoginTarget::parse("https://github.com")
+                .unwrap()
+                .for_account("account\npassword=secret")
+                .is_err()
         );
     }
 

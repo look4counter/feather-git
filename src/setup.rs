@@ -388,61 +388,13 @@ pub fn deletion_target(path: &Path) -> Result<std::path::PathBuf> {
     Ok(root)
 }
 
-#[cfg(windows)]
-pub fn recycle_repository(path: &Path) -> Result<()> {
+pub fn delete_repository(path: &Path) -> Result<()> {
     let root = deletion_target(path)?;
-    std::thread::Builder::new()
-        .name("recycle-repository".into())
-        .spawn(move || recycle_target(&root))?
-        .join()
-        .map_err(|_| anyhow::anyhow!("휴지통 작업이 중단되었습니다."))?
-}
-
-#[cfg(windows)]
-fn recycle_target(path: &Path) -> Result<()> {
-    use windows::{
-        Win32::{System::Com::*, UI::Shell::*},
-        core::HSTRING,
-    };
-    let root = deletion_target(path)?;
-    unsafe {
-        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
-        struct ComGuard;
-        impl Drop for ComGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    CoUninitialize();
-                }
-            }
-        }
-        let _guard = ComGuard;
-        let operation: IFileOperation =
-            CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-        operation.SetOperationFlags(
-            FOF_ALLOWUNDO
-                | FOF_NOCONFIRMATION
-                | FOF_NOERRORUI
-                | FOF_SILENT
-                | FOFX_RECYCLEONDELETE
-                | FOFX_EARLYFAILURE,
-        )?;
-        let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(root.as_os_str()), None)?;
-        operation.DeleteItem(&item, None)?;
-        operation
-            .PerformOperations()
-            .context("저장소를 휴지통으로 이동하지 못했습니다.")?;
-        if operation.GetAnyOperationsAborted()?.as_bool() || root.exists() {
-            bail!("저장소 삭제가 완료되지 않았습니다.");
-        }
-    }
+    std::fs::remove_dir_all(&root).context("저장소 폴더를 삭제하지 못했습니다.")?;
     Ok(())
 }
 
-#[cfg(not(windows))]
-pub fn recycle_repository(_path: &Path) -> Result<()> {
-    bail!("이 환경에서는 휴지통 이동을 지원하지 않습니다.")
-}
-
+#[cfg(test)]
 pub fn create(path: &Path, source: Option<&str>) -> Result<()> {
     if source.is_some_and(|url| url.trim().is_empty() || url.starts_with('-')) {
         bail!("유효한 저장소 URL을 입력하세요.");
@@ -457,9 +409,159 @@ pub fn create(path: &Path, source: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+pub fn init_existing_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("기존 디렉터리를 선택하세요.");
+    }
+    let git_dir = path.join(".git");
+    match std::fs::symlink_metadata(&git_dir) {
+        Ok(_) => bail!("선택한 디렉터리에 이미 .git이 있습니다."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context(".git 상태를 확인하지 못했습니다."),
+    }
+    feather_git::native_git::init_repository(path)?;
+    #[cfg(windows)]
+    hide_git_directory(&git_dir)?;
+    Ok(())
+}
+
+pub fn clone_into_existing_directory(path: &Path, url: &str) -> Result<()> {
+    if url.trim().is_empty() || url.starts_with('-') {
+        bail!("유효한 저장소 URL을 입력하세요.");
+    }
+    if !path.is_dir() {
+        bail!("기존 디렉터리를 선택하세요.");
+    }
+    if std::fs::read_dir(path)
+        .context("선택한 디렉터리의 내용을 확인하지 못했습니다.")?
+        .next()
+        .is_some()
+    {
+        bail!("Clone 대상 디렉터리는 비어 있어야 합니다.");
+    }
+    feather_git::native_git::clone_repository(url, path)?;
+    #[cfg(windows)]
+    hide_git_directory(&path.join(".git"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn hide_git_directory(path: &Path) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
+        },
+        core::HSTRING,
+    };
+
+    let attributes = std::fs::metadata(path)?.file_attributes();
+    let name = HSTRING::from(path.as_os_str());
+    unsafe {
+        SetFileAttributesW(
+            &name,
+            FILE_FLAGS_AND_ATTRIBUTES(attributes | FILE_ATTRIBUTE_HIDDEN.0),
+        )
+    }
+    .context(".git 디렉터리에 숨김 속성을 설정하지 못했습니다.")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clone_into_selected_empty_directory_without_child_repository() {
+        let (_temp, source) = configured_repository();
+        save_commit(&source, "source commit");
+        let target = source.parent().unwrap().join("chosen");
+        std::fs::create_dir(&target).unwrap();
+
+        clone_into_existing_directory(&target, source.to_str().unwrap()).unwrap();
+
+        assert!(target.join(".git").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(target.join("file.txt")).unwrap(),
+            "source commit"
+        );
+        assert!(!target.join("repository").exists());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(target.join(".git"))
+                    .unwrap()
+                    .file_attributes()
+                    & 0x2,
+                0
+            );
+        }
+        let kept = source.parent().unwrap().join("occupied");
+        std::fs::create_dir(&kept).unwrap();
+        std::fs::write(kept.join("keep.txt"), "keep").unwrap();
+        assert!(clone_into_existing_directory(&kept, source.to_str().unwrap()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(kept.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(clone_into_existing_directory(&kept, "").is_err());
+        assert!(!kept.join(".git").exists());
+    }
+
+    #[test]
+    fn delete_only_validated_repository_folder() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = temp.path().to_path_buf();
+        let repository = parent.join("repo");
+        std::fs::create_dir(&repository).unwrap();
+        init_existing_directory(&repository).unwrap();
+        let sibling = parent.join("keep.txt");
+        std::fs::write(&sibling, "keep").unwrap();
+        std::fs::write(repository.join("uncommitted.txt"), "delete").unwrap();
+        assert!(delete_repository(&parent).is_err());
+        assert!(repository.exists());
+
+        delete_repository(&repository).unwrap();
+
+        assert!(!repository.exists());
+        assert_eq!(std::fs::read_to_string(sibling).unwrap(), "keep");
+    }
+
+    #[test]
+    fn existing_directory_becomes_repository_without_creating_child_folder() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let chosen = temp.path().join("chosen");
+        std::fs::create_dir(&chosen).unwrap();
+        std::fs::write(chosen.join("keep.txt"), "preserved").unwrap();
+
+        init_existing_directory(&chosen).unwrap();
+
+        assert!(chosen.join(".git").is_dir());
+        assert!(!chosen.join("repository").exists());
+        assert_eq!(
+            std::fs::read_to_string(chosen.join("keep.txt")).unwrap(),
+            "preserved"
+        );
+        assert!(feather_git::native_git::gix_repository(&chosen).is_ok());
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            assert_ne!(
+                std::fs::metadata(chosen.join(".git"))
+                    .unwrap()
+                    .file_attributes()
+                    & 0x2,
+                0
+            );
+        }
+        assert!(init_existing_directory(&chosen).is_err());
+        assert!(init_existing_directory(&temp.path().join("missing")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(chosen.join("keep.txt")).unwrap(),
+            "preserved"
+        );
+    }
 
     fn configured_repository() -> (tempfile::TempDir, std::path::PathBuf) {
         let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();

@@ -29,6 +29,22 @@ fn source_boundary(text: &str, mut index: usize) -> usize {
     index
 }
 
+fn line_starts(text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+        .collect()
+}
+
+fn visible_rows(offset: f32, viewport: f32, count: usize) -> Range<usize> {
+    let first = ((-offset).max(0.) / 22.).floor() as usize;
+    let visible = (viewport.max(0.) / 22.).ceil() as usize;
+    first.saturating_sub(2).min(count)..(first + visible + 3).min(count)
+}
+
+fn diff_body_start(start: usize, line_len: usize) -> usize {
+    start + 16.min(line_len)
+}
+
 pub fn read_only_key(key: &Keystroke) -> bool {
     if key.modifiers.alt || key.modifiers.platform {
         return false;
@@ -137,6 +153,7 @@ pub struct CommitEditor {
     buffer: Buffer,
     single_line: bool,
     read_only: bool,
+    diff_coloring: bool,
     secret: bool,
     pub focus: FocusHandle,
     pub enabled: bool,
@@ -144,6 +161,9 @@ pub struct CommitEditor {
     scroll: ScrollHandle,
     bounds: Option<Bounds<Pixels>>,
     lines: Vec<(usize, ShapedLine)>,
+    visible_row_start: usize,
+    diff_line_starts: Vec<usize>,
+    diff_max_columns: usize,
     dragging: bool,
     reveal_cursor: bool,
     viewport: Size<Pixels>,
@@ -157,6 +177,7 @@ impl CommitEditor {
             buffer: Buffer::default(),
             single_line: false,
             read_only: false,
+            diff_coloring: false,
             secret: false,
             focus: cx.focus_handle(),
             enabled: true,
@@ -164,6 +185,9 @@ impl CommitEditor {
             scroll: ScrollHandle::new(),
             bounds: None,
             lines: Vec::new(),
+            visible_row_start: 0,
+            diff_line_starts: Vec::new(),
+            diff_max_columns: 0,
             dragging: false,
             reveal_cursor: false,
             viewport: Size::default(),
@@ -183,13 +207,31 @@ impl CommitEditor {
         editor
     }
 
+    pub fn diff_read_only(text: &str, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::read_only(text, cx);
+        editor.diff_coloring = true;
+        editor.diff_line_starts = line_starts(&editor.buffer.text);
+        editor.diff_max_columns = editor
+            .buffer
+            .text
+            .split('\n')
+            .map(|line| {
+                line.chars()
+                    .map(|character| usize::from(!character.is_ascii()) + 1)
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0);
+        editor
+    }
+
     fn editable(&self) -> bool {
         self.enabled && !self.read_only
     }
 
     pub fn background_color(&self) -> u32 {
         if self.read_only {
-            theme::BG
+            theme::PANEL
         } else {
             theme::INPUT
         }
@@ -215,6 +257,23 @@ impl CommitEditor {
             text: self.input_text(text),
             ..Buffer::default()
         };
+        if self.diff_coloring {
+            self.diff_line_starts = line_starts(&self.buffer.text);
+            self.diff_max_columns = self
+                .buffer
+                .text
+                .split('\n')
+                .map(|line| {
+                    line.chars()
+                        .map(|character| usize::from(!character.is_ascii()) + 1)
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0);
+            self.lines.clear();
+            self.visible_row_start = 0;
+            self.scroll.set_offset(point(px(0.), px(0.)));
+        }
         self.changed(cx);
     }
     fn input_text(&self, text: &str) -> String {
@@ -243,21 +302,36 @@ impl CommitEditor {
             return 0;
         };
         let row = (f32::from(position.y - bounds.origin.y) / 22.).max(0.) as usize;
-        let Some((start, line)) = self.lines.get(row.min(self.lines.len().saturating_sub(1)))
+        let local_row = if self.diff_coloring {
+            row.saturating_sub(self.visible_row_start)
+        } else {
+            row
+        };
+        let Some((start, line)) = self
+            .lines
+            .get(local_row.min(self.lines.len().saturating_sub(1)))
         else {
             return 0;
         };
-        source_boundary(
+        let index = source_boundary(
             &self.buffer.text,
             start + line.closest_index_for_x((position.x - bounds.origin.x).max(px(0.))),
-        )
+        );
+        if self.diff_coloring {
+            index.max(diff_body_start(*start, line.len()))
+        } else {
+            index
+        }
     }
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.apply_shortcut_key(&event.keystroke, cx);
+    }
+
+    pub fn apply_shortcut_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) {
         if !self.enabled {
             cx.stop_propagation();
             return;
         }
-        let key = &event.keystroke;
         if self.read_only && !read_only_key(key) {
             cx.stop_propagation();
             return;
@@ -331,7 +405,30 @@ impl CommitEditor {
                         "home" => start,
                         "end" => end,
                         "up" | "down" => {
-                            if self.read_only && !self.lines.is_empty() {
+                            if self.diff_coloring && !self.diff_line_starts.is_empty() {
+                                let row = self
+                                    .diff_line_starts
+                                    .partition_point(|start| *start <= cursor)
+                                    .saturating_sub(1);
+                                let target = if key.key == "up" {
+                                    row.saturating_sub(1)
+                                } else {
+                                    (row + 1).min(self.diff_line_starts.len() - 1)
+                                };
+                                let column = self.buffer.text[self.diff_line_starts[row]..cursor]
+                                    .chars()
+                                    .count()
+                                    .max(16);
+                                let target_start = self.diff_line_starts[target];
+                                let target_end = self
+                                    .diff_line_starts
+                                    .get(target + 1)
+                                    .map_or(self.buffer.text.len(), |next| next - 1);
+                                self.buffer.text[target_start..target_end]
+                                    .char_indices()
+                                    .nth(column)
+                                    .map_or(target_end, |(index, _)| target_start + index)
+                            } else if self.read_only && !self.lines.is_empty() {
                                 let row = self
                                     .lines
                                     .iter()
@@ -381,6 +478,25 @@ impl CommitEditor {
                             }
                         }
                         _ => cursor,
+                    };
+                    let next = if self.diff_coloring {
+                        let row = self
+                            .diff_line_starts
+                            .partition_point(|start| *start <= next)
+                            .saturating_sub(1);
+                        let start = self.diff_line_starts.get(row).copied().unwrap_or(0);
+                        let end = self
+                            .diff_line_starts
+                            .get(row + 1)
+                            .map_or(self.buffer.text.len(), |next| next - 1);
+                        let minimum = diff_body_start(start, end.saturating_sub(start));
+                        if next < minimum && key.key == "left" && cursor == minimum && row > 0 {
+                            start.saturating_sub(1)
+                        } else {
+                            next.max(minimum)
+                        }
+                    } else {
+                        next
                     };
                     self.buffer.move_to(next, key.modifiers.shift);
                 }
@@ -628,8 +744,15 @@ impl EntityInputHandler for CommitEditor {
             .iter()
             .rposition(|(start, _)| *start <= range.start)?;
         let (start, line) = &self.lines[row];
+        if range.start > start + line.len() {
+            return None;
+        }
         Some(Bounds::new(
-            bounds.origin + point(line.x_for_index(range.start - start), px(row as f32 * 22.)),
+            bounds.origin
+                + point(
+                    line.x_for_index(range.start.saturating_sub(*start).min(line.len())),
+                    px((row + self.visible_row_start) as f32 * 22.),
+                ),
             size(px(2.), px(22.)),
         ))
     }
@@ -645,7 +768,7 @@ impl EntityInputHandler for CommitEditor {
 
 impl Render for CommitEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let wrap = self.read_only && !self.single_line;
+        let wrap = self.read_only && !self.single_line && !self.diff_coloring;
         let mut start = 0;
         let wrap_width = if self.viewport.width > px(0.) {
             f32::from(self.viewport.width) - 20.
@@ -653,40 +776,108 @@ impl Render for CommitEditor {
             560.
         }
         .max(1.);
-        let shape = |text: &str| {
-            let display = if self.secret {
+        let secret = self.secret;
+        let diff_coloring = self.diff_coloring;
+        let text_size = self.text_size;
+        let shape = |text: &str, color: u32| {
+            let display = if secret {
                 masked_text(text)
             } else {
                 text.to_owned()
             };
-            let run = TextRun {
-                len: display.len(),
-                font: font("Cascadia Mono"),
-                color: rgb(theme::TEXT).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
+            let prefix = if diff_coloring {
+                display.len().min(13)
+            } else {
+                0
+            };
+            let runs = if prefix > 0 {
+                vec![
+                    TextRun {
+                        len: prefix,
+                        font: font("Cascadia Mono"),
+                        color: rgb(theme::MUTED).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    },
+                    TextRun {
+                        len: display.len() - prefix,
+                        font: font("Cascadia Mono"),
+                        color: rgb(color).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    },
+                ]
+            } else {
+                vec![TextRun {
+                    len: display.len(),
+                    font: font("Cascadia Mono"),
+                    color: rgb(color).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }]
             };
             window
                 .text_system()
-                .shape_line(display.into(), px(self.text_size), &[run], None)
+                .shape_line(display.into(), px(text_size), &runs, None)
         };
         let mut lines = Vec::new();
-        for text in self.buffer.text.split('\n') {
-            let line = shape(text);
-            if wrap {
-                for range in
-                    wrapped_ranges(text, wrap_width, |index| line.x_for_index(index).into())
-                {
-                    lines.push((start + range.start, shape(&text[range])));
-                }
-            } else {
-                lines.push((start, line));
+        let mut backgrounds = Vec::new();
+        let row_range = if diff_coloring {
+            visible_rows(
+                f32::from(self.scroll.offset().y),
+                if self.viewport.height > px(0.) {
+                    f32::from(self.viewport.height)
+                } else {
+                    660.
+                },
+                self.diff_line_starts.len(),
+            )
+        } else {
+            0..0
+        };
+        if diff_coloring {
+            for row in row_range.clone() {
+                let start = self.diff_line_starts[row];
+                let end = self
+                    .diff_line_starts
+                    .get(row + 1)
+                    .map_or(self.buffer.text.len(), |next| next - 1);
+                let text = &self.buffer.text[start..end];
+                let marker = text.as_bytes().get(14).copied();
+                let (background, foreground) = match marker {
+                    Some(b'+') => (theme::DIFF_ADD_BG, theme::DIFF_ADD_TEXT),
+                    Some(b'-') => (theme::DIFF_DELETE_BG, theme::DIFF_DELETE_TEXT),
+                    Some(b'@') | Some(b'\\') => (theme::DIFF_HEADER_BG, theme::DIFF_HEADER_TEXT),
+                    _ => (theme::PANEL, theme::TEXT),
+                };
+                lines.push((start, shape(text, foreground)));
+                backgrounds.push(background);
             }
-            start += text.len() + 1;
+        } else {
+            for text in self.buffer.text.split('\n') {
+                let line = shape(text, theme::TEXT);
+                if wrap {
+                    for range in
+                        wrapped_ranges(text, wrap_width, |index| line.x_for_index(index).into())
+                    {
+                        lines.push((start + range.start, shape(&text[range], theme::TEXT)));
+                        backgrounds.push(theme::PANEL);
+                    }
+                } else {
+                    lines.push((start, line));
+                    backgrounds.push(theme::PANEL);
+                }
+                start += text.len() + 1;
+            }
         }
         let width = if wrap {
             (f32::from(self.viewport.width) - 12.).max(0.)
+        } else if diff_coloring {
+            let cell = f32::from(shape("0", theme::TEXT).width);
+            self.diff_max_columns as f32 * cell + 12.
         } else {
             lines
                 .iter()
@@ -694,7 +885,12 @@ impl Render for CommitEditor {
                 .fold(0., f32::max)
                 + 8.
         };
-        let height = lines.len() as f32 * 22.;
+        let height = if diff_coloring {
+            self.diff_line_starts.len()
+        } else {
+            lines.len()
+        } as f32
+            * 22.;
         let visible = if self.single_line {
             crate::scrolling::Visibility::default()
         } else {
@@ -703,7 +899,7 @@ impl Render for CommitEditor {
                 self.viewport.height.into(),
                 width,
                 height,
-                !self.read_only,
+                !self.read_only || self.diff_coloring,
                 12.,
             )
         };
@@ -723,6 +919,13 @@ impl Render for CommitEditor {
         let selection = self.buffer.selection();
         let cursor = self.buffer.cursor;
         let marked = self.buffer.marked.clone();
+        let first_visible_row = row_range.start;
+        let gutter_edges = if diff_coloring {
+            let measure = shape("0000000000000000", theme::TEXT);
+            Some((measure.x_for_index(13), measure.x_for_index(16)))
+        } else {
+            None
+        };
         let view = cx.entity();
         let focus = self.focus.clone();
         let editor = div()
@@ -805,12 +1008,74 @@ impl Render for CommitEditor {
                             ElementInputHandler::new(text_bounds, view.clone()),
                             cx,
                         );
+                        if let Some((numbers_end, marker_end)) = gutter_edges {
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    text_bounds.origin,
+                                    size(numbers_end, text_bounds.size.height),
+                                ),
+                                rgb(theme::HISTORY_HOVER),
+                            ));
+                            for edge in [numbers_end, marker_end] {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        text_bounds.origin + point(edge, px(0.)),
+                                        size(px(1.), text_bounds.size.height),
+                                    ),
+                                    rgb(theme::LINE),
+                                ));
+                            }
+                        }
                         for (row, (start, line)) in lines.iter().enumerate() {
-                            let origin = text_bounds.origin + point(px(0.), px(row as f32 * 22.));
+                            let absolute_row = if diff_coloring {
+                                first_visible_row + row
+                            } else {
+                                row
+                            };
+                            let origin =
+                                text_bounds.origin + point(px(0.), px(absolute_row as f32 * 22.));
+                            if let Some(background) = backgrounds.get(row)
+                                && *background != theme::PANEL
+                            {
+                                window.paint_quad(fill(
+                                    Bounds::new(origin, size(text_bounds.size.width, px(22.))),
+                                    rgb(*background),
+                                ));
+                            }
+                            if diff_coloring {
+                                let numbers_end = line.x_for_index(13.min(line.len()));
+                                let marker_end = line.x_for_index(16.min(line.len()));
+                                window.paint_quad(fill(
+                                    Bounds::new(origin, size(numbers_end, px(22.))),
+                                    rgb(theme::HISTORY_HOVER),
+                                ));
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        origin + point(numbers_end, px(0.)),
+                                        size(px(1.), px(22.)),
+                                    ),
+                                    rgb(theme::LINE),
+                                ));
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        origin + point(marker_end, px(0.)),
+                                        size(px(1.), px(22.)),
+                                    ),
+                                    rgb(theme::LINE),
+                                ));
+                            }
                             let end = start + line.len();
-                            if selection.start <= end && selection.end > *start {
+                            let body_start = if diff_coloring {
+                                diff_body_start(0, line.len())
+                            } else {
+                                0
+                            };
+                            if selection.start <= end && selection.end > start + body_start {
                                 let left = line.x_for_index(
-                                    selection.start.saturating_sub(*start).min(line.len()),
+                                    selection
+                                        .start
+                                        .saturating_sub(*start)
+                                        .clamp(body_start, line.len()),
                                 );
                                 let right = line.x_for_index(
                                     selection.end.saturating_sub(*start).min(line.len()),
@@ -824,7 +1089,10 @@ impl Render for CommitEditor {
                                 ));
                             }
                             line.paint(origin, px(22.), window, cx).ok();
-                            if cursor >= *start && cursor <= end && focus.is_focused(window) {
+                            if cursor >= start + body_start
+                                && cursor <= end
+                                && focus.is_focused(window)
+                            {
                                 window.paint_quad(fill(
                                     Bounds::new(
                                         origin + point(line.x_for_index(cursor - start), px(1.)),
@@ -854,20 +1122,34 @@ impl Render for CommitEditor {
                         view.update(cx, |this, cx| {
                             this.bounds = Some(text_bounds);
                             this.lines = lines.clone();
+                            this.visible_row_start = first_visible_row;
                             if this.reveal_cursor {
                                 this.reveal_cursor = false;
-                                if let Some(row) =
-                                    lines.iter().rposition(|(start, _)| *start <= cursor)
+                                let cursor_row = if diff_coloring {
+                                    this.diff_line_starts
+                                        .partition_point(|start| *start <= cursor)
+                                        .saturating_sub(1)
+                                } else {
+                                    lines
+                                        .iter()
+                                        .rposition(|(start, _)| *start <= cursor)
+                                        .unwrap_or(0)
+                                };
+                                if let Some((start, line)) =
+                                    lines.get(cursor_row.saturating_sub(first_visible_row))
                                 {
-                                    let (start, line) = &lines[row];
                                     let caret = point(
-                                        line.x_for_index(cursor - start),
-                                        px(row as f32 * 22.),
+                                        line.x_for_index(
+                                            cursor.saturating_sub(*start).min(line.len()),
+                                        ),
+                                        px(cursor_row as f32 * 22.),
                                     );
                                     let viewport = this.scroll.bounds().size;
                                     let before = this.scroll.offset();
                                     let mut offset = before;
-                                    if !this.read_only && viewport.width > px(0.) {
+                                    if (!this.read_only || this.diff_coloring)
+                                        && viewport.width > px(0.)
+                                    {
                                         if caret.x < -offset.x {
                                             offset.x = -caret.x;
                                         } else if caret.x + px(3.) > -offset.x + viewport.width {
@@ -885,6 +1167,11 @@ impl Render for CommitEditor {
                                         this.scroll.set_offset(offset);
                                         cx.notify();
                                     }
+                                } else if diff_coloring {
+                                    let mut offset = this.scroll.offset();
+                                    offset.y = px(-(cursor_row as f32 * 22.));
+                                    this.scroll.set_offset(offset);
+                                    cx.notify();
                                 }
                             }
                         });
@@ -948,6 +1235,15 @@ impl Render for CommitEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn diff_virtual_rows_and_body_boundary_cover_scrolling_and_short_lines() {
+        assert_eq!(line_starts("one\ntwo\n"), vec![0, 4, 8]);
+        assert_eq!(visible_rows(0., 220., 10_000), 0..13);
+        assert_eq!(visible_rows(-2200., 220., 10_000), 98..113);
+        assert_eq!(diff_body_start(100, 40), 116);
+        assert_eq!(diff_body_start(100, 3), 103);
+    }
 
     #[::core::prelude::v1::test]
     fn password_mask_preserves_byte_offsets_and_mouse_indexes_stay_on_source_boundaries() {

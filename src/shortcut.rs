@@ -213,6 +213,24 @@ pub fn commands() -> Vec<Command> {
         };
         add(id, "공통", "*", name, key, first, second);
     }
+    add(
+        "new-tab",
+        "공통",
+        "project-tabs",
+        "새 탭 추가",
+        "ctrl-n",
+        "ctrl-n",
+        "",
+    );
+    add(
+        "close-tab",
+        "공통",
+        "project-tabs",
+        "저장소 탭 닫기",
+        "ctrl-x",
+        "ctrl-x",
+        "",
+    );
     for (id, name, key) in [("stash", "스태시", "s"), ("commit", "커밋", "c")] {
         add(id, "파일목록", "stage-files", name, key, key, "");
     }
@@ -1077,6 +1095,71 @@ mod binding_tests {
         }
         assert!(bindings.set("nav-left", 0, "alt-y".into()).is_err());
         assert!(bindings.set("branch-checkout", 0, "alt-y".into()).is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn new_tab_key_works_in_main_and_clone_and_can_be_remapped() {
+        let mut bindings = Bindings::default();
+        for scope in ["main", "clone", "files"] {
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("ctrl-n").unwrap())
+                        .unwrap()
+                ),
+                "ctrl-n"
+            );
+        }
+        assert!(
+            bindings
+                .resolve("modal", &Keystroke::parse("ctrl-n").unwrap())
+                .is_none()
+        );
+        bindings.set("new-tab", 0, "alt-n".into()).unwrap();
+        assert_eq!(
+            chord(
+                &bindings
+                    .resolve("clone", &Keystroke::parse("alt-n").unwrap())
+                    .unwrap()
+            ),
+            "ctrl-n"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn close_tab_key_works_in_project_scopes_and_can_be_remapped() {
+        let mut bindings = Bindings::default();
+        for scope in ["main", "branches", "history", "files", "viewer"] {
+            assert_eq!(
+                chord(
+                    &bindings
+                        .resolve(scope, &Keystroke::parse("ctrl-x").unwrap())
+                        .unwrap()
+                ),
+                "ctrl-x"
+            );
+        }
+        for scope in ["modal", "settings-modal", "commit-modal"] {
+            assert!(
+                bindings
+                    .resolve(scope, &Keystroke::parse("ctrl-x").unwrap())
+                    .is_none()
+            );
+        }
+        bindings.set("close-tab", 0, "alt-x".into()).unwrap();
+        assert_eq!(
+            chord(
+                &bindings
+                    .resolve("branches", &Keystroke::parse("alt-x").unwrap())
+                    .unwrap()
+            ),
+            "ctrl-x"
+        );
+        assert!(
+            bindings
+                .resolve("branches", &Keystroke::parse("ctrl-x").unwrap())
+                .is_none()
+        );
     }
 
     #[::core::prelude::v1::test]

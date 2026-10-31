@@ -1,6 +1,7 @@
 pub mod auth_profiles;
 pub mod conflict;
 pub mod git;
+pub mod git_search;
 pub mod graph;
 pub mod model;
 pub mod native_git;

@@ -9,6 +9,7 @@ mod history_view;
 mod layout;
 mod popup;
 mod scrolling;
+mod search_window;
 mod session;
 mod settings;
 mod settings_git;

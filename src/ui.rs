@@ -12,6 +12,35 @@ use gpui::{prelude::*, *};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+const SEARCH_VIRTUAL_ROW: usize = usize::MAX;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SearchArrowTarget {
+    Input,
+    Row(usize),
+}
+
+fn search_arrow_target(selected: usize, count: usize, down: bool) -> SearchArrowTarget {
+    if selected == SEARCH_VIRTUAL_ROW {
+        return if down {
+            SearchArrowTarget::Input
+        } else {
+            SearchArrowTarget::Row(SEARCH_VIRTUAL_ROW)
+        };
+    }
+    if down {
+        SearchArrowTarget::Row(if count == 0 {
+            SEARCH_VIRTUAL_ROW
+        } else {
+            (selected + 1).min(count - 1)
+        })
+    } else if selected == 0 {
+        SearchArrowTarget::Input
+    } else {
+        SearchArrowTarget::Row(selected - 1)
+    }
+}
+
 #[derive(Default)]
 struct StartPage {
     url_editor: Option<Entity<CommitEditor>>,
@@ -133,6 +162,15 @@ fn adjacent_tab(current: usize, count: usize, next: bool) -> Option<usize> {
     })
 }
 
+fn adjacent_reference_tab(tab: RefTab, search: bool, next: bool) -> usize {
+    let current = if search {
+        RefTab::ALL.len()
+    } else {
+        tab.index()
+    };
+    adjacent_tab(current, RefTab::ALL.len() + 1, next).unwrap()
+}
+
 fn candidate_shortcut(key: &str) -> Option<usize> {
     match key {
         "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
@@ -218,6 +256,14 @@ impl WorkspaceTab {
 }
 
 pub struct Workspace {
+    file_window: Option<AnyWindowHandle>,
+    file_window_activation: Option<Subscription>,
+    search_tab: bool,
+    search_editor: Entity<CommitEditor>,
+    search_results: Vec<feather_git::git_search::Match>,
+    search_selected: usize,
+    search_loading: bool,
+    search_generation: u64,
     state_path: Option<PathBuf>,
     popup_options: session::PopupOptions,
     recent: Vec<PathBuf>,
@@ -261,6 +307,8 @@ pub struct Workspace {
     body_bounds: Bounds<Pixels>,
     resize_drag: Option<(SplitAxis, Pixels)>,
     start_pages: HashMap<u64, StartPage>,
+    start_action_focus: [FocusHandle; 4],
+    recent_action_focus: HashMap<PathBuf, [FocusHandle; 2]>,
     graphs: HashMap<u64, HashMap<usize, RowGraph>>,
     history_scroll: HashMap<u64, UniformListScrollHandle>,
     grid_columns: ColumnLayout,
@@ -306,6 +354,41 @@ fn panel() -> Div {
         .min_h_0()
         .bg(rgb(PANEL))
         .overflow_hidden()
+}
+
+fn diff_column_guides(partial: bool, horizontal_offset: Pixels) -> Div {
+    div()
+        .absolute()
+        .left(horizontal_offset)
+        .top_0()
+        .h_full()
+        .flex()
+        .when(partial, |guide| {
+            guide.child(
+                div()
+                    .w(px(24.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .bg(rgb(HISTORY_HOVER)),
+            )
+        })
+        .child(
+            div()
+                .w(px(96.))
+                .h_full()
+                .flex_shrink_0()
+                .bg(rgb(HISTORY_HOVER))
+                .border_r_1()
+                .border_color(rgb(LINE)),
+        )
+        .child(
+            div()
+                .w(px(20.))
+                .h_full()
+                .flex_shrink_0()
+                .border_r_1()
+                .border_color(rgb(LINE)),
+        )
 }
 
 fn empty(message: &str) -> Div {
@@ -969,6 +1052,14 @@ impl Workspace {
 
     pub fn new(paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
+            file_window: None,
+            file_window_activation: None,
+            search_tab: false,
+            search_editor: cx.new(|cx| CommitEditor::single_line("", cx)),
+            search_results: Vec::new(),
+            search_selected: SEARCH_VIRTUAL_ROW,
+            search_loading: false,
+            search_generation: 0,
             state_path: session::state_path().ok(),
             popup_options: session::PopupOptions::default(),
             recent: Vec::new(),
@@ -1013,6 +1104,13 @@ impl Workspace {
             body_bounds: Bounds::default(),
             resize_drag: None,
             start_pages: HashMap::new(),
+            start_action_focus: [
+                cx.focus_handle(),
+                cx.focus_handle(),
+                cx.focus_handle(),
+                cx.focus_handle(),
+            ],
+            recent_action_focus: HashMap::new(),
             graphs: HashMap::new(),
             history_scroll: HashMap::new(),
             grid_columns: ColumnLayout::default(),
@@ -1250,21 +1348,13 @@ impl Workspace {
                 .map_or(0, |rows| rows.lines.len()))
                 .collect();
         }
-        self.tabs
+        (0..self
+            .tabs
             .iter()
             .filter_map(WorkspaceTab::project)
             .find(|project| project.id == key.0)
-            .map(|project| {
-                project
-                    .diff
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, line)| line.old.is_some() || line.new.is_some())
-                    .map(|(row, _)| row)
-                    .collect()
-            })
-            .unwrap_or_default()
+            .map_or(0, |project| project.diff.lines.len()))
+            .collect()
     }
 
     fn initial_text_selection(&self, key: ListKey) -> Option<(ListKey, Selection)> {
@@ -1304,6 +1394,13 @@ impl Workspace {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(handle) = self.file_window {
+            handle
+                .update(cx, |_, child, _| child.activate_window())
+                .ok();
+            cx.stop_propagation();
+            return;
+        }
         if !self.history_in_progress()
             && !self.branch_busy
             && self.shortcut_capture.is_none()
@@ -1340,7 +1437,7 @@ impl Workspace {
             cx.stop_propagation();
             return;
         }
-        if self.history_in_progress() || self.branch_busy {
+        if (self.history_in_progress() && !self.search_tab) || self.branch_busy {
             cx.stop_propagation();
             return;
         }
@@ -1417,9 +1514,10 @@ impl Workspace {
             } else {
                 match self.list_focus {
                     Some(ListFocus::Branches(id))
-                        if self.project().is_some_and(|project| {
-                            project.id == id && project.ref_tab == RefTab::Local
-                        }) =>
+                        if !self.search_tab
+                            && self.project().is_some_and(|project| {
+                                project.id == id && project.ref_tab == RefTab::Local
+                            }) =>
                     {
                         "local-branches"
                     }
@@ -1439,6 +1537,42 @@ impl Workspace {
             }
         };
         let input = &event.keystroke;
+        if self.search_tab
+            && self.project().is_some()
+            && !input.modifiers.control
+            && !input.modifiers.alt
+            && !input.modifiers.platform
+            && !input.modifiers.shift
+        {
+            if self.search_editor.read(cx).focus.is_focused(window)
+                && input.key == "enter"
+                && !self.search_editor.read(cx).is_composing()
+            {
+                self.run_search(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if self.search_editor.read(cx).focus.is_focused(window)
+                && self.search_editor.read(cx).message().is_empty()
+                && ["left", "right"].contains(&input.key.as_str())
+            {
+                self.cycle_panel_tab(input.key == "right", window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            if self.focus.is_focused(window)
+                && matches!(self.list_focus, Some(ListFocus::Branches(_)))
+                && ["enter", "/"].contains(&input.key.as_str())
+            {
+                self.search_editor.read(cx).focus.focus(window);
+                if input.key == "enter" {
+                    self.run_search(cx);
+                }
+                cx.stop_propagation();
+                self.notify(cx);
+                return;
+            }
+        }
         if input.key == "enter"
             && input.modifiers.shift
             && !input.modifiers.control
@@ -1452,10 +1586,123 @@ impl Workspace {
             }
             return;
         }
+        let key = &event.keystroke;
+        if ["main", "clone"].contains(&scope)
+            && let Some(id) = self.active.filter(|id| self.start_pages.contains_key(id))
+        {
+            if key.key == "tab"
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.platform
+            {
+                let composing = self.start_pages.get(&id).is_some_and(|page| {
+                    page.url_editor.as_ref().is_some_and(|editor| {
+                        editor.read(cx).focus.is_focused(window) && editor.read(cx).is_composing()
+                    })
+                });
+                if !composing {
+                    crate::popup::focus_next(
+                        &self.start_focus_order(cx),
+                        key.modifiers.shift,
+                        window,
+                    );
+                    if let Some(page) = self.start_pages.get(&id) {
+                        for (index, path) in self.recent.iter().enumerate() {
+                            if self.recent_action_focus.get(path).is_some_and(|handles| {
+                                handles.iter().any(|handle| handle.is_focused(window))
+                            }) {
+                                page.recent_scroll
+                                    .scroll_to_item(index, ScrollStrategy::Center);
+                                break;
+                            }
+                        }
+                    }
+                    cx.stop_propagation();
+                    self.notify(cx);
+                }
+                return;
+            }
+            if key.key == "space"
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.shift
+                && !key.modifiers.platform
+            {
+                if event.is_held {
+                    cx.stop_propagation();
+                    return;
+                }
+                if self.start_pages.get(&id).is_some_and(|page| page.busy) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if let Some(mode) = self.start_action_focus[..3]
+                    .iter()
+                    .position(|focus| focus.is_focused(window))
+                {
+                    self.activate_start_action(id, mode as u8, window, cx);
+                } else if self.start_action_focus[3].is_focused(window) {
+                    self.start_repository(id, 2, cx);
+                } else if let Some((path, action)) = self.recent.iter().find_map(|path| {
+                    self.recent_action_focus.get(path).and_then(|focus| {
+                        focus
+                            .iter()
+                            .position(|focus| focus.is_focused(window))
+                            .map(|action| (path.clone(), action))
+                    })
+                }) {
+                    if action == 0 {
+                        self.open(path, cx);
+                    } else {
+                        self.delete_target = Some(path);
+                        self.delete_confirm = false;
+                        self.focus.focus(window);
+                        self.notify(cx);
+                    }
+                } else {
+                    return;
+                }
+                cx.stop_propagation();
+                return;
+            }
+        }
         let Some(mapped_key) = self.shortcuts.resolve(scope, &event.keystroke) else {
             return;
         };
         let key = &mapped_key;
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && key.key == "n"
+        {
+            if !event.is_held {
+                self.add_empty_tab();
+                self.focus.focus(window);
+                self.notify(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && !key.modifiers.platform
+            && key.key == "x"
+        {
+            if self.search_editor.read(cx).focus.is_focused(window) {
+                return;
+            }
+            if let Some(id) = self.project().map(|project| project.id) {
+                if !event.is_held {
+                    self.close_tab(id, cx);
+                    self.focus.focus(window);
+                    self.notify(cx);
+                }
+                cx.stop_propagation();
+            }
+            return;
+        }
         if key.modifiers.control
             && !key.modifiers.alt
             && !key.modifiers.shift
@@ -1850,6 +2097,82 @@ impl Workspace {
             }
             cx.stop_propagation();
             return;
+        }
+        if self.search_tab && self.project().is_some() {
+            if self.search_editor.read(cx).focus.is_focused(window) {
+                if key.key == "enter" && !self.search_editor.read(cx).is_composing() {
+                    self.run_search(cx);
+                    cx.stop_propagation();
+                } else if ["up", "down"].contains(&key.key.as_str())
+                    && !self.search_editor.read(cx).is_composing()
+                    && !key.modifiers.control
+                    && !key.modifiers.alt
+                    && !key.modifiers.shift
+                    && !key.modifiers.platform
+                {
+                    self.search_selected = if key.key == "down" && !self.search_results.is_empty() {
+                        0
+                    } else {
+                        SEARCH_VIRTUAL_ROW
+                    };
+                    self.list_focus = self
+                        .project()
+                        .map(|project| ListFocus::Branches(project.id));
+                    self.focus.focus(window);
+                    cx.stop_propagation();
+                    self.notify(cx);
+                }
+                return;
+            }
+            if matches!(self.list_focus, Some(ListFocus::Branches(_)))
+                && !key.modifiers.control
+                && !key.modifiers.alt
+            {
+                match key.key.as_str() {
+                    "up" | "down" => match search_arrow_target(
+                        self.search_selected,
+                        self.search_results.len(),
+                        key.key == "down",
+                    ) {
+                        SearchArrowTarget::Input => {
+                            self.search_editor.read(cx).focus.focus(window);
+                        }
+                        SearchArrowTarget::Row(index) => self.search_selected = index,
+                    },
+                    "space" => {
+                        if matches!(
+                            self.search_results.get(self.search_selected),
+                            Some(feather_git::git_search::Match::Commit { .. })
+                        ) {
+                            self.activate_search_result(cx);
+                        }
+                    }
+                    "o" => {
+                        if let Some(feather_git::git_search::Match::File { path, .. }) =
+                            self.search_results.get(self.search_selected)
+                        {
+                            self.open_search_file(path.clone(), cx);
+                        }
+                    }
+                    "enter" | "/" => {
+                        self.search_editor.read(cx).focus.focus(window);
+                        if key.key == "enter" {
+                            self.run_search(cx);
+                        }
+                    }
+                    "left" | "right" if !key.modifiers.shift && !key.modifiers.platform => {
+                        self.cycle_panel_tab(key.key == "right", window, cx);
+                    }
+                    _ => {}
+                }
+                if ["up", "down", "space", "o", "enter", "/", "left", "right"]
+                    .contains(&key.key.as_str())
+                {
+                    cx.stop_propagation();
+                    self.notify(cx);
+                    return;
+                }
+            }
         }
         if key.key == "f12"
             && !key.modifiers.control
@@ -3144,7 +3467,7 @@ impl Workspace {
             for session in sessions {
                 let _ = session.close();
             }
-            crate::setup::recycle_repository(&target)
+            crate::setup::delete_repository(&target)
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -3367,9 +3690,10 @@ impl Workspace {
         handle: UniformListScrollHandle,
         list: impl IntoElement,
         content: Size<f32>,
-        horizontal: bool,
+        decoration: (bool, Option<Div>),
         cx: &Context<Self>,
     ) -> Div {
+        let (horizontal, guide) = decoration;
         let visible = self.scroll_visibility(key, content, horizontal);
         let view = cx.weak_entity();
         div()
@@ -3413,11 +3737,13 @@ impl Workspace {
             )
             .child(
                 div()
+                    .relative()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
                     .overflow_hidden()
+                    .when_some(guide, |row, guide| row.child(guide))
                     .child(list)
                     .when(visible.vertical, |row| {
                         row.child(self.scroll_bar(key, handle.clone(), false, cx))
@@ -4365,6 +4691,10 @@ impl Workspace {
             return;
         };
         self.active = Some(id);
+        self.search_tab = false;
+        self.search_generation += 1;
+        self.search_loading = false;
+        self.search_results.clear();
         self.ensure_active_loaded(cx);
         self.list_focus = None;
         self.text_selection = None;
@@ -4375,6 +4705,10 @@ impl Workspace {
     }
 
     fn add_empty_tab(&mut self) {
+        self.search_tab = false;
+        self.search_generation += 1;
+        self.search_loading = false;
+        self.search_results.clear();
         let id = self.next_id;
         self.next_id += 1;
         self.tabs.push(WorkspaceTab::Empty(id));
@@ -4383,6 +4717,53 @@ impl Workspace {
         self.error = None;
         self.tabs_scroll.scroll_to_item(self.tabs.len() - 1);
         self.persist();
+    }
+
+    fn activate_start_action(
+        &mut self,
+        id: u64,
+        mode: u8,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.start_pages.get(&id).is_none_or(|page| page.busy) {
+            return;
+        }
+        if mode == 2 {
+            let page = self.start_pages.get_mut(&id).unwrap();
+            page.clone_form = true;
+            let editor = page
+                .url_editor
+                .get_or_insert_with(|| cx.new(|cx| CommitEditor::single_line("", cx)));
+            editor.read(cx).focus.focus(window);
+            cx.notify();
+        } else {
+            self.start_repository(id, mode, cx);
+        }
+    }
+
+    fn start_focus_order(&self, cx: &Context<Self>) -> Vec<FocusHandle> {
+        let mut order = self.start_action_focus[..3].to_vec();
+        if let Some(page) = self.active.and_then(|id| self.start_pages.get(&id))
+            && page.clone_form
+        {
+            if let Some(editor) = &page.url_editor {
+                order.push(editor.read(cx).focus.clone());
+            }
+            order.push(self.start_action_focus[3].clone());
+        }
+        for path in &self.recent {
+            if let Some(handles) = self.recent_action_focus.get(path) {
+                order.extend(handles.iter().cloned());
+            }
+        }
+        order
+    }
+
+    fn focus_style(button: Stateful<Div>, focused: bool) -> Stateful<Div> {
+        button.when(focused, |button| {
+            button.border_1().border_color(rgb(ACCENT)).bg(rgb(HOVER))
+        })
     }
 
     fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
@@ -4407,6 +4788,10 @@ impl Workspace {
         self.start_pages.remove(&id);
         self.tabs.retain(|tab| tab.id() != id);
         if self.active == Some(id) {
+            self.search_tab = false;
+            self.search_generation += 1;
+            self.search_loading = false;
+            self.search_results.clear();
             self.active = self.tabs.last().map(WorkspaceTab::id);
         }
         if self.tabs.is_empty() {
@@ -4443,7 +4828,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn resize_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn resize_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.history_in_progress()
             || self.help
             || self.settings.is_some()
@@ -4465,10 +4850,12 @@ impl Workspace {
                 self.text_drag = false;
                 return;
             }
-            if let Some((key, _)) = &self.text_selection
+            if let Some(key) = self.text_selection.as_ref().map(|(key, _)| *key)
                 && self.active == Some(key.0)
-                && let Some(viewport) = self.viewports.get(key)
-                && let Some(handle) = self.list_scroll.get(key)
+                && let Some(viewport) = self.viewports.get(&key).copied()
+                && viewport.size.width > px(0.)
+                && viewport.size.height > px(0.)
+                && let Some(handle) = self.list_scroll.get(&key)
             {
                 let base = handle.0.borrow().base_handle.clone();
                 let offset = base.offset();
@@ -4491,6 +4878,73 @@ impl Workspace {
                 if next != offset {
                     base.set_offset(next);
                     cx.notify();
+                }
+                let offset = base.offset();
+                let count = if key.1 == 31 {
+                    self.detail_items
+                        .get(&key.0)
+                        .map_or(0, |rows| rows.lines.len())
+                } else {
+                    self.project().map_or(0, |project| project.diff.lines.len())
+                };
+                if count > 0 {
+                    let row = drag_row(
+                        event.position.y.into(),
+                        viewport.origin.y.into(),
+                        viewport.size.height.into(),
+                        offset.y.into(),
+                        count,
+                    );
+                    let raw = if key.1 == 31 {
+                        self.detail_items
+                            .get(&key.0)
+                            .and_then(|rows| rows.lines.get(row))
+                            .cloned()
+                    } else {
+                        self.project()
+                            .and_then(|project| project.diff.lines.get(row))
+                            .map(|line| line.text.clone())
+                    };
+                    if let Some(raw) = raw {
+                        let left = if key.1 == 31 {
+                            12.
+                        } else {
+                            116. + if self.project().is_some_and(|p| {
+                                p.file_tab == FileTab::Stage && p.diff.partial.is_some()
+                            }) {
+                                24.
+                            } else {
+                                0.
+                            }
+                        };
+                        let x = event.position.x.clamp(
+                            viewport.origin.x,
+                            viewport.origin.x + viewport.size.width - px(0.01),
+                        ) - viewport.origin.x
+                            - px(left)
+                            - offset.x;
+                        let displayed = raw.replace('\t', "    ");
+                        let shaped = shape_styled_line(
+                            window,
+                            &displayed,
+                            TEXT,
+                            if key.1 == 31 {
+                                detail_label_len(&raw)
+                            } else {
+                                0
+                            },
+                        );
+                        let byte = shaped.unwrapped_layout.closest_index_for_x(x.max(px(0.)));
+                        if let Some((selected_key, selection)) = &mut self.text_selection
+                            && *selected_key == key
+                        {
+                            selection.cursor = Position {
+                                row,
+                                column: original_column(&raw, byte),
+                            };
+                            cx.notify();
+                        }
+                    }
                 }
             }
             return;
@@ -4718,34 +5172,25 @@ impl Workspace {
             });
         }
         page.error = None;
-        let existing = (mode == 1).then(|| {
-            cx.prompt_for_paths(PathPromptOptions {
-                files: false,
-                directories: true,
-                multiple: false,
-                prompt: Some("저장소 열기".into()),
-            })
-        });
-        let destination = (mode != 1).then(|| {
-            cx.prompt_for_new_path(
-                &std::env::current_dir().unwrap_or_default(),
-                Some("repository"),
-            )
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                match mode {
+                    0 => "신규 저장소 디렉터리 선택",
+                    2 => "Clone 대상 디렉터리 선택",
+                    _ => "저장소 열기",
+                }
+                .into(),
+            ),
         });
         cx.spawn(async move |this, cx| {
-            let selected = if let Some(prompt) = existing {
-                prompt
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| r)
-                    .map(|paths| paths.and_then(|p| p.into_iter().next()))
-            } else {
-                destination
-                    .unwrap()
-                    .await
-                    .map_err(anyhow::Error::from)
-                    .and_then(|r| r)
-            };
+            let selected = selected
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r)
+                .map(|paths| paths.and_then(|p| p.into_iter().next()));
             let result = match selected {
                 Ok(Some(path)) => {
                     let alive = this
@@ -4757,8 +5202,13 @@ impl Workspace {
                     Some(
                         cx.background_executor()
                             .spawn(async move {
-                                if mode != 1 {
-                                    crate::setup::create(&path, source.as_deref())?;
+                                if mode == 0 {
+                                    crate::setup::init_existing_directory(&path)?;
+                                } else if mode == 2 {
+                                    crate::setup::clone_into_existing_directory(
+                                        &path,
+                                        source.as_deref().unwrap_or_default(),
+                                    )?;
                                 }
                                 git::repository_root(&path)
                             })
@@ -4800,7 +5250,7 @@ impl Workspace {
         self.notify(cx);
     }
 
-    fn start_page(&self, cx: &Context<Self>) -> Stateful<Div> {
+    fn start_page(&self, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let Some(id) = self.active else {
             return div().id("start-page");
         };
@@ -4820,24 +5270,17 @@ impl Workspace {
             .flex_shrink_0()
             .child(div().text_lg().child("신규 저장소"));
         for (mode, label) in [(0, "신규 저장소"), (1, "저장소 열기"), (2, "Clone")] {
-            content = content.child(button(("start", mode as usize), label, false).on_click(
-                cx.listener(move |this, _, window, cx| {
-                    if this.start_pages.get(&id).is_none_or(|p| p.busy) {
-                        return;
-                    }
-                    if mode == 2 {
-                        let page = this.start_pages.get_mut(&id).unwrap();
-                        page.clone_form = true;
-                        let editor = page
-                            .url_editor
-                            .get_or_insert_with(|| cx.new(|cx| CommitEditor::single_line("", cx)));
-                        editor.read(cx).focus.focus(window);
-                        cx.notify();
-                    } else {
-                        this.start_repository(id, mode, cx);
-                    }
-                }),
-            ));
+            content = content.child(
+                Self::focus_style(
+                    button(("start", mode as usize), label, false)
+                        .track_focus(&self.start_action_focus[mode as usize]),
+                    self.start_action_focus[mode as usize].is_focused(window),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.start_action_focus[mode as usize].focus(window);
+                    this.activate_start_action(id, mode, window, cx);
+                })),
+            );
         }
         if page.clone_form {
             content = content
@@ -4855,13 +5298,15 @@ impl Workspace {
                     )
                 })
                 .child(
-                    self.shortcut_button(
-                        "execute-clone",
-                        "Clone 실행 · 저장 위치 선택",
-                        "confirm",
-                        true,
+                    Self::focus_style(
+                        self.shortcut_button("execute-clone", "Clone 실행", "confirm", true)
+                            .track_focus(&self.start_action_focus[3]),
+                        self.start_action_focus[3].is_focused(window),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.start_repository(id, 2, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_action_focus[3].focus(window);
+                        this.start_repository(id, 2, cx)
+                    })),
                 );
         }
         if page.busy {
@@ -4876,9 +5321,9 @@ impl Workspace {
         let list = uniform_list(
             ("recent-list", id as usize),
             count,
-            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 range
-                    .map(|index| this.recent_row(index, cx))
+                    .map(|index| this.recent_row(index, window, cx))
                     .collect::<Vec<_>>()
             }),
         )
@@ -4906,7 +5351,7 @@ impl Workspace {
                 scroll,
                 list,
                 size(0., count as f32 * RECENT_ROW_HEIGHT),
-                false,
+                (false, None),
                 cx,
             ));
         div()
@@ -4922,7 +5367,7 @@ impl Workspace {
             .child(recent)
     }
 
-    fn recent_row(&self, index: usize, cx: &Context<Self>) -> Stateful<Div> {
+    fn recent_row(&self, index: usize, window: &Window, cx: &Context<Self>) -> Stateful<Div> {
         let row = div()
             .id(("recent-row", index))
             .h(px(RECENT_ROW_HEIGHT))
@@ -4940,7 +5385,13 @@ impl Workspace {
         };
         let open_path = path.clone();
         let delete_path = path.clone();
+        let focus = self.recent_action_focus.get(path);
         row.cursor_pointer()
+            .when_some(focus, |row, focus| row.track_focus(&focus[0]))
+            .when(
+                focus.is_some_and(|focus| focus[0].is_focused(window)),
+                |row| row.bg(rgb(HOVER)).border_l_2().border_color(rgb(ACCENT)),
+            )
             .hover(|row| row.bg(rgb(HOVER)))
             .child(
                 div()
@@ -4967,6 +5418,16 @@ impl Workspace {
             .child(
                 div()
                     .id(("recent-delete", index))
+                    .when_some(focus, |button, focus| button.track_focus(&focus[1]))
+                    .when(
+                        focus.is_some_and(|focus| focus[1].is_focused(window)),
+                        |button| {
+                            button
+                                .bg(rgb(DANGER_HOVER))
+                                .border_1()
+                                .border_color(rgb(ACCENT))
+                        },
+                    )
                     .size(px(28.))
                     .flex_shrink_0()
                     .flex()
@@ -4977,13 +5438,21 @@ impl Workspace {
                     .child(trash_icon())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
+                        if let Some(focus) = this.recent_action_focus.get(&delete_path) {
+                            focus[1].focus(window);
+                        }
                         this.delete_target = Some(delete_path.clone());
                         this.delete_confirm = false;
                         this.focus.focus(window);
                         cx.notify();
                     })),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.open(open_path.clone(), cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if let Some(focus) = this.recent_action_focus.get(&open_path) {
+                    focus[0].focus(window);
+                }
+                this.open(open_path.clone(), cx)
+            }))
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
@@ -5339,21 +5808,17 @@ impl Workspace {
                         if this.active == Some(id)
                             && this.list_focus == Some(ListFocus::Text((id, 30)))
                         {
-                            this.text_selection = p
-                                .diff
-                                .lines
-                                .iter()
-                                .position(|line| line.old.is_some() || line.new.is_some())
-                                .map(|row| {
-                                    let position = Position { row, column: 0 };
-                                    (
-                                        (id, 30),
-                                        Selection {
-                                            anchor: position,
-                                            cursor: position,
-                                        },
-                                    )
-                                });
+                            this.text_selection = p.diff.lines.first().map(|_| {
+                                let row = 0;
+                                let position = Position { row, column: 0 };
+                                (
+                                    (id, 30),
+                                    Selection {
+                                        anchor: position,
+                                        cursor: position,
+                                    },
+                                )
+                            });
                         }
                     }
                     Err(err) => {
@@ -5388,6 +5853,7 @@ impl Workspace {
     }
 
     fn switch_reference_tab(&mut self, tab: RefTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_tab = false;
         if let Some(project) = self.project_mut() {
             project.ref_tab = tab;
             self.list_focus = Some(ListFocus::Branches(project.id));
@@ -5422,8 +5888,16 @@ impl Workspace {
         };
         match self.list_focus {
             Some(ListFocus::Branches(id)) if id == project.id => {
-                let index = adjacent_tab(project.ref_tab.index(), RefTab::ALL.len(), next).unwrap();
-                self.switch_reference_tab(RefTab::ALL[index], window, cx);
+                let index = adjacent_reference_tab(project.ref_tab, self.search_tab, next);
+                if index == RefTab::ALL.len() {
+                    self.search_tab = true;
+                    self.search_selected = SEARCH_VIRTUAL_ROW;
+                    self.list_focus = Some(ListFocus::Branches(id));
+                    self.focus.focus(window);
+                    self.notify(cx);
+                } else {
+                    self.switch_reference_tab(RefTab::ALL[index], window, cx);
+                }
             }
             Some(ListFocus::Files(id)) if id == project.id => {
                 let tabs = [FileTab::Stage, FileTab::History];
@@ -5439,7 +5913,245 @@ impl Workspace {
         }
     }
 
-    fn branch_panel(&mut self, cx: &Context<Self>) -> Div {
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project() else {
+            return;
+        };
+        let root = project.path.clone();
+        let query = self.search_editor.read(cx).message().to_owned();
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        self.search_loading = true;
+        self.search_results.clear();
+        self.search_selected = SEARCH_VIRTUAL_ROW;
+        let task = cx
+            .background_executor()
+            .spawn(async move { feather_git::git_search::search(&root, &query) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if this.search_generation != generation {
+                    return;
+                }
+                this.search_loading = false;
+                match result {
+                    Ok(results) => this.search_results = results,
+                    Err(error) => {
+                        this.error =
+                            this.error_history
+                                .report("search", "검색", Some(error.to_string()))
+                    }
+                }
+                this.notify(cx);
+            })
+            .ok();
+        })
+        .detach();
+        self.notify(cx);
+    }
+
+    fn activate_search_result(&mut self, cx: &mut Context<Self>) {
+        let Some(result) = self.search_results.get(self.search_selected).cloned() else {
+            return;
+        };
+        match result {
+            feather_git::git_search::Match::Commit { id, .. } => {
+                self.select_commit(id.clone(), cx);
+                let mut load_more = None;
+                let mut visible_index = None;
+                if let Some(project) = self.project_mut() {
+                    visible_index = project
+                        .snapshot
+                        .commits
+                        .iter()
+                        .position(|commit| commit.id == id);
+                    if visible_index.is_none() {
+                        load_more = Some(project.id);
+                        project.history_target = Some(id);
+                    }
+                }
+                if let Some(index) = visible_index
+                    && let Some(project_id) = self.active
+                {
+                    self.history_scroll
+                        .entry(project_id)
+                        .or_default()
+                        .scroll_to_item(index, ScrollStrategy::Center);
+                }
+                if let Some(project_id) = load_more {
+                    self.load_more(project_id, cx);
+                }
+                self.notify(cx);
+            }
+            feather_git::git_search::Match::File { path, .. } => self.open_search_file(path, cx),
+        }
+    }
+
+    fn open_search_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if let Some(handle) = self.file_window {
+            handle
+                .update(cx, |_, child, _| child.activate_window())
+                .ok();
+            return;
+        }
+        let Some(project) = self.project() else {
+            return;
+        };
+        let root = project.path.clone();
+        let title = format!("{} · 파일 히스토리", path);
+        let shortcuts = self.shortcuts.clone();
+        let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
+        match cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(720.), px(480.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            move |_, cx| {
+                cx.new(|cx| crate::search_window::FileHistoryWindow::new(root, path, shortcuts, cx))
+            },
+        ) {
+            Ok(handle) => {
+                let child: AnyWindowHandle = handle.into();
+                self.file_window = Some(child);
+                let parent = cx.weak_entity();
+                cx.on_window_closed(move |cx| {
+                    if !cx.windows().contains(&child) {
+                        parent
+                            .update(cx, |this, cx| {
+                                if this.file_window == Some(child) {
+                                    this.file_window = None;
+                                    this.notify(cx);
+                                }
+                            })
+                            .ok();
+                    }
+                })
+                .detach();
+                self.notify(cx);
+            }
+            Err(error) => {
+                self.error =
+                    self.error_history
+                        .report("search", "파일 히스토리", Some(error.to_string()));
+                self.notify(cx);
+            }
+        }
+    }
+
+    fn search_panel(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let mut results = div()
+            .id("search-results")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let Some(project) = this.project() {
+                    this.list_focus = Some(ListFocus::Branches(project.id));
+                    this.focus.focus(window);
+                    this.notify(cx);
+                }
+            }));
+        for (index, result) in self.search_results.iter().enumerate() {
+            let label = match result {
+                feather_git::git_search::Match::Commit { id, title } => {
+                    format!("{}  {}", &id[..8], title)
+                }
+                feather_git::git_search::Match::File { path, content } => {
+                    format!("{}{}", path, if *content { " · 내용 일치" } else { "" })
+                }
+            };
+            let file = matches!(result, feather_git::git_search::Match::File { .. });
+            let path = if let feather_git::git_search::Match::File { path, .. } = result {
+                path.clone()
+            } else {
+                String::new()
+            };
+            results = results.child(
+                div()
+                    .id(("search-result", index))
+                    .h(px(history_view::ROW_HEIGHT))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(rgb(if self.search_selected == index {
+                        if self.list_focus == self.project().map(|p| ListFocus::Branches(p.id))
+                            && self.focus.is_focused(window)
+                        {
+                            SELECT
+                        } else {
+                            SELECT_INACTIVE
+                        }
+                    } else {
+                        PANEL
+                    }))
+                    .when(self.search_selected != index, |row| {
+                        row.hover(|row| row.bg(rgb(HISTORY_HOVER)))
+                    })
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_sm()
+                            .bg(rgb(if file { TAG_BG } else { LOCAL_BG }))
+                            .text_color(rgb(if file { TAG_TEXT } else { ADDED }))
+                            .child(if file { "F" } else { "C" }),
+                    )
+                    .child(div().min_w_0().text_ellipsis().child(label))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.search_selected = index;
+                        this.list_focus = this.project().map(|p| ListFocus::Branches(p.id));
+                        this.focus.focus(window);
+                        if file && event.click_count() == 2 {
+                            this.open_search_file(path.clone(), cx);
+                        }
+                        this.notify(cx);
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(
+                        div()
+                            .h(px(30.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .child(self.search_editor.clone()),
+                    ),
+            )
+            .when(self.search_loading, |body| {
+                body.child(div().px_3().child("검색 중…"))
+            })
+            .child(results)
+    }
+
+    fn branch_panel(&mut self, window: &Window, cx: &Context<Self>) -> Div {
         let mut tabs = div()
             .id("reference-tabs")
             .border_b_1()
@@ -5456,12 +6168,28 @@ impl Workspace {
                 button(
                     ("ref-tab", i),
                     tab.label(),
-                    self.project().is_some_and(|p| p.ref_tab == tab),
+                    !self.search_tab && self.project().is_some_and(|p| p.ref_tab == tab),
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.switch_reference_tab(tab, window, cx);
                 })),
             );
+        }
+        tabs = tabs.child(
+            button("ref-tab-search", "Search", self.search_tab).on_click(cx.listener(
+                |this, _, window, cx| {
+                    this.search_tab = true;
+                    this.search_selected = SEARCH_VIRTUAL_ROW;
+                    this.list_focus = this
+                        .project()
+                        .map(|project| ListFocus::Branches(project.id));
+                    this.focus.focus(window);
+                    this.notify(cx);
+                },
+            )),
+        );
+        if self.search_tab {
+            return panel().child(tabs).child(self.search_panel(window, cx));
         }
         let (id, kind, count) = self
             .project()
@@ -5491,15 +6219,27 @@ impl Workspace {
         .w_full();
         panel()
             .child(tabs)
-            .when(count == 0, |p| p.child(empty("표시할 항목이 없습니다.")))
-            .child(self.scroll_frame(
-                key,
-                scroll,
-                list,
-                size(0., count as f32 * history_view::ROW_HEIGHT),
-                false,
-                cx,
-            ))
+            .when(count == 0, |p| {
+                p.child(empty("표시할 항목이 없습니다.").px_3().py_2())
+            })
+            .child(
+                self.scroll_frame(
+                    key,
+                    scroll,
+                    list,
+                    size(0., count as f32 * history_view::ROW_HEIGHT),
+                    (false, None),
+                    cx,
+                )
+                .id(("branch-frame", id as usize))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.active == Some(id) {
+                        this.list_focus = Some(ListFocus::Branches(id));
+                        this.focus.focus(window);
+                        this.notify(cx);
+                    }
+                })),
+            )
     }
 
     fn branch_row(
@@ -5888,14 +6628,26 @@ impl Workspace {
                     .when(count == 0, |grid| {
                         grid.child(empty("커밋이 없습니다. 초기 저장소일 수 있습니다."))
                     })
-                    .child(self.scroll_frame(
-                        (project_id, 0),
-                        scroll,
-                        list,
-                        size(0., count as f32 * history_view::ROW_HEIGHT),
-                        false,
-                        cx,
-                    ))
+                    .child(
+                        self.scroll_frame(
+                            (project_id, 0),
+                            scroll,
+                            list,
+                            size(0., count as f32 * history_view::ROW_HEIGHT),
+                            (false, None),
+                            cx,
+                        )
+                        .id(("history-frame", project_id as usize))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                if this.active == Some(project_id) {
+                                    this.list_focus = Some(ListFocus::History(project_id));
+                                    this.focus.focus(window);
+                                    this.notify(cx);
+                                }
+                            },
+                        )),
+                    )
                     .when(page_loading, |grid| grid.child(page_progress())),
             )
     }
@@ -6041,14 +6793,24 @@ impl Workspace {
                     "작업 디렉터리가 깨끗합니다."
                 }))
             })
-            .child(self.scroll_frame(
-                key,
-                scroll,
-                list,
-                size(0., count as f32 * history_view::ROW_HEIGHT),
-                false,
-                cx,
-            ))
+            .child(
+                self.scroll_frame(
+                    key,
+                    scroll,
+                    list,
+                    size(0., count as f32 * history_view::ROW_HEIGHT),
+                    (false, None),
+                    cx,
+                )
+                .id(("file-frame", key.1 as usize))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.active == Some(id) {
+                        this.list_focus = Some(ListFocus::Files(id));
+                        this.focus.focus(window);
+                        this.notify(cx);
+                    }
+                })),
+            )
     }
 
     fn file_row(
@@ -6150,10 +6912,39 @@ impl Workspace {
                     .text_xs()
                     .flex_shrink_0()
                     .when(key.1 == 20, |status| {
+                        let label = file.stage_status();
+                        let mut chars = label.chars();
+                        let left = chars
+                            .next()
+                            .filter(|c| *c != ' ')
+                            .map_or_else(String::new, |c| c.to_string());
+                        let right = chars
+                            .next()
+                            .filter(|c| *c != ' ')
+                            .map_or_else(String::new, |c| c.to_string());
                         status
-                            .w(px(22.))
-                            .font_family("Cascadia Mono")
-                            .whitespace_nowrap()
+                            .w(px(18.))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(9.))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .line_height(px(history_view::ROW_HEIGHT))
+                                    .text_center()
+                                    .child(left),
+                            )
+                            .child(
+                                div()
+                                    .w(px(9.))
+                                    .h_full()
+                                    .flex_shrink_0()
+                                    .line_height(px(history_view::ROW_HEIGHT))
+                                    .text_center()
+                                    .child(right),
+                            )
                     })
                     .text_color(rgb(if file.status == "U" {
                         ERROR
@@ -6166,17 +6957,15 @@ impl Workspace {
                             _ => MODIFIED,
                         }
                     }))
-                    .child(if key.1 == 20 {
-                        file.stage_status()
-                    } else {
-                        file.status.clone()
-                    }),
+                    .when(key.1 != 20, |status| status.child(file.status.clone())),
             )
             .child(
                 div()
                     .min_w_0()
                     .text_ellipsis()
-                    .text_size(px(14.))
+                    .text_xs()
+                    .h_full()
+                    .line_height(px(history_view::ROW_HEIGHT))
                     .when(key.1 == 20 && file.staged, |name| {
                         name.text_color(rgb(ADDED))
                     })
@@ -6330,6 +7119,10 @@ impl Workspace {
             content_width
         };
         let scroll = self.scroll_handle(key);
+        let guide = (!details && count > 0).then(|| {
+            let offset = scroll.0.borrow().base_handle.offset().x;
+            diff_column_guides(partial, offset)
+        });
         let list = uniform_list(
             ("diff-lines", key.1 as usize),
             count,
@@ -6353,6 +7146,8 @@ impl Workspace {
                     div()
                         .px_4()
                         .py_2()
+                        .border_b_1()
+                        .border_color(rgb(LINE))
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .flex_shrink_0()
@@ -6439,17 +7234,43 @@ impl Workspace {
                     .py_2(),
                 )
             })
-            .child(self.scroll_frame(
-                key,
-                scroll,
-                list,
-                size(
-                    if count > 0 { content_width } else { 0. },
-                    count as f32 * 22.,
-                ),
-                true,
-                cx,
-            ))
+            .child(
+                self.scroll_frame(
+                    key,
+                    scroll,
+                    list,
+                    size(
+                        if count > 0 { content_width } else { 0. },
+                        count as f32 * 22.,
+                    ),
+                    (true, guide),
+                    cx,
+                )
+                .id(("diff-frame", key.1 as usize))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.active != Some(id)
+                        || this.history_in_progress()
+                        || this.help
+                        || this.settings.is_some()
+                        || this.commit_dialog.is_some()
+                        || this.discard_dialog.is_some()
+                        || this.stash_dialog.is_some()
+                        || this.delete_target.is_some()
+                    {
+                        return;
+                    }
+                    if !this
+                        .text_selection
+                        .as_ref()
+                        .is_some_and(|(selected, _)| *selected == key)
+                    {
+                        this.text_selection = this.initial_text_selection(key);
+                    }
+                    this.list_focus = Some(ListFocus::Text(key));
+                    this.focus.focus(window);
+                    cx.notify();
+                })),
+            )
             .when(!note.is_empty(), |p| {
                 p.child(
                     div()
@@ -6522,6 +7343,8 @@ impl Workspace {
                         .w(px(24.))
                         .h(px(22.))
                         .flex_shrink_0()
+                        .bg(rgb(HISTORY_HOVER))
+                        .line_height(px(22.))
                         .text_center()
                         .when(matches!(line.kind, '+' | '-'), |cell| {
                             cell.child(
@@ -6544,16 +7367,28 @@ impl Workspace {
             .child(
                 div()
                     .w(px(48.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
                     .flex_shrink_0()
                     .px_2()
+                    .bg(rgb(HISTORY_HOVER))
                     .text_color(rgb(MUTED))
                     .child(line.old.map(|v| v.to_string()).unwrap_or_default()),
             )
             .child(
                 div()
                     .w(px(48.))
+                    .h(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_end()
                     .flex_shrink_0()
                     .px_2()
+                    .bg(rgb(HISTORY_HOVER))
+                    .border_r_1()
+                    .border_color(rgb(LINE))
                     .text_color(rgb(MUTED))
                     .child(line.new.map(|v| v.to_string()).unwrap_or_default()),
             )
@@ -6561,8 +7396,11 @@ impl Workspace {
                 div()
                     .w_5()
                     .h(px(22.))
-                    .line_height(px(22.))
                     .flex_shrink_0()
+                    .line_height(px(22.))
+                    .text_center()
+                    .border_r_1()
+                    .border_color(rgb(LINE))
                     .child(line.kind.to_string()),
             )
             .when(partial && line.kind == '@', |row| {
@@ -6613,20 +7451,12 @@ impl Workspace {
             .filter(|(selected, _)| *selected == key)
             .map(|(_, selection)| selection.clone());
         let focused = matches!(self.list_focus, Some(ListFocus::Text(selected)) if selected == key);
-        let cursor_allowed = key.1 == 31
-            || self
-                .tabs
-                .iter()
-                .filter_map(WorkspaceTab::project)
-                .find(|project| project.id == key.0)
-                .and_then(|project| project.diff.lines.get(row))
-                .is_some_and(|line| line.old.is_some() || line.new.is_some());
         let view = cx.weak_entity();
         div()
             .flex_1()
             .min_w_0()
             .h_full()
-            .when(cursor_allowed, |line| line.cursor(CursorStyle::IBeam))
+            .cursor(CursorStyle::IBeam)
             .child(
                 canvas(
                     |_, _, _| (),
@@ -6658,7 +7488,7 @@ impl Workspace {
                                     rgb(TEXT_SELECTION),
                                 ));
                             }
-                            if focused && cursor_allowed && selection.cursor.row == row {
+                            if focused && selection.cursor.row == row {
                                 window.paint_quad(fill(
                                     Bounds::new(
                                         bounds.origin
@@ -6684,8 +7514,7 @@ impl Workspace {
                             }
                             down_view
                                 .update(cx, |this, cx| {
-                                    if !cursor_allowed
-                                        || this.history_in_progress()
+                                    if this.history_in_progress()
                                         || this.help
                                         || this.commit_dialog.is_some()
                                         || this.discard_dialog.is_some()
@@ -6730,76 +7559,6 @@ impl Workspace {
                                 })
                                 .ok();
                         });
-                        let move_view = view.clone();
-                        let move_line = shaped.clone();
-                        let move_raw = raw.clone();
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
-                            if phase != DispatchPhase::Capture {
-                                return;
-                            }
-                            move_view
-                                .update(cx, |this, cx| {
-                                    if !cursor_allowed
-                                        || !this.text_drag
-                                        || this.history_in_progress()
-                                        || this.help
-                                        || this.commit_dialog.is_some()
-                                        || this.discard_dialog.is_some()
-                                        || this.stash_dialog.is_some()
-                                        || this.delete_target.is_some()
-                                        || this.settings.is_some()
-                                        || this.branch_dialog.is_some()
-                                        || this.branch_busy
-                                        || this.active != Some(key.0)
-                                    {
-                                        return;
-                                    }
-                                    if event.pressed_button != Some(MouseButton::Left) {
-                                        this.text_drag = false;
-                                        return;
-                                    }
-                                    let Some(viewport) = this.viewports.get(&key) else {
-                                        return;
-                                    };
-                                    let y = px(clamp_drag_y(
-                                        event.position.y.into(),
-                                        viewport.origin.y.into(),
-                                        viewport.size.height.into(),
-                                    ));
-                                    let count = if key.1 == 31 {
-                                        this.detail_items
-                                            .get(&key.0)
-                                            .map_or(0, |rows| rows.lines.len())
-                                    } else {
-                                        this.tabs
-                                            .iter()
-                                            .filter_map(WorkspaceTab::project)
-                                            .find(|project| project.id == key.0)
-                                            .map_or(0, |project| project.diff.lines.len())
-                                    };
-                                    let above = y < bounds.origin.y;
-                                    let below = y >= bounds.origin.y + bounds.size.height;
-                                    if (above && row != 0) || (below && row + 1 != count) {
-                                        return;
-                                    }
-                                    if let Some((selected_key, selection)) =
-                                        &mut this.text_selection
-                                        && *selected_key == key
-                                    {
-                                        selection.cursor = Position {
-                                            row,
-                                            column: original_column(
-                                                &move_raw,
-                                                move_line.unwrapped_layout.closest_index_for_x(
-                                                    event.position.x - bounds.origin.x,
-                                                ),
-                                            ),
-                                        };
-                                        cx.notify();
-                                    }
-                                })
-                                .ok();
-                        });
                         let up_view = view.clone();
                         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture && event.button == MouseButton::Left
@@ -6834,6 +7593,13 @@ fn display_file_rows(files: &[FileChange], tree: bool) -> Vec<FileRow> {
 
 fn clamp_drag_y(y: f32, top: f32, height: f32) -> f32 {
     y.clamp(top, (top + height - 0.01).max(top))
+}
+
+fn drag_row(y: f32, top: f32, height: f32, offset: f32, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    (((clamp_drag_y(y, top, height) - top - offset) / 22.).max(0.) as usize).min(count - 1)
 }
 
 fn displayed_byte(raw: &str, column: usize) -> usize {
@@ -7479,7 +8245,7 @@ impl Workspace {
                 .text_color(rgb(TEXT))
                 .font_family("Segoe UI")
                 .child(top)
-                .child(self.start_page(cx))
+                .child(self.start_page(window, cx))
                 .child(
                     div()
                         .flex()
@@ -7496,7 +8262,7 @@ impl Workspace {
                         .child(self.settings_link(cx)),
                 );
         }
-        let branch = self.branch_panel(cx);
+        let branch = self.branch_panel(window, cx);
         let history = self.history_panel(cx);
         let files = self.files_panel(window, cx);
         let diff = self.diff_panel(window, cx);
@@ -7673,8 +8439,27 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.file_window_activation.is_none() {
+            self.file_window_activation =
+                Some(cx.observe_window_activation(window, |this, window, cx| {
+                    if window.is_window_active()
+                        && let Some(handle) = this.file_window
+                    {
+                        handle
+                            .update(cx, |_, child, _| child.activate_window())
+                            .ok();
+                    }
+                }));
+        }
         self.collect_errors(cx);
         self.sync_error_editor(cx);
+        self.recent_action_focus
+            .retain(|path, _| self.recent.contains(path));
+        for path in &self.recent {
+            self.recent_action_focus
+                .entry(path.clone())
+                .or_insert_with(|| [cx.focus_handle(), cx.focus_handle()]);
+        }
         if self.focus_after_popup || window.focused(cx).is_none() {
             self.focus_after_popup = false;
             if matches!(self.branch_dialog.as_ref().map(|dialog| &dialog.action), Some(BranchAction::Connect { plan, .. }) if !plan.candidates.is_empty())
@@ -8320,33 +9105,19 @@ impl Render for Workspace {
                                 this.notify(cx);
                             }),
                         ))
-                        .child(
-                            self.shortcut_button("cancel-recent-action", "취소", "cancel", false)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_target = None;
-                                    this.notify(cx);
-                                })),
-                        )
                         .into_any_element(),
                 );
             } else if let Some(path) = &self.delete_target {
                 title = "저장소 삭제";
                 card = card
                     .child(session::display_path(path))
-                    .child("미커밋 파일을 포함한 저장소 폴더 전체를 휴지통으로 이동합니다.");
+                    .child("미커밋 파일을 포함한 저장소 폴더 전체를 영구 삭제합니다.");
                 footer = Some(
                     div()
                         .flex()
                         .gap_2()
                         .child(
-                            self.shortcut_button("cancel-delete", "취소", "cancel", false)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.delete_target = None;
-                                    this.notify(cx);
-                                })),
-                        )
-                        .child(
-                            button("confirm-delete", "휴지통으로 이동", true)
+                            button("confirm-delete", "삭제", true)
                                 .on_click(cx.listener(|this, _, _, cx| this.delete_repository(cx))),
                         )
                         .into_any_element(),
@@ -8469,6 +9240,24 @@ impl Render for Workspace {
         if self.error_history_open && self.error_history.len() > 0 {
             root = root.child(self.error_overlay(window, cx));
         }
+        if self.file_window.is_some() {
+            root = root.child(
+                div()
+                    .id("file-window-parent-blocker")
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(rgba(0x24324730))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(handle) = this.file_window {
+                            handle
+                                .update(cx, |_, child, _| child.activate_window())
+                                .ok();
+                        }
+                        cx.stop_propagation();
+                    })),
+            );
+        }
         root
     }
 }
@@ -8476,6 +9265,21 @@ impl Render for Workspace {
 #[cfg(test)]
 mod detail_tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn search_arrows_move_between_virtual_row_input_and_results() {
+        assert_eq!(
+            search_arrow_target(SEARCH_VIRTUAL_ROW, 0, true),
+            SearchArrowTarget::Input
+        );
+        assert_eq!(
+            search_arrow_target(SEARCH_VIRTUAL_ROW, 2, false),
+            SearchArrowTarget::Row(SEARCH_VIRTUAL_ROW)
+        );
+        assert_eq!(search_arrow_target(0, 2, false), SearchArrowTarget::Input);
+        assert_eq!(search_arrow_target(0, 2, true), SearchArrowTarget::Row(1));
+        assert_eq!(search_arrow_target(1, 2, true), SearchArrowTarget::Row(1));
+    }
 
     #[::core::prelude::v1::test]
     fn panel_tabs_cycle_forward_and_backward_and_handle_empty_or_single_tabs() {
@@ -8504,6 +9308,15 @@ mod detail_tests {
         );
         assert_eq!(adjacent_tab(0, 3, false), Some(2));
         assert_eq!(adjacent_tab(2, 3, true), Some(0));
+    }
+
+    #[::core::prelude::v1::test]
+    fn reference_tabs_cycle_through_search_in_both_directions() {
+        assert_eq!(adjacent_reference_tab(RefTab::Tag, false, true), 4);
+        assert_eq!(adjacent_reference_tab(RefTab::Tag, true, true), 0);
+        assert_eq!(adjacent_reference_tab(RefTab::Local, false, false), 4);
+        assert_eq!(adjacent_reference_tab(RefTab::Local, true, false), 3);
+        assert_eq!(adjacent_reference_tab(RefTab::Tag, false, false), 2);
     }
 
     #[::core::prelude::v1::test]
@@ -8606,6 +9419,11 @@ mod detail_tests {
         assert!(clamp_drag_y(150., 10., 100.) < 110.);
         assert!(clamp_drag_y(150., 10., 100.) > 109.);
         assert_eq!(clamp_drag_y(150., 10., 0.), 10.);
+        assert_eq!(drag_row(5., 10., 100., 0., 20), 0);
+        assert_eq!(drag_row(150., 10., 100., 0., 20), 4);
+        assert_eq!(drag_row(150., 10., 100., -44., 20), 6);
+        assert_eq!(drag_row(150., 10., 100., -440., 20), 19);
+        assert_eq!(drag_row(150., 10., 100., 0., 0), 0);
     }
 
     #[::core::prelude::v1::test]

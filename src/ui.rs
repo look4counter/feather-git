@@ -6535,17 +6535,19 @@ impl Workspace {
                     .border_color(rgb(LINE))
                     .child(
                         div()
-                            .h(px(30.))
-                            .px_2()
-                            .flex()
-                            .items_center()
+                            .h(px(36.))
+                            .overflow_hidden()
+                            .flex_shrink_0()
                             .border_1()
                             .border_color(rgb(LINE))
+                            .rounded_sm()
+                            .p_1()
+                            .bg(rgb(self.search_editor.read(cx).background_color()))
                             .child(self.search_editor.clone()),
                     ),
             )
             .when(self.search_loading, |body| {
-                body.child(div().px_3().child("검색 중…"))
+                body.child(empty("검색 중…").px_3().py_2())
             })
             .child(results)
     }
@@ -7182,15 +7184,20 @@ impl Workspace {
                 )
             })
             .when(count == 0, |panel| {
-                panel.child(empty(if loading {
-                    "조회 중입니다…"
-                } else if failed {
-                    "파일 목록을 조회하지 못했습니다."
-                } else if history {
-                    "선택한 커밋에 변경 파일이 없습니다."
-                } else {
-                    "작업 디렉터리가 깨끗합니다."
-                }))
+                panel.child(
+                    empty(if loading {
+                        "조회 중입니다…"
+                    } else if failed {
+                        "파일 목록을 조회하지 못했습니다."
+                    } else if history {
+                        "선택한 커밋에 변경 파일이 없습니다."
+                    } else {
+                        "작업 디렉터리가 깨끗합니다."
+                    })
+                    .when(!loading && !failed && !history, |message| {
+                        message.px_3().py_2()
+                    }),
+                )
             })
             .child(
                 self.scroll_frame(

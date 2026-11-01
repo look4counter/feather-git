@@ -1008,3 +1008,15 @@ src/auth_profiles.rs의 관리 목록에서 직접 등록 항목마다 기존 �
 ## US195 계획
 
 src/commit_editor.rs의 기존 드래그·Ctrl+C·Ctrl+A 및 읽기 전용 기능을 재사용하는 단일행 생성 함수를 추가한다. src/settings.rs는 표시 주소별 읽기 전용 Entity를 보관하고 원격 갱신 시 동기화한다. src/auth_settings.rs는 인증 ID별 Entity를 보관하고 필터 갱신 시 동기화한다. 두 화면의 주소 문자열을 높이 26px의 읽기 전용 편집기로 교체한다. 기존 설정 키 이벤트는 Ctrl+C·Ctrl+A를 자식에 전달하므로 변경하지 않는다. 기존 편집기 및 URL 비밀정보 제거 회귀, fmt/check/clippy로 검증한다. 저장소 구조와 종속성은 유지한다.
+
+## Stage 정상 빈 상태 여백 축소 (US196)
+
+src/ui.rs의 파일 목록 empty 요소에 !loading && !failed && !history 조건으로 px_3·py_2를 적용한다. 기존 브랜치 빈 상태와 같은 좌우 12px·상하 8px이며 공유 empty의 20px 기본값은 유지한다. 데이터와 외부 계약 변경은 없다. 새 테스트 없이 조건 및 상수 비교와 fmt/check/clippy로 검증한다. 헌법은 미작성 템플릿이며 한글 문서 및 전체 절차 준수에 위반이 없다.
+
+## Search 검색 중 안내 스타일 (US197)
+
+src/ui.rs search_panel의 검색 중… 요소에 기존 empty 헬퍼를 재사용하고 px_3·py_2로 브랜치 빈 목록 안내와 맞춘다. text_sm과 MUTED 색상을 함께 적용한다. 데이터·검색 동작 변경과 추가 의존성은 없다. 조건과 공통 헬퍼를 검토하고 fmt/check/clippy로 검증한다. 확정 규칙 위반 없음.
+
+## Search 입력창 스타일 (US198)
+
+src/ui.rs search_panel의 입력 래퍼를 src/settings.rs의 field와 같은 h(36px), overflow_hidden, flex_shrink_0, border_1, LINE 색상, rounded_sm, p_1, 편집기 background_color로 맞춘다. 기존 px_2와 flex·items_center는 공통 래퍼에 맞춰 대체한다. 바깥 헤더 및 검색 로직은 유지한다. 데이터 변경이나 의존성 추가는 없다. 비교 코드 검토와 fmt/check/clippy로 검증한다. 확정 규칙 위반 없음.

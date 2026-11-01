@@ -1512,3 +1512,15 @@ Clone URL을 입력하고 기존 빈 디렉터리를 선택하면 `.git`과 작�
 ## US195 검증
 
 원격 fetch/push 주소와 인증 주소의 텍스트를 드래그한 뒤 Ctrl+C로 부분 복사하고 Ctrl+A 후 전체 복사한다. 입력·붙여넣기·잘라내기·삭제로 주소를 바꿀 수 없어야 한다. 긴 주소, 같은 주소의 여러 원격, .git 경로, 원격 삭제·인증 재필터링도 확인한다. 자동 검증은 편집기 회귀 7개 및 설정 회귀 9개, cargo fmt --check, cargo check, cargo clippy --all-targets -- -D warnings가 통과했다. 실제 화면 드래그와 클립보드 내용 확인은 수행하지 않았다.
+
+## US196 Stage 빈 상태 여백 검증
+
+Stage 정상 빈 상태에만 좌우 12px·상하 8px가 적용되고, 조회 중·오류·History 안내는 기존 공유 여백을 사용함을 코드로 확인했다. cargo fmt --check, cargo check --all-targets 및 cargo clippy --all-targets -- -D warnings 통과. 실제 GUI 수동 검증은 수행하지 않았다.
+
+## US197 Search 검색 중 안내 검증
+
+공통 empty 헬퍼의 text_sm·MUTED 색상과 px_3·py_2 여백을 적용했으며 검색 실행·입력·결과 경로는 유지함을 코드로 검토했다. cargo fmt --check, cargo check --all-targets 및 cargo clippy --all-targets -- -D warnings 통과. 실제 GUI 수동 검증은 수행하지 않았다.
+
+## US198 Search 입력창 스타일 검증
+
+설정 field의 36px 높이·넘침 처리·축소 방지·테두리·rounded_sm·p_1·편집기 배경색과 같은 속성을 적용했으며 검색 입력·실행·포커스 코드는 유지함을 검토했다. cargo fmt --check, cargo check --all-targets 및 cargo clippy --all-targets -- -D warnings 통과. 실제 GUI 수동 검증은 수행하지 않았다.

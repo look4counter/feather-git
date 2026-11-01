@@ -11,4 +11,5 @@ mod native_refs;
 mod native_remote;
 pub mod paging;
 pub mod partial_stage;
+pub mod repository_watch;
 pub mod stash_recovery;

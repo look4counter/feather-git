@@ -14,6 +14,11 @@ use std::path::PathBuf;
 
 const SEARCH_VIRTUAL_ROW: usize = usize::MAX;
 
+struct ExternalWatch {
+    watcher: Option<feather_git::repository_watch::Watcher>,
+    scheduler: feather_git::repository_watch::Scheduler,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SearchArrowTarget {
     Input,
@@ -261,6 +266,7 @@ impl WorkspaceTab {
 }
 
 pub struct Workspace {
+    external_watches: HashMap<u64, ExternalWatch>,
     file_window: Option<AnyWindowHandle>,
     file_window_activation: Option<Subscription>,
     search_tab: bool,
@@ -1058,6 +1064,7 @@ impl Workspace {
 
     pub fn new(paths: Vec<PathBuf>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
+            external_watches: HashMap::new(),
             file_window: None,
             file_window_activation: None,
             search_tab: false,
@@ -1136,7 +1143,321 @@ impl Workspace {
             diff_content_width: HashMap::new(),
         };
         this.restore(paths, cx);
+        #[cfg(windows)]
+        {
+            let executor = cx.background_executor().clone();
+            cx.spawn(async move |this, cx| {
+                loop {
+                    executor.timer(std::time::Duration::from_millis(100)).await;
+                    if this
+                        .update(cx, |this, cx| this.poll_external_changes(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         this
+    }
+
+    fn poll_external_changes(&mut self, cx: &mut Context<Self>) {
+        use feather_git::repository_watch::{Scheduler, Watcher};
+        let projects: Vec<_> = self
+            .tabs
+            .iter()
+            .filter_map(WorkspaceTab::project)
+            .map(|p| (p.id, p.path.clone()))
+            .collect();
+        self.external_watches
+            .retain(|id, _| projects.iter().any(|(open, _)| id == open));
+        for (id, path) in &projects {
+            if !self.external_watches.contains_key(id) {
+                self.external_watches.insert(
+                    *id,
+                    ExternalWatch {
+                        watcher: None,
+                        scheduler: Scheduler::default(),
+                    },
+                );
+                let id = *id;
+                let path = path.clone();
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { Watcher::start(&path) });
+                cx.spawn(async move |this, cx| {
+                    let result = task.await;
+                    this.update(cx, |this, cx| {
+                        let Some(watch) = this.external_watches.get_mut(&id) else {
+                            return;
+                        };
+                        match result {
+                            Ok(watcher) => {
+                                watch.watcher = Some(watcher);
+                                // Reconcile once after arming to cover changes during startup.
+                                watch
+                                    .scheduler
+                                    .push(feather_git::repository_watch::Batch::event(
+                                        feather_git::repository_watch::Scope::Full,
+                                        std::time::Instant::now(),
+                                    ));
+                            }
+                            Err(error) => {
+                                this.error = this.error_history.report(
+                                    format!("watch-{id}"),
+                                    "외부 변경 감시",
+                                    Some(format!("{error:#}")),
+                                );
+                            }
+                        }
+                        this.notify(cx);
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+        let blocked = self.pending > 0
+            || self.branch_busy
+            || self.search_loading
+            || self.commit_dialog.is_some()
+            || self.branch_dialog.is_some()
+            || self.stash_dialog.is_some()
+            || self.discard_dialog.is_some()
+            || self.settings.is_some()
+            || self.shortcut_settings
+            || self.delete_target.is_some();
+        let now = std::time::Instant::now();
+        let mut refresh = None;
+        for (id, watch) in &mut self.external_watches {
+            if let Some(watcher) = &watch.watcher {
+                let (batch, error) = watcher.drain();
+                if let Some(batch) = batch {
+                    watch.scheduler.push(batch);
+                }
+                if let Some(error) = error {
+                    self.error = self.error_history.report(
+                        format!("watch-{id}"),
+                        "외부 변경 감시",
+                        Some(error),
+                    );
+                    cx.notify();
+                }
+            }
+            let project_blocked = self
+                .tabs
+                .iter()
+                .filter_map(WorkspaceTab::project)
+                .find(|p| p.id == *id)
+                .is_none_or(|p| !p.initialized || p.loading || p.diff_loading || p.page_loading);
+            if let Some(scope) =
+                watch
+                    .scheduler
+                    .begin(now, self.active == Some(*id), blocked || project_blocked)
+            {
+                refresh = Some((*id, scope));
+            }
+        }
+        if let Some((id, scope)) = refresh {
+            self.refresh_external(id, scope, cx);
+        }
+    }
+
+    fn refresh_external(
+        &mut self,
+        id: u64,
+        scope: feather_git::repository_watch::Scope,
+        cx: &mut Context<Self>,
+    ) {
+        use feather_git::repository_watch::{Batch, Scope};
+        let Some(project) = self
+            .tabs
+            .iter_mut()
+            .filter_map(WorkspaceTab::project_mut)
+            .find(|p| p.id == id)
+        else {
+            return;
+        };
+        let (generation, diff_generation) = (project.generation, project.diff_generation);
+        let path = project.path.clone();
+        let commit = project.commit.clone();
+        let loaded_count = project.snapshot.commits.len();
+        let file_tab = project.file_tab;
+        let selected = project
+            .selected_file
+            .and_then(|index| project.files().get(index))
+            .cloned();
+        project.loading = true;
+        let task = cx.background_executor().spawn(async move {
+            let snapshot = if scope == Scope::Full {
+                let mut snapshot = git::load_for_refresh(&path, commit.as_deref())?;
+                while snapshot.has_more && snapshot.commits.len() < loaded_count {
+                    let Some(session) = &snapshot.session else {
+                        break;
+                    };
+                    let page = session.next_page()?;
+                    snapshot.commits.extend(page.commits);
+                    snapshot.has_more = page.has_more;
+                }
+                Some(snapshot)
+            } else {
+                None
+            };
+            let stage = match &snapshot {
+                Some(snapshot) => snapshot.stage.clone(),
+                None => git::load_stage(&path)?,
+            };
+            let files = if file_tab == FileTab::Stage {
+                Some(&stage)
+            } else {
+                snapshot.as_ref().map(|s| &s.history)
+            };
+            let file = selected
+                .as_ref()
+                .and_then(|selected| {
+                    files.and_then(|files| {
+                        files
+                            .iter()
+                            .find(|file| {
+                                file.path == selected.path && file.staged == selected.staged
+                            })
+                            .or_else(|| files.iter().find(|file| file.path == selected.path))
+                    })
+                })
+                .cloned();
+            let diff = file
+                .as_ref()
+                .map(|file| git::diff(&path, file))
+                .transpose()?;
+            Ok::<_, anyhow::Error>((snapshot, stage, file, diff))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Some(watch) = this.external_watches.get_mut(&id) {
+                    watch.scheduler.finish();
+                }
+                let Some(project) = this
+                    .tabs
+                    .iter_mut()
+                    .filter_map(WorkspaceTab::project_mut)
+                    .find(|p| p.id == id)
+                else {
+                    return;
+                };
+                if project.generation != generation || project.diff_generation != diff_generation {
+                    if project.generation == generation {
+                        project.loading = false;
+                    }
+                    if let Some(watch) = this.external_watches.get_mut(&id) {
+                        watch
+                            .scheduler
+                            .push(Batch::event(scope, std::time::Instant::now()));
+                    }
+                    return;
+                }
+                project.loading = false;
+                match result {
+                    Ok((snapshot, stage, file, diff)) => {
+                        if let Some(snapshot) = snapshot {
+                            project.commit = snapshot
+                                .commit_detail
+                                .as_ref()
+                                .map(|detail| detail.id.clone());
+                            if !snapshot
+                                .references
+                                .iter()
+                                .any(|r| Some(&r.revision) == project.revision.as_ref())
+                            {
+                                project.revision = None;
+                            }
+                            project.page_generation += 1;
+                            project.page_error = None;
+                            project.snapshot = snapshot;
+                            this.graphs.remove(&id);
+                            this.file_items.insert(
+                                (id, 21),
+                                display_file_rows(&project.snapshot.history, this.file_tree),
+                            );
+                            let rows = project
+                                .snapshot
+                                .commit_detail
+                                .as_ref()
+                                .map(detail_rows)
+                                .unwrap_or_default();
+                            this.detail_items.insert(id, TextRows::new(rows));
+                        } else {
+                            project.snapshot.stage = stage;
+                            project.snapshot.unmerged = project
+                                .snapshot
+                                .stage
+                                .iter()
+                                .filter(|f| f.status == "U")
+                                .map(|f| f.path.clone())
+                                .collect();
+                        }
+                        project
+                            .stage_selection
+                            .restore(&project.snapshot.stage, &Default::default());
+                        this.file_items.insert(
+                            (id, 20),
+                            display_file_rows(&project.snapshot.stage, this.file_tree),
+                        );
+                        if scope == Scope::Full || file_tab == FileTab::Stage {
+                            project.selected_file = file.as_ref().and_then(|file| {
+                                project
+                                    .files()
+                                    .iter()
+                                    .position(|f| f.path == file.path && f.staged == file.staged)
+                            });
+                            project.diff_generation += 1;
+                            project.diff = diff.unwrap_or_default();
+                            this.partial_selection.remove(&id);
+                            this.diff_measured.remove(&id);
+                            let columns = project
+                                .diff
+                                .lines
+                                .iter()
+                                .map(|line| text_columns(&line.text))
+                                .max()
+                                .unwrap_or(0);
+                            this.diff_content_width
+                                .insert(id, columns as f32 * 8. + 132.);
+                            this.diff_width_row.insert(
+                                id,
+                                project
+                                    .diff
+                                    .lines
+                                    .iter()
+                                    .enumerate()
+                                    .max_by_key(|(_, line)| line.text.len())
+                                    .map(|(i, _)| i)
+                                    .unwrap_or(0),
+                            );
+                            if this
+                                .text_selection
+                                .as_ref()
+                                .is_some_and(|(key, _)| *key == (id, 30))
+                            {
+                                this.text_selection = None;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        project.error = this.error_history.report(
+                            format!("project-{id}"),
+                            "외부 변경 갱신",
+                            Some(format!("{error:#}")),
+                        );
+                    }
+                }
+                this.notify(cx);
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn restore(&mut self, arguments: Vec<PathBuf>, cx: &mut Context<Self>) {
@@ -2843,15 +3164,14 @@ impl Workspace {
                         }
                         this.reload(cx);
                         this.active = active;
-                        if push_after {
-                            if let Some(project) = this
+                        if push_after
+                            && let Some(project) = this
                                 .tabs
                                 .iter()
                                 .filter_map(WorkspaceTab::project)
                                 .find(|p| p.id == id)
-                            {
-                                this.open_push(id, project.path.clone(), cx);
-                            }
+                        {
+                            this.open_push(id, project.path.clone(), cx);
                         }
                     }
                     Err(error) => {

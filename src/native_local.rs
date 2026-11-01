@@ -427,12 +427,52 @@ pub fn commit(path: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn amend_commit(path: &Path, message: &str) -> Result<()> {
+    if message.trim().is_empty() || message.contains('\0') {
+        bail!("커밋 메시지를 입력하세요.");
+    }
+    let repo = repo(path)?;
+    let head = repo.head_id()?.detach();
+    let previous = repo.find_commit(head)?;
+    let decoded = previous.decode()?;
+    let author = decoded.author()?.to_owned()?;
+    let parents = previous
+        .parent_ids()
+        .map(|id| id.detach())
+        .collect::<Vec<_>>();
+    let index = index(path, None)?;
+    let tree = index_tree(&repo, &index)?;
+    if previous.tree_id()?.detach() == tree {
+        bail!("staged 변경사항이 없습니다.");
+    }
+    create_commit_expected(&repo, tree, &parents, message, Some(author), Some(head))?;
+    Ok(())
+}
+
 pub fn create_commit(
     repo: &gix::Repository,
     tree: gix::ObjectId,
     parents: &[gix::ObjectId],
     message: &str,
     author: Option<gix::actor::Signature>,
+) -> Result<gix::ObjectId> {
+    create_commit_expected(
+        repo,
+        tree,
+        parents,
+        message,
+        author,
+        parents.first().copied(),
+    )
+}
+
+fn create_commit_expected(
+    repo: &gix::Repository,
+    tree: gix::ObjectId,
+    parents: &[gix::ObjectId],
+    message: &str,
+    author: Option<gix::actor::Signature>,
+    expected_head: Option<gix::ObjectId>,
 ) -> Result<gix::ObjectId> {
     use gix::refs::{
         Target,
@@ -475,9 +515,8 @@ pub fn create_commit(
                 message: format!("commit: {}", message.lines().next().unwrap_or_default()).into(),
                 ..Default::default()
             },
-            expected: parents
-                .first()
-                .map(|p| PreviousValue::MustExistAndMatch(Target::Object(*p)))
+            expected: expected_head
+                .map(|p| PreviousValue::MustExistAndMatch(Target::Object(p)))
                 .unwrap_or(PreviousValue::MustNotExist),
             new: Target::Object(id),
         },

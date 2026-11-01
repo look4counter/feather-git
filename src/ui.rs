@@ -55,6 +55,7 @@ struct CommitDialog {
     editor: Entity<CommitEditor>,
     busy: bool,
     push_after: bool,
+    amend: bool,
     error: Option<String>,
 }
 
@@ -75,6 +76,10 @@ struct DiscardDialog {
 
 #[derive(Clone)]
 enum BranchAction {
+    Push {
+        plan: crate::setup::PushPlan,
+        force_with_lease: bool,
+    },
     Create {
         commit: String,
         remote: bool,
@@ -289,6 +294,7 @@ pub struct Workspace {
     focus: FocusHandle,
     branch_checks_focus: [FocusHandle; 2],
     commit_push_focus: FocusHandle,
+    commit_amend_focus: FocusHandle,
     reset_mode_focus: FocusHandle,
     upstream_scroll: ScrollHandle,
     upstream_focus: FocusHandle,
@@ -1085,6 +1091,7 @@ impl Workspace {
             focus: cx.focus_handle(),
             branch_checks_focus: [cx.focus_handle(), cx.focus_handle()],
             commit_push_focus: cx.focus_handle(),
+            commit_amend_focus: cx.focus_handle(),
             reset_mode_focus: cx.focus_handle(),
             upstream_scroll: ScrollHandle::new(),
             upstream_focus: cx.focus_handle(),
@@ -1722,7 +1729,8 @@ impl Workspace {
             return;
         }
         let checkbox_focused = (self.commit_dialog.is_some()
-            && self.commit_push_focus.is_focused(window))
+            && (self.commit_push_focus.is_focused(window)
+                || self.commit_amend_focus.is_focused(window)))
             || (self.branch_dialog.is_some()
                 && self
                     .branch_checks_focus
@@ -1790,8 +1798,10 @@ impl Workspace {
                     if matches!(dialog.action, BranchAction::Connect { .. }) {
                         inputs.push(self.upstream_focus.clone());
                     }
-                    if matches!(dialog.action, BranchAction::Revert { .. })
-                        || matches!(&dialog.action, BranchAction::RevertControl { state, action: crate::branches::RevertControl::Continue, .. } if state.no_commit.is_none())
+                    if matches!(
+                        dialog.action,
+                        BranchAction::Revert { .. } | BranchAction::Push { .. }
+                    ) || matches!(&dialog.action, BranchAction::RevertControl { state, action: crate::branches::RevertControl::Continue, .. } if state.no_commit.is_none())
                         || matches!(&dialog.action, BranchAction::Delete { plan, .. } if !plan.related.is_empty())
                     {
                         inputs.push(self.branch_checks_focus[0].clone());
@@ -1808,6 +1818,7 @@ impl Workspace {
                 } else if let Some(dialog) = &self.commit_dialog {
                     blocked = dialog.busy || dialog.editor.read(cx).is_composing();
                     inputs.push(dialog.editor.read(cx).focus.clone());
+                    inputs.push(self.commit_amend_focus.clone());
                     inputs.push(self.commit_push_focus.clone());
                 }
                 if !blocked {
@@ -1861,6 +1872,14 @@ impl Workspace {
                 return;
             }
             if dialog.editor.read(cx).is_composing() {
+                return;
+            }
+            if key.key == "space" && self.commit_amend_focus.is_focused(window) {
+                if let Some(dialog) = &mut self.commit_dialog {
+                    dialog.amend = !dialog.amend;
+                }
+                cx.stop_propagation();
+                self.notify(cx);
                 return;
             }
             if key.key == "space" && self.commit_push_focus.is_focused(window) {
@@ -1927,6 +1946,12 @@ impl Workspace {
             {
                 let changed = if let Some(dialog) = &mut self.branch_dialog {
                     match &mut dialog.action {
+                        BranchAction::Push {
+                            force_with_lease, ..
+                        } if index == 0 => {
+                            *force_with_lease = !*force_with_lease;
+                            true
+                        }
                         BranchAction::Revert { no_commit, .. } if index == 0 => {
                             *no_commit = !*no_commit;
                             self.popup_options.revert_no_commit = *no_commit;
@@ -2646,12 +2671,42 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_push(&mut self, project_id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        match crate::setup::push_plan(&path) {
+            Ok(plan) => {
+                self.branch_dialog = Some(BranchDialog {
+                    project_id,
+                    path,
+                    action: BranchAction::Push {
+                        plan,
+                        force_with_lease: false,
+                    },
+                    editor: None,
+                    error: None,
+                });
+                self.focus_after_popup = true;
+            }
+            Err(error) => {
+                self.error =
+                    self.error_history
+                        .report("workspace", "푸시", Some(format!("{error:#}")));
+            }
+        }
+        self.notify(cx);
+    }
+
     fn remote_operation(
         &mut self,
         operation: crate::setup::RemoteOperation,
         cx: &mut Context<Self>,
     ) {
         if self.busy() {
+            return;
+        }
+        if matches!(operation, crate::setup::RemoteOperation::Push) {
+            if let Some(project) = self.project() {
+                self.open_push(project.id, project.path.clone(), cx);
+            }
             return;
         }
         let Some(p) = self.project() else {
@@ -2711,6 +2766,7 @@ impl Workspace {
             editor,
             busy: false,
             push_after: false,
+            amend: false,
             error: None,
         });
         cx.notify();
@@ -2760,15 +2816,16 @@ impl Workspace {
         };
         dialog.busy = true;
         let push_after = dialog.push_after;
+        let amend = dialog.amend;
         dialog.error = None;
         dialog.editor.update(cx, |editor, cx| {
             editor.enabled = false;
             cx.notify();
         });
         self.pending += 1;
-        let task = cx
-            .background_executor()
-            .spawn(async move { crate::setup::commit_then_push(&path, &message, push_after) });
+        let task = cx.background_executor().spawn(async move {
+            crate::setup::commit_then_push_with_options(&path, &message, false, amend)
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
@@ -2786,6 +2843,16 @@ impl Workspace {
                         }
                         this.reload(cx);
                         this.active = active;
+                        if push_after {
+                            if let Some(project) = this
+                                .tabs
+                                .iter()
+                                .filter_map(WorkspaceTab::project)
+                                .find(|p| p.id == id)
+                            {
+                                this.open_push(id, project.path.clone(), cx);
+                            }
+                        }
                     }
                     Err(error) => {
                         if let Some(dialog) = &mut this.commit_dialog
@@ -4328,14 +4395,22 @@ impl Workspace {
         dialog.error = None;
         self.pending += 1;
         self.branch_busy = true;
-        self.remote_status = Some((id, "브랜치 작업 중…"));
+        self.remote_status = Some((
+            id,
+            if matches!(action, BranchAction::Push { .. }) {
+                "푸시 중…"
+            } else {
+                "브랜치 작업 중…"
+            },
+        ));
         let switched = matches!(
             action,
             BranchAction::Track(_) | BranchAction::ChooseCheckout { .. }
         );
         let restore_focus = matches!(
             action,
-            BranchAction::Create { .. }
+            BranchAction::Push { .. }
+                | BranchAction::Create { .. }
                 | BranchAction::Tag { .. }
                 | BranchAction::Reset { .. }
                 | BranchAction::Revert { .. }
@@ -4348,6 +4423,10 @@ impl Workspace {
         );
         let task = cx.background_executor().spawn(async move {
             match action {
+                BranchAction::Push {
+                    plan,
+                    force_with_lease,
+                } => crate::setup::push_with_plan(&path, &plan, force_with_lease),
                 BranchAction::Create {
                     commit,
                     remote,
@@ -8539,6 +8618,7 @@ impl Render for Workspace {
                 );
             } else if let Some(dialog) = &self.branch_dialog {
                 title = match &dialog.action {
+                    BranchAction::Push { .. } => "푸시",
                     BranchAction::Create { .. } => "브랜치 만들기",
                     BranchAction::Tag { .. } => "태그 만들기",
                     BranchAction::Delete { plan, .. } => plan.kind.title(),
@@ -8563,7 +8643,8 @@ impl Render for Workspace {
                 let minimal = create
                     || matches!(
                         dialog.action,
-                        BranchAction::Tag { .. }
+                        BranchAction::Push { .. }
+                            | BranchAction::Tag { .. }
                             | BranchAction::Delete { .. }
                             | BranchAction::Connect { .. }
                             | BranchAction::Reset { .. }
@@ -8578,6 +8659,35 @@ impl Render for Workspace {
                     card = card.text_size(px(13.));
                 }
                 match &dialog.action {
+                    BranchAction::Push {
+                        force_with_lease, ..
+                    } => {
+                        card = card.child(
+                            button("push-force-with-lease", "", false)
+                                .track_focus(&self.branch_checks_focus[0])
+                                .when(self.branch_checks_focus[0].is_focused(window), |button| {
+                                    button.bg(rgb(SELECT))
+                                })
+                                .child(crate::controls::checkbox(
+                                    *force_with_lease,
+                                    "원격 변경 확인 후 강제 푸시",
+                                ))
+                                .on_click(cx.listener(|this, event, window, cx| {
+                                    if !crate::controls::checkbox_click(event) || this.branch_busy {
+                                        return;
+                                    }
+                                    if let Some(dialog) = &mut this.branch_dialog
+                                        && let BranchAction::Push {
+                                            force_with_lease, ..
+                                        } = &mut dialog.action
+                                    {
+                                        *force_with_lease = !*force_with_lease;
+                                        this.branch_checks_focus[0].focus(window);
+                                        this.notify(cx);
+                                    }
+                                })),
+                        );
+                    }
                     BranchAction::Create { .. } | BranchAction::Tag { .. } => {
                         let tag = matches!(dialog.action, BranchAction::Tag { .. });
                         card = card
@@ -9039,8 +9149,39 @@ impl Render for Workspace {
                 title = "커밋";
                 width = 640.;
                 card = card
-                    .child(div().text_color(rgb(MUTED)).child("커밋메시지"))
-                    .child(dialog.editor.clone())
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .flex_shrink_0()
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .rounded_sm()
+                            .p_1()
+                            .bg(rgb(dialog.editor.read(cx).background_color()))
+                            .child(dialog.editor.clone()),
+                    )
+                    .child(
+                        button("commit-amend-option", "", false)
+                            .track_focus(&self.commit_amend_focus)
+                            .when(self.commit_amend_focus.is_focused(window), |button| {
+                                button.bg(rgb(SELECT))
+                            })
+                            .when(dialog.busy, |button| button.opacity(0.45))
+                            .child(crate::controls::checkbox(dialog.amend, "마지막 커밋 수정"))
+                            .on_click(cx.listener(|this, event, window, cx| {
+                                if !crate::controls::checkbox_click(event) {
+                                    return;
+                                }
+                                if let Some(dialog) = &mut this.commit_dialog
+                                    && !dialog.busy
+                                    && !dialog.editor.read(cx).is_composing()
+                                {
+                                    dialog.amend = !dialog.amend;
+                                    this.commit_amend_focus.focus(window);
+                                    this.notify(cx);
+                                }
+                            })),
+                    )
                     .child(
                         button("commit-push-option", "", false)
                             .track_focus(&self.commit_push_focus)
@@ -9066,13 +9207,7 @@ impl Render for Workspace {
                     .when_some(dialog.error.clone(), |card, error| {
                         card.child(div().text_color(rgb(ERROR)).child(error))
                     })
-                    .when(dialog.busy, |card| {
-                        card.child(if dialog.push_after {
-                            "커밋 후 푸시하는 중입니다…"
-                        } else {
-                            "커밋하는 중입니다…"
-                        })
-                    });
+                    .when(dialog.busy, |card| card.child("커밋하는 중입니다…"));
                 footer = Some(
                     self.shortcut_button("confirm-commit", "확인", "confirm", true)
                         .when(dialog.busy, |button| button.opacity(0.45))

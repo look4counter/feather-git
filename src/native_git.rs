@@ -362,6 +362,9 @@ fn list_tree(
 pub fn commit(path: &Path, message: &str) -> Result<()> {
     local::commit(path, message)
 }
+pub fn amend_commit(path: &Path, message: &str) -> Result<()> {
+    local::amend_commit(path, message)
+}
 pub fn gix_repository(path: &Path) -> Result<gix::Repository> {
     local::repo(path)
 }

@@ -63,6 +63,69 @@ impl RemoteOperation {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PushPlan {
+    pub local_reference: String,
+    pub remote: String,
+    pub destination: String,
+    pub expected: String,
+}
+
+pub fn push_plan(path: &Path) -> Result<PushPlan> {
+    let repo = git2::Repository::discover(feather_git::native_git::ordinary_path(path))?;
+    let head = repo.head()?;
+    if !head.is_branch() {
+        bail!("푸시할 로컬 브랜치가 필요합니다.");
+    }
+    let branch = head.shorthand().context("브랜치명이 없습니다.")?;
+    let config = repo.config()?;
+    let remote = config
+        .get_string(&format!("branch.{branch}.remote"))
+        .context("추적 원격이 없습니다.")?;
+    let destination = config
+        .get_string(&format!("branch.{branch}.merge"))
+        .context("추적 브랜치가 없습니다.")?;
+    let expected = repo
+        .find_branch(branch, git2::BranchType::Local)?
+        .upstream()
+        .ok()
+        .and_then(|upstream| upstream.get().target())
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    Ok(PushPlan {
+        local_reference: head.name().context("브랜치명이 없습니다.")?.to_owned(),
+        remote,
+        destination,
+        expected,
+    })
+}
+
+pub fn push_with_plan(path: &Path, plan: &PushPlan, force_with_lease: bool) -> Result<()> {
+    let current = push_plan(path)?;
+    if current.local_reference != plan.local_reference
+        || current.remote != plan.remote
+        || current.destination != plan.destination
+    {
+        bail!("푸시 대상이 변경되었습니다. 확인창을 다시 여세요.");
+    }
+    let refspec = format!("{}:{}", plan.local_reference, plan.destination);
+    let lease = format!("--force-with-lease={}:{}", plan.destination, plan.expected);
+    let mut args = vec!["push"];
+    if force_with_lease {
+        args.push(&lease);
+    }
+    args.extend(["--", &plan.remote, &refspec]);
+    let output = git_command(path).args(args).output()?;
+    if !output.status.success() {
+        bail!(
+            "푸시 실패: {}{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn fetch(path: &Path) -> Result<()> {
     RemoteOperation::Fetch.run(path)
@@ -140,8 +203,22 @@ pub fn restore_stash(repository: &Path, commit: &str) -> Result<()> {
     feather_git::stash_recovery::restore(repository, commit)
 }
 
+#[cfg(test)]
 pub fn commit_then_push(repository: &Path, message: &str, push: bool) -> Result<Option<String>> {
-    commit(repository, message)?;
+    commit_then_push_with_options(repository, message, push, false)
+}
+
+pub fn commit_then_push_with_options(
+    repository: &Path,
+    message: &str,
+    push: bool,
+    amend: bool,
+) -> Result<Option<String>> {
+    if amend {
+        feather_git::native_git::amend_commit(repository, message)?;
+    } else {
+        commit(repository, message)?;
+    }
     Ok(if push {
         RemoteOperation::Push
             .run(repository)
@@ -964,6 +1041,134 @@ mod tests {
                 .stdout,
             b"committed without remote"
         );
+    }
+
+    #[test]
+    fn push_plan_lease_rejects_changed_remote_and_allows_known_amend() {
+        let (temp, source) = configured_repository();
+        save_commit(&source, "initial");
+        let bare = temp.path().join("remote.git");
+        assert!(
+            oracle_git_command(temp.path())
+                .args(["clone", "--bare"])
+                .arg(&source)
+                .arg(&bare)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        for path in [&a, &b] {
+            create(path, Some(bare.to_str().unwrap())).unwrap();
+            for args in [
+                ["config", "user.name", "Test"],
+                ["config", "user.email", "test@example.invalid"],
+                ["config", "commit.gpgsign", "false"],
+            ] {
+                assert!(
+                    oracle_git_command(path)
+                        .args(args)
+                        .output()
+                        .unwrap()
+                        .status
+                        .success()
+                );
+            }
+        }
+        let remote_id = || {
+            let repo = git2::Repository::open_bare(&bare).unwrap();
+            repo.head().unwrap().target().unwrap().to_string()
+        };
+        assert!(push_plan(&source).is_err());
+        let original = remote_id();
+        let plan = push_plan(&a).unwrap();
+        assert_eq!(plan.expected, original);
+        assert_eq!(remote_id(), original);
+        std::fs::write(a.join("file.txt"), "amended").unwrap();
+        stage_file(&a, b"file.txt").unwrap();
+        commit_then_push_with_options(&a, "amended", false, true).unwrap();
+        assert_eq!(remote_id(), original);
+        assert!(push_with_plan(&a, &plan, false).is_err());
+        assert_eq!(remote_id(), original);
+        push_with_plan(&a, &plan, true).unwrap();
+        let amended = remote_id();
+        assert_ne!(amended, original);
+        RemoteOperation::Fetch.run(&a).unwrap();
+        let stale = push_plan(&a).unwrap();
+        assert_eq!(stale.expected, amended);
+        RemoteOperation::Fetch.run(&b).unwrap();
+        assert!(
+            oracle_git_command(&b)
+                .args(["reset", "--hard", "@{upstream}"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        save_commit(&b, "someone else");
+        let other = push_plan(&b).unwrap();
+        push_with_plan(&b, &other, false).unwrap();
+        let changed = remote_id();
+        save_commit(&a, "local divergent");
+        assert!(push_with_plan(&a, &stale, true).is_err());
+        assert_eq!(remote_id(), changed);
+        let mut wrong = stale.clone();
+        wrong.destination = "refs/heads/other".into();
+        assert!(push_with_plan(&a, &wrong, true).is_err());
+        assert_eq!(remote_id(), changed);
+    }
+
+    #[test]
+    fn amend_preserves_parents_author_and_unstaged_files() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let repository = temp.path().join("repo");
+        let path = repository.as_path();
+        create(path, None).unwrap();
+        for args in [
+            ["config", "user.name", "Original"],
+            ["config", "user.email", "original@example.invalid"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(
+                oracle_git_command(path)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(feather_git::native_git::amend_commit(path, "missing").is_err());
+        for round in 0..2 {
+            std::fs::write(path.join("tracked.txt"), format!("before {round}")).unwrap();
+            stage_file(path, b"tracked.txt").unwrap();
+            commit(path, "original").unwrap();
+            let repo = git2::Repository::open(path).unwrap();
+            let old = repo.head().unwrap().peel_to_commit().unwrap();
+            let old_parents = old.parent_ids().collect::<Vec<_>>();
+            let old_author = old.author();
+            std::fs::write(path.join("tracked.txt"), "staged").unwrap();
+            stage_file(path, b"tracked.txt").unwrap();
+            std::fs::write(path.join("tracked.txt"), "unstaged").unwrap();
+            assert!(feather_git::native_git::amend_commit(path, " ").is_err());
+            commit_then_push_with_options(path, "수정\n\n본문", false, true).unwrap();
+            let amended = repo.head().unwrap().peel_to_commit().unwrap();
+            assert_ne!(old.id(), amended.id());
+            assert_eq!(amended.parent_ids().collect::<Vec<_>>(), old_parents);
+            assert!(amended.author() == old_author);
+            assert_eq!(amended.message().unwrap(), "수정\n\n본문");
+            let tree = amended.tree().unwrap();
+            let blob = repo
+                .find_blob(tree.get_name("tracked.txt").unwrap().id())
+                .unwrap();
+            assert_eq!(blob.content(), b"staged");
+            assert_eq!(
+                std::fs::read(path.join("tracked.txt")).unwrap(),
+                b"unstaged"
+            );
+            assert!(feather_git::native_git::amend_commit(path, "no staged changes").is_err());
+        }
     }
 
     #[test]

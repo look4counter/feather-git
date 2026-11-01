@@ -750,6 +750,24 @@ pub fn for_remote_urls(profiles: &[AuthProfile], remotes: &[String]) -> Vec<Auth
     result
 }
 
+pub fn manageable_for_remote_urls(
+    profiles: &[AuthProfile],
+    remotes: &[String],
+) -> Vec<AuthProfile> {
+    let mut seen = std::collections::BTreeSet::new();
+    profiles
+        .iter()
+        .filter(|profile| {
+            !profile.hidden
+                && !profile.imported
+                && !for_remote_urls(std::slice::from_ref(*profile), remotes).is_empty()
+        })
+        .cloned()
+        .chain(for_remote_urls(profiles, remotes))
+        .filter(|profile| seen.insert(profile.id.clone()))
+        .collect()
+}
+
 pub enum ResolvedAuth {
     Direct { username: String, secret: Secret },
     Gcm { username: String, url: String },
@@ -1092,6 +1110,102 @@ mod tests {
         let mut hidden = entries.to_vec();
         hidden[0].hidden = true;
         assert_eq!(for_remote_urls(&hidden, &[remotes[0].clone()])[0].id, "b");
+    }
+
+    #[test]
+    fn management_limits_registered_profiles_to_current_remotes_and_preserves_import_filter() {
+        let entries = [
+            ("host", "https://github.com", false, false),
+            ("repo", "https://github.com/team/repo.git", false, false),
+            ("other", "https://other.invalid", false, false),
+            (
+                "other-repo",
+                "https://github.com/team/other.git",
+                false,
+                false,
+            ),
+            ("prefix", "https://github.com/tea", false, false),
+            ("hidden", "https://github.com", false, true),
+            ("import", "https://github.com/team/repo.git", true, false),
+            ("unrelated", "https://other.invalid", true, false),
+        ]
+        .map(|(id, url, imported, hidden)| AuthProfile {
+            id: id.into(),
+            url: url.into(),
+            username: id.into(),
+            method: AuthMethod::Gcm,
+            imported,
+            hidden,
+        });
+        for remotes in [vec![], vec!["git@github.com:team/repo.git".into()]] {
+            assert_eq!(
+                manageable_for_remote_urls(&entries, &remotes)
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>(),
+                Vec::<&str>::new()
+            );
+        }
+        assert_eq!(
+            manageable_for_remote_urls(&entries, &["https://user@github.com/team/repo.git".into()])
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["host", "repo", "import"]
+        );
+        assert_eq!(
+            manageable_for_remote_urls(&entries, &["https://other.invalid/repo.git".into()])
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["other", "unrelated"]
+        );
+        assert_eq!(
+            select(&entries, "https://github.com/team/repo.git", None)
+                .unwrap()
+                .id,
+            "repo"
+        );
+    }
+
+    #[test]
+    fn registered_profile_can_be_managed_removed_and_replaced_for_matching_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let vault = Vault::default();
+        let url = "https://github.com";
+        let secret = Secret::new("test-secret".into());
+        let entries = register_at(
+            &path,
+            &vault,
+            url,
+            "wrong-account",
+            AuthMethod::Password,
+            Some(&secret),
+        )
+        .unwrap();
+        let remotes = ["https://github.com/team/repo.git".into()];
+        assert!(
+            manageable_for_remote_urls(&entries, &["https://other.invalid/repo.git".into()])
+                .is_empty()
+        );
+        let managed = manageable_for_remote_urls(&entries, &remotes);
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].username, "wrong-account");
+        assert!(remove_at(&path, &vault, &managed[0].id).unwrap().is_empty());
+        let replaced = register_at(
+            &path,
+            &vault,
+            url,
+            "correct-account",
+            AuthMethod::Password,
+            Some(&secret),
+        )
+        .unwrap();
+        assert_eq!(
+            manageable_for_remote_urls(&replaced, &remotes)[0].username,
+            "correct-account"
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub struct AuthPanel {
     gcm: Option<Gcm>,
     add_focus: FocusHandle,
     delete_focus: BTreeMap<String, FocusHandle>,
+    addresses: BTreeMap<String, Entity<CommitEditor>>,
     methods: [FocusHandle; 2],
     method: AuthMethod,
     url: Entity<CommitEditor>,
@@ -55,6 +56,7 @@ impl AuthPanel {
             gcm: None,
             add_focus: cx.focus_handle(),
             delete_focus: BTreeMap::new(),
+            addresses: BTreeMap::new(),
             methods: std::array::from_fn(|_| cx.focus_handle()),
             method: AuthMethod::BrowserGcm,
             url: cx.new(|cx| CommitEditor::single_line("", cx)),
@@ -101,10 +103,18 @@ impl AuthPanel {
         }
     }
     fn refilter(&mut self, cx: &mut Context<Self>) {
-        let entries = profiles::for_remote_urls(&self.all_profiles, &self.remote_urls);
+        let entries = profiles::manageable_for_remote_urls(&self.all_profiles, &self.remote_urls);
         self.delete_focus
             .retain(|id, _| entries.iter().any(|entry| &entry.id == id));
+        self.addresses
+            .retain(|id, _| entries.iter().any(|entry| &entry.id == id));
         for entry in &entries {
+            let address = self.addresses.entry(entry.id.clone()).or_insert_with(|| {
+                cx.new(|cx| CommitEditor::single_line_read_only(&entry.url, cx))
+            });
+            if address.read(cx).message() != entry.url {
+                address.update(cx, |address, cx| address.set_text(&entry.url, cx));
+            }
             self.delete_focus
                 .entry(entry.id.clone())
                 .or_insert_with(|| cx.focus_handle());
@@ -429,7 +439,7 @@ impl AuthPanel {
                             this.profiles.iter().any(|profile| &profile.username == username && &profile.url != url)
                         });
                         this.notice = Some(if other_scope {
-                            "선택한 주소의 인증을 로그아웃했습니다. 같은 계정명의 다른 주소 인증이 목록에 대신 표시됩니다."
+                            "선택한 주소의 인증을 로그아웃했습니다. 같은 계정명의 다른 주소 인증은 목록에 남아 있습니다."
                         } else { "로그아웃하고 인증 등록을 삭제했습니다." }.into());
                     }
                     Err(error) => this.error = Some(error.to_string()),
@@ -573,7 +583,7 @@ impl Render for AuthPanel {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .child(entry.url.clone())
+                            .child(div().h(px(26.)).child(self.addresses[&id].clone()))
                             .child(format!(
                                 "{} · {}{}",
                                 entry.username,
@@ -608,9 +618,9 @@ impl Render for AuthPanel {
             body = body.child("인증 목록을 읽고 있습니다…");
         } else if self.profiles.is_empty() {
             body = body.child(if self.remote_urls.is_empty() {
-                "원격 저장소를 등록하면 해당 주소에 맞는 인증을 표시합니다."
+                "원격 저장소를 등록하면 해당 주소에 해당하는 인증을 표시합니다."
             } else {
-                "현재 원격 주소 또는 상위 주소에 일치하는 인증이 없습니다."
+                "현재 원격 주소 또는 상위 주소에 해당하는 인증이 없습니다."
             });
         }
         if self

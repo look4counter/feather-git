@@ -247,6 +247,12 @@ impl CommitEditor {
         editor.set_text(text, cx);
         editor
     }
+    pub fn single_line_read_only(text: &str, cx: &mut Context<Self>) -> Self {
+        let mut editor = Self::single_line(text, cx);
+        editor.read_only = true;
+        editor.text_size = 13.;
+        editor
+    }
     pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.secret {
             unsafe {

@@ -29,6 +29,7 @@ pub struct SettingsPanel {
     identity_focus: FocusHandle,
     remote_focus: FocusHandle,
     remote_delete_focus: BTreeMap<String, FocusHandle>,
+    remote_addresses: BTreeMap<(String, String), Entity<CommitEditor>>,
     remote_name: Entity<CommitEditor>,
     remote_url: Entity<CommitEditor>,
     remote_dialog: bool,
@@ -74,6 +75,7 @@ impl SettingsPanel {
             identity_focus: cx.focus_handle(),
             remote_focus: cx.focus_handle(),
             remote_delete_focus: BTreeMap::new(),
+            remote_addresses: BTreeMap::new(),
             remote_name: cx.new(|cx| CommitEditor::single_line("", cx)),
             remote_url: cx.new(|cx| CommitEditor::single_line("", cx)),
             remote_dialog: false,
@@ -264,6 +266,25 @@ impl SettingsPanel {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
+        let addresses: std::collections::BTreeSet<_> = snapshot
+            .info
+            .remotes
+            .iter()
+            .flat_map(|remote| {
+                remote
+                    .fetch_urls
+                    .iter()
+                    .chain(remote.push_urls.iter())
+                    .map(|url| (remote.name.clone(), display_url(url)))
+            })
+            .collect();
+        self.remote_addresses
+            .retain(|url, _| addresses.contains(url));
+        for (name, address) in addresses {
+            self.remote_addresses
+                .entry((name, address.clone()))
+                .or_insert_with(|| cx.new(|cx| CommitEditor::single_line_read_only(&address, cx)));
+        }
         let urls = snapshot
             .info
             .remotes
@@ -614,7 +635,17 @@ impl SettingsPanel {
                                     .text_color(rgb(theme::ACCENT))
                                     .child(remote.name.clone()),
                             )
-                            .child(div().flex_1().min_w_0().child(display_url(url))),
+                            .child({
+                                let row = div().flex_1().min_w_0().h(px(26.));
+                                if let Some(address) = self
+                                    .remote_addresses
+                                    .get(&(remote.name.clone(), display_url(url)))
+                                {
+                                    row.child(address.clone())
+                                } else {
+                                    row.child(display_url(url))
+                                }
+                            }),
                     );
                 }
                 let name = remote.name.clone();

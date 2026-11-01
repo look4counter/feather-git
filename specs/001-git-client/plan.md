@@ -994,3 +994,17 @@ src/ui.rs의 새 탭 작업에 전용 FocusHandle 목록을 만들고 Tab·Shift
 ## US192 계획
 
 src/shortcut.rs의 프로젝트 탭 명령에 기본 `ctrl-x`를 등록한다. 프로젝트 탭 범위 중 저장소가 활성화된 상태에서만 src/ui.rs의 기존 `close_tab`을 호출한다. 팝업은 명령 범위에서 제외하고 Clone URL 입력창은 텍스트 편집 동작을 유지한다. 탭 닫기 경로와 단축키 해석을 단위 테스트 및 포맷·컴파일·정적 검사로 확인한다.
+
+## US193 계획
+
+Rust 2024·GPUI와 기존 JSON 인증 목록/OS 비밀 저장소를 사용한다. src/auth_profiles.rs에 관리 목록용 순수 함수를 추가한다. 숨김이 아닌 직접 등록 항목 전체와 기존 for_remote_urls 결과를 ID로 중복 제거해 합친다. for_remote_urls와 select/resolve의 실제 전송 선택은 변경하지 않는다. src/auth_settings.rs의 refilter만 관리 함수로 연결하고 빈 목록 안내 및 삭제 후 잔존 안내를 수정한다. 별도 네트워크나 권한 조회를 추가하지 않는다.
+
+가짜 Vault 회귀로 호스트·저장소·다른 주소의 직접 등록 항목, 원격 없음, 숨김·가져오기 필터, 삭제 후 다른 계정 재등록을 검증한다. cargo fmt --check, cargo test --lib auth_profiles::tests, cargo check, cargo clippy --all-targets -- -D warnings를 수행한다. 기존 헌법은 미작성 템플릿이므로 추가 원칙 검사는 생략하고 AGENTS.md의 한글 문서와 speckit 단계 준수를 확인했다. 설계 후에도 위반 사항이 없다.
+
+## US194 계획
+
+src/auth_profiles.rs의 관리 목록에서 직접 등록 항목마다 기존 원격 필터를 적용하여 적용 가능한 모든 상위 범위를 보존한다. 기존 전체 프로필 원격 필터 결과와 합쳐 자동 가져오기 정책과 ID 중복 제거를 유지한다. 전송 선택 및 저장 형식은 변경하지 않는다. src/auth_settings.rs의 빈 상태 안내를 현재 원격 기준으로 수정한다. US193의 원격 무관 합집합 결정을 대체한다. 기존 회귀를 현재 정책으로 수정하고 cargo test --lib auth_profiles::tests, cargo fmt --check, cargo check, cargo clippy --all-targets -- -D warnings로 검증한다.
+
+## US195 계획
+
+src/commit_editor.rs의 기존 드래그·Ctrl+C·Ctrl+A 및 읽기 전용 기능을 재사용하는 단일행 생성 함수를 추가한다. src/settings.rs는 표시 주소별 읽기 전용 Entity를 보관하고 원격 갱신 시 동기화한다. src/auth_settings.rs는 인증 ID별 Entity를 보관하고 필터 갱신 시 동기화한다. 두 화면의 주소 문자열을 높이 26px의 읽기 전용 편집기로 교체한다. 기존 설정 키 이벤트는 Ctrl+C·Ctrl+A를 자식에 전달하므로 변경하지 않는다. 기존 편집기 및 URL 비밀정보 제거 회귀, fmt/check/clippy로 검증한다. 저장소 구조와 종속성은 유지한다.

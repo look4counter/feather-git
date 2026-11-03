@@ -1707,7 +1707,7 @@ dependencies = [
 
 [[package]]
 name = "feather-git"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "git2",
@@ -3148,8 +3148,6 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "979b45cfa6ec723b6f42330915a1b3769b930d02b2d505f9697f8ca602bee707"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",
@@ -5109,8 +5107,6 @@ dependencies = [
 [[package]]
 name = "proc-macro-error2"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11ec05c52be0a07b08061f7dd003e7d7092e0472bc731b4af7bb1ef876109802"
 dependencies = [
  "proc-macro-error-attr2",
  "proc-macro2",

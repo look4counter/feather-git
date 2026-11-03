@@ -2,6 +2,10 @@ use crate::theme;
 use gpui::{prelude::*, *};
 use std::ops::Range;
 
+#[cfg(test)]
+#[path = "../vendor/gpui/src/platform/windows/ime.rs"]
+mod windows_ime;
+
 fn text_vertical_offset(single_line: bool, height: f32) -> f32 {
     if single_line {
         ((height - 22.) / 2.).max(0.)
@@ -1240,7 +1244,257 @@ impl Render for CommitEditor {
 
 #[cfg(test)]
 mod tests {
+    use super::windows_ime::{ImeAction, ImeEvent, ImeState};
     use super::*;
+
+    fn ime_event(buffer: &mut Buffer, state: &mut ImeState, event: ImeEvent<'_>) {
+        for action in state.actions(event) {
+            match action {
+                ImeAction::Unmark => buffer.marked = None,
+                ImeAction::Replace(text) => buffer.replace(None, text, false, None),
+                ImeAction::Mark(text, selected) => buffer.replace(None, text, true, selected),
+            }
+        }
+        assert!(buffer.text.is_char_boundary(buffer.anchor));
+        assert!(buffer.text.is_char_boundary(buffer.cursor));
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_native_composition_is_completed_before_ordinary_character() {
+        use std::cell::RefCell;
+        for prefix in ["쿼", "제목 😀\n쿼"] {
+            let editor = RefCell::new((Buffer::default(), ImeState::default()));
+            {
+                let mut editor = editor.borrow_mut();
+                let (buffer, state) = &mut *editor;
+                buffer.replace(None, prefix, false, None);
+                ime_event(
+                    buffer,
+                    state,
+                    ImeEvent::Composition {
+                        result: None,
+                        composing: Some(("리", None)),
+                    },
+                );
+            }
+            // The captured Windows trace delivers WM_CHAR while the native
+            // composition and marked range still exist, before RESULT and END.
+            windows_ime::dispatch_character(
+                true,
+                || {
+                    let mut editor = editor.borrow_mut();
+                    let (buffer, state) = &mut *editor;
+                    ime_event(
+                        buffer,
+                        state,
+                        ImeEvent::Composition {
+                            result: Some("리"),
+                            composing: None,
+                        },
+                    );
+                    ime_event(buffer, state, ImeEvent::End);
+                },
+                || {
+                    let mut editor = editor.borrow_mut();
+                    let (buffer, state) = &mut *editor;
+                    ime_event(buffer, state, ImeEvent::Character("I"));
+                },
+            );
+            let mut editor = editor.borrow_mut();
+            let (buffer, state) = &mut *editor;
+            assert_eq!(buffer.text, format!("{prefix}리I"));
+            assert!(buffer.marked.is_none());
+            ime_event(buffer, state, ImeEvent::Character("D"));
+            assert_eq!(buffer.text, format!("{prefix}리ID"));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ordinary_character_without_native_composition_keeps_dead_key_behavior() {
+        let mut buffer = Buffer::default();
+        let mut state = ImeState::default();
+        buffer.replace(None, "´", true, None);
+        windows_ime::dispatch_character(
+            false,
+            || panic!("no native composition to complete"),
+            || {
+                ime_event(&mut buffer, &mut state, ImeEvent::Character("é"));
+            },
+        );
+        assert_eq!(buffer.text, "é");
+        assert!(buffer.marked.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ime_mode_keys_reach_native_translation_before_app_shortcuts() {
+        // VK_PROCESSKEY wraps IME-handled keys; VK_HANGUL has no ordinary
+        // character mapping. Both must reach TranslateMessage regardless of
+        // whether a composition already exists.
+        for virtual_key in [0xe5, 0x15] {
+            for composing in [false, true] {
+                let mut buffer = Buffer::default();
+                buffer.replace(None, "쿼리", composing, None);
+                let mut open = true;
+                let mut native_calls = 0;
+                let native = windows_ime::dispatch_ime_key(virtual_key, || {
+                    native_calls += 1;
+                    // The input method commits its composition when switching.
+                    buffer.marked = None;
+                    open = !open;
+                });
+                assert!(native, "IME keys must bypass app shortcut dispatch");
+                assert_eq!(native_calls, 1);
+                assert!(!open);
+                assert!(buffer.marked.is_none());
+                assert_eq!(buffer.text, "쿼리");
+                assert!(windows_ime::dispatch_ime_key(virtual_key, || open = !open));
+                assert!(open, "the reverse language switch must also be delivered");
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ordinary_alt_and_letter_keys_keep_app_shortcut_dispatch() {
+        // VK_MENU, VK_RMENU, ordinary letters, arrows and VK_PACKET keep their
+        // existing paths. In particular, do not remap every right Alt to Hangul.
+        for virtual_key in [0x12, 0xa5, 0x41, 0x25, 0xe7] {
+            assert!(!windows_ime::dispatch_ime_key(virtual_key, || {
+                panic!("ordinary keys must not enter the dedicated IME route");
+            }));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ime_end_preserves_korean_before_latin_and_editing() {
+        for prefix in ["쿼", "제목 😀\n쿼"] {
+            let mut buffer = Buffer::default();
+            let mut state = ImeState::default();
+            buffer.replace(None, prefix, false, None);
+            ime_event(
+                &mut buffer,
+                &mut state,
+                ImeEvent::Composition {
+                    result: None,
+                    composing: Some(("리", Some(1..1))),
+                },
+            );
+            ime_event(&mut buffer, &mut state, ImeEvent::End);
+            ime_event(&mut buffer, &mut state, ImeEvent::Character("I"));
+            assert_eq!(buffer.text, format!("{prefix}리I"));
+            ime_event(&mut buffer, &mut state, ImeEvent::Character("D"));
+            assert_eq!(buffer.text, format!("{prefix}리ID"));
+            assert!(buffer.marked.is_none());
+            buffer.anchor = buffer.previous(buffer.cursor);
+            buffer.replace(None, "", false, None);
+            assert_eq!(buffer.text, format!("{prefix}리I"));
+            buffer.move_to(buffer.previous(buffer.cursor), false);
+            buffer.replace(None, "X", false, None);
+            assert_eq!(buffer.text, format!("{prefix}리XI"));
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ime_result_before_or_after_end_is_not_duplicated() {
+        for end_first in [false, true] {
+            let mut buffer = Buffer::default();
+            let mut state = ImeState::default();
+            buffer.replace(None, "쿼", false, None);
+            ime_event(
+                &mut buffer,
+                &mut state,
+                ImeEvent::Composition {
+                    result: None,
+                    composing: Some(("리", Some(1..1))),
+                },
+            );
+            if end_first {
+                ime_event(&mut buffer, &mut state, ImeEvent::End);
+            }
+            ime_event(
+                &mut buffer,
+                &mut state,
+                ImeEvent::Composition {
+                    result: Some("리"),
+                    composing: None,
+                },
+            );
+            if !end_first {
+                ime_event(&mut buffer, &mut state, ImeEvent::End);
+            }
+            ime_event(&mut buffer, &mut state, ImeEvent::Boundary);
+            ime_event(&mut buffer, &mut state, ImeEvent::Character("ID"));
+            assert_eq!(buffer.text, "쿼리ID");
+            assert!(buffer.marked.is_none());
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ime_commits_previous_before_marking_next_and_cancels_only_composition() {
+        let mut buffer = Buffer::default();
+        let mut state = ImeState::default();
+        buffer.replace(None, "😀\n쿼", false, None);
+        ime_event(
+            &mut buffer,
+            &mut state,
+            ImeEvent::Composition {
+                result: None,
+                composing: Some(("리", Some(1..1))),
+            },
+        );
+        ime_event(
+            &mut buffer,
+            &mut state,
+            ImeEvent::Composition {
+                result: Some("리"),
+                composing: Some(("ㅎ", Some(1..1))),
+            },
+        );
+        assert_eq!(buffer.text, "😀\n쿼리ㅎ");
+        ime_event(
+            &mut buffer,
+            &mut state,
+            ImeEvent::Composition {
+                result: None,
+                composing: Some(("한", Some(1..1))),
+            },
+        );
+        assert_eq!(buffer.text, "😀\n쿼리한");
+        ime_event(&mut buffer, &mut state, ImeEvent::Cancel);
+        ime_event(&mut buffer, &mut state, ImeEvent::End);
+        ime_event(&mut buffer, &mut state, ImeEvent::Character("I"));
+        assert_eq!(buffer.text, "😀\n쿼리I");
+    }
+
+    #[::core::prelude::v1::test]
+    fn windows_ime_boundary_and_new_composition_preserve_committed_selection() {
+        let mut buffer = Buffer::default();
+        let mut state = ImeState::default();
+        buffer.replace(None, "쿼리", true, None);
+        ime_event(&mut buffer, &mut state, ImeEvent::End);
+        ime_event(&mut buffer, &mut state, ImeEvent::Boundary);
+        assert!(buffer.marked.is_none());
+        buffer.anchor = 0;
+        buffer.cursor = buffer.text.len();
+        ime_event(
+            &mut buffer,
+            &mut state,
+            ImeEvent::Composition {
+                result: None,
+                composing: Some(("한", Some(1..1))),
+            },
+        );
+        assert_eq!(buffer.text, "한");
+        ime_event(&mut buffer, &mut state, ImeEvent::End);
+        ime_event(
+            &mut buffer,
+            &mut state,
+            ImeEvent::Composition {
+                result: None,
+                composing: Some(("글", Some(1..1))),
+            },
+        );
+        assert_eq!(buffer.text, "한글");
+    }
 
     #[::core::prelude::v1::test]
     fn diff_virtual_rows_and_body_boundary_cover_scrolling_and_short_lines() {

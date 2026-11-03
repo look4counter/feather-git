@@ -5858,17 +5858,15 @@ impl Workspace {
         self.text_selection = None;
         let Some(p) = self.project_mut() else { return };
         p.initialized = true;
-        p.generation += 1;
+        p.begin_reload();
         p.page_generation += 1;
         p.page_loading = false;
         p.page_error = None;
         p.history_target = None;
-        p.history_loading = true;
         p.diff_generation += 1;
         p.diff_loading = false;
         let (id, generation) = (p.id, p.generation);
         let (path, commit) = (p.path.clone(), p.commit.clone());
-        p.loading = true;
         p.error = None;
         p.selected_file = None;
         p.stage_selection.clear();
@@ -5883,12 +5881,14 @@ impl Workspace {
                     .tabs
                     .iter_mut()
                     .filter_map(WorkspaceTab::project_mut)
-                    .find(|p| p.id == id && p.generation == generation)
+                    .find(|p| p.id == id)
                 else {
                     return;
                 };
-                p.loading = false;
-                p.history_loading = false;
+                if !p.finish_reload(generation) {
+                    this.notify(cx);
+                    return;
+                }
                 match result {
                     Ok(snapshot) => {
                         let entering =

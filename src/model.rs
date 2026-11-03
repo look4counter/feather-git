@@ -513,6 +513,7 @@ pub struct Project {
     pub diff: Diff,
     pub loading: bool,
     pub history_loading: bool,
+    history_generation: u64,
     pub history_target: Option<String>,
     pub error: Option<String>,
     pub generation: u64,
@@ -546,6 +547,7 @@ impl Project {
             diff: Diff::default(),
             loading: false,
             history_loading: false,
+            history_generation: 0,
             history_target: None,
             error: None,
             generation: 0,
@@ -584,8 +586,116 @@ impl Project {
         None
     }
 
+    pub fn begin_reload(&mut self) {
+        self.generation += 1;
+        self.history_generation = self.generation;
+        self.history_loading = true;
+        self.loading = true;
+    }
+
+    pub fn finish_reload(&mut self, generation: u64) -> bool {
+        // Result ownership can change when a commit is selected, but the
+        // refresh still owns its history-loading state until it completes.
+        if self.history_generation == generation {
+            self.history_loading = false;
+        }
+        if self.generation != generation {
+            return false;
+        }
+        self.loading = false;
+        true
+    }
+
     pub fn history_in_progress(&self) -> bool {
         self.history_loading || self.page_loading
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+
+    #[test]
+    fn reload_completion_releases_history_after_commit_selection() {
+        for selection_finishes_first in [false, true] {
+            let mut project = Project::new(1, PathBuf::from("repo"));
+            project.begin_reload();
+            let reload_generation = project.generation;
+            project.generation += 1;
+            project.commit = Some("selected".into());
+            project.loading = !selection_finishes_first;
+
+            assert!(!project.finish_reload(reload_generation));
+            assert!(!project.history_in_progress());
+            assert_eq!(project.loading, !selection_finishes_first);
+            assert_eq!(project.commit.as_deref(), Some("selected"));
+
+            project.loading = false;
+            assert!(!project.history_in_progress());
+        }
+    }
+
+    #[test]
+    fn reload_success_and_error_share_completion_cleanup() {
+        for result in [Ok(()), Err("query failed")] {
+            let mut project = Project::new(1, PathBuf::from("repo"));
+            project.begin_reload();
+            let generation = project.generation;
+            assert!(project.history_in_progress());
+            assert!(project.finish_reload(generation));
+            if let Err(error) = result {
+                project.error = Some(error.into());
+            }
+            assert!(!project.loading);
+            assert!(!project.history_in_progress());
+            assert_eq!(project.error.is_some(), result.is_err());
+        }
+    }
+
+    #[test]
+    fn reload_completion_preserves_newer_refresh_in_either_order() {
+        for newest_finishes_first in [false, true] {
+            let mut project = Project::new(1, PathBuf::from("repo"));
+            project.begin_reload();
+            let old = project.generation;
+            project.begin_reload();
+            let current = project.generation;
+
+            if newest_finishes_first {
+                assert!(project.finish_reload(current));
+                project.commit = Some("newest".into());
+            }
+            assert!(!project.finish_reload(old));
+            assert_eq!(project.history_in_progress(), !newest_finishes_first);
+            assert_eq!(project.loading, !newest_finishes_first);
+            if !newest_finishes_first {
+                assert!(project.finish_reload(current));
+                project.commit = Some("newest".into());
+            }
+
+            assert!(!project.finish_reload(old));
+            assert!(!project.history_in_progress());
+            assert!(!project.loading);
+            assert_eq!(project.commit.as_deref(), Some("newest"));
+        }
+    }
+
+    #[test]
+    fn stale_reload_error_releases_only_its_own_history_state() {
+        let mut project = Project::new(1, PathBuf::from("repo"));
+        project.begin_reload();
+        let old = project.generation;
+        project.generation += 1;
+        project.error = Some("current selection error".into());
+        let stale_result: Result<(), &str> = Err("old reload error");
+
+        if project.finish_reload(old) {
+            project.error = stale_result.err().map(str::to_owned);
+        }
+
+        assert!(!project.history_in_progress());
+        assert!(project.loading);
+        assert_eq!(project.error.as_deref(), Some("current selection error"));
     }
 }
 

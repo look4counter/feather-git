@@ -66,7 +66,9 @@ pub fn callbacks<'a>(repository: Option<&Path>) -> RemoteCallbacks<'a> {
             }
         }
         if allowed.contains(CredentialType::USERNAME) {
-            if configured_username.is_none() && url.starts_with("https://") {
+            if configured_username.is_none()
+                && (url.starts_with("https://") || url.starts_with("http://"))
+            {
                 let profiles = crate::auth_profiles::load()
                     .map_err(|error| git2::Error::from_str(&error.to_string()))?;
                 if let Some(profile) = crate::auth_profiles::select(&profiles, url, None) {

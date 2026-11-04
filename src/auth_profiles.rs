@@ -163,7 +163,7 @@ pub fn erase_existing_for(
 
 fn existing_profile(credential: &ExistingCredential) -> Option<AuthProfile> {
     let mut parsed = url::Url::parse(credential.target.strip_prefix("git:")?).ok()?;
-    if parsed.scheme() != "https" {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
     let account = if credential.username.trim().is_empty() {
@@ -411,18 +411,18 @@ impl SecretStore for SystemSecrets {
 
 pub fn normalize_url(value: &str) -> Result<String> {
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        bail!("공백 없는 HTTPS URL을 입력하세요.");
+        bail!("공백 없는 HTTP 또는 HTTPS URL을 입력하세요.");
     }
-    let url =
-        url::Url::parse(value).map_err(|_| anyhow::anyhow!("올바른 HTTPS URL을 입력하세요."))?;
-    if url.scheme() != "https"
+    let url = url::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("올바른 HTTP 또는 HTTPS URL을 입력하세요."))?;
+    if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        bail!("사용자 정보·쿼리·프래그먼트 없는 HTTPS URL을 입력하세요.");
+        bail!("사용자 정보·쿼리·프래그먼트 없는 HTTP 또는 HTTPS URL을 입력하세요.");
     }
     Ok(url.to_string())
 }
@@ -435,15 +435,16 @@ pub fn credential_request(value: &str, username: Option<&str>) -> Result<Vec<u8>
     }
     let url =
         url::Url::parse(value).map_err(|_| anyhow::anyhow!("올바른 인증 URL이 필요합니다."))?;
-    if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("HTTPS 인증 주소가 필요합니다.");
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("HTTP 또는 HTTPS 인증 주소가 필요합니다.");
     }
     let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
     let account = username
         .filter(|name| !name.is_empty())
         .or_else(|| (!url.username().is_empty()).then(|| url.username()));
     Ok(format!(
-        "protocol=https\nhost={host}\npath={}\n{}\n",
+        "protocol={}\nhost={host}\npath={}\n{}\n",
+        url.scheme(),
         url.path().trim_start_matches('/'),
         account
             .map(|name| format!("username={name}\n"))
@@ -700,7 +701,7 @@ pub fn for_remote_urls(profiles: &[AuthProfile], remotes: &[String]) -> Vec<Auth
         let Ok(mut parsed) = url::Url::parse(remote) else {
             continue;
         };
-        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             continue;
         }
         let _ = parsed.set_username("");
@@ -798,6 +799,71 @@ pub fn resolve(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn http_auth_preserves_scope_and_separates_https() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let vault = Vault::default();
+        let http = "http://example.invalid:8080/team";
+        let profiles = register_at(
+            &path,
+            &vault,
+            http,
+            "alice",
+            AuthMethod::Password,
+            Some(&Secret::new("secret".into())),
+        )
+        .unwrap();
+        assert_eq!(profiles[0].url, http);
+        assert_eq!(
+            String::from_utf8(credential_request(http, Some("alice")).unwrap()).unwrap(),
+            "protocol=http\nhost=example.invalid:8080\npath=team\nusername=alice\n\n"
+        );
+        let remote = "http://example.invalid:8080/team/repo.git";
+        assert_eq!(select(&profiles, remote, None).unwrap().username, "alice");
+        assert!(
+            select(
+                &profiles,
+                "https://example.invalid:8080/team/repo.git",
+                None
+            )
+            .is_none()
+        );
+        assert_eq!(for_remote_urls(&profiles, &[remote.into()]), profiles);
+        assert_eq!(
+            manageable_for_remote_urls(&profiles, &[remote.into()]),
+            profiles
+        );
+        assert!(matches!(
+            resolve(&profiles, &vault, remote, None).unwrap(),
+            Some(ResolvedAuth::Direct { .. })
+        ));
+        assert!(credential_request(http, Some("alice\npassword=bad")).is_err());
+        assert!(
+            remove_at(&path, &vault, &profiles[0].id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn imports_http_credentials_with_a_distinct_protocol_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let credentials = ["http", "https"].map(|scheme| ExistingCredential {
+            target: format!("git:{scheme}://alice@example.invalid/team"),
+            username: "alice".into(),
+        });
+        let profiles = merge_existing_at(&path, &credentials).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_ne!(profiles[0].id, profiles[1].id);
+        assert!(matches_existing(&profiles[0], &credentials[0]));
+        assert!(!matches_existing(&profiles[0], &credentials[1]));
+        let linked = for_remote_urls(&profiles, &["http://example.invalid/team/repo.git".into()]);
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].url, "http://example.invalid/team");
+    }
     #[derive(Default)]
     struct Vault {
         values: Mutex<std::collections::BTreeMap<String, String>>,
@@ -1382,7 +1448,7 @@ mod tests {
         let path = temp.path().join("auth.json");
         let mut vault = Vault::default();
         for url in [
-            "http://example.invalid",
+            "ftp://example.invalid",
             "https://user:secret@example.invalid",
             "https://example.invalid?token=secret",
             "https://example.invalid\n",

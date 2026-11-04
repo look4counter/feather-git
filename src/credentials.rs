@@ -8,6 +8,7 @@ use std::{
 };
 
 pub struct LoginTarget {
+    protocol: String,
     host: String,
     path: String,
     username: Option<String>,
@@ -16,10 +17,10 @@ pub struct LoginTarget {
 impl LoginTarget {
     pub fn parse(value: &str) -> Result<Self> {
         if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            bail!("공백과 줄바꿈이 없는 HTTPS 주소를 입력하세요.");
+            bail!("공백과 줄바꿈이 없는 HTTP 또는 HTTPS 주소를 입력하세요.");
         }
-        let url = url::Url::parse(value).context("로그인할 HTTPS 주소를 입력하세요.")?;
-        if url.scheme() != "https"
+        let url = url::Url::parse(value).context("로그인할 HTTP 또는 HTTPS 주소를 입력하세요.")?;
+        if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -29,7 +30,7 @@ impl LoginTarget {
             || value.to_ascii_lowercase().contains("%0d")
         {
             bail!(
-                "사용자정보·쿼리가 없는 HTTPS 주소를 사용하세요. SSH 인증은 SSH 키로 관리합니다."
+                "사용자정보·쿼리가 없는 HTTP 또는 HTTPS 주소를 사용하세요. SSH 인증은 SSH 키로 관리합니다."
             );
         }
         let host = format!(
@@ -40,6 +41,7 @@ impl LoginTarget {
                 .unwrap_or_default()
         );
         Ok(Self {
+            protocol: url.scheme().to_owned(),
             host,
             path: url.path().trim_start_matches('/').to_owned(),
             username: None,
@@ -48,7 +50,8 @@ impl LoginTarget {
 
     fn input(&self) -> Vec<u8> {
         format!(
-            "protocol=https\nhost={}\npath={}\n{}\n",
+            "protocol={}\nhost={}\npath={}\n{}\n",
+            self.protocol,
             self.host,
             self.path,
             self.username
@@ -569,10 +572,30 @@ mod tests {
     }
 
     #[test]
-    fn https_targets_reject_protocol_injection_secrets_and_ssh() {
+    fn http_target_preserves_protocol_port_path_and_account() {
+        let target = LoginTarget::parse("http://example.invalid:8080/team/repo.git")
+            .unwrap()
+            .for_account("alice")
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(target.input()).unwrap(),
+            "protocol=http\nhost=example.invalid:8080\npath=team/repo.git\nusername=alice\n\n"
+        );
+        for invalid in [
+            "http://u:secret@example.invalid",
+            "http://example.invalid?q=secret",
+            "http://example.invalid/#fragment",
+            "http://example.invalid/%0a",
+        ] {
+            assert!(LoginTarget::parse(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn web_targets_reject_protocol_injection_secrets_and_ssh() {
         for invalid in [
             "git@github.com:team/repo.git",
-            "http://example.invalid",
+            "ftp://example.invalid",
             "https://u:secret@example.invalid",
             "https://example.invalid?token=secret",
             "https://example.invalid\nhost=other",

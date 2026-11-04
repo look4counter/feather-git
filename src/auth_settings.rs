@@ -486,7 +486,7 @@ impl AuthPanel {
             .pb_1()
             .child(div().child("인증 방식"))
             .child(choices);
-        body = body.child(input("HTTPS 저장소 또는 서비스 URL", self.url.clone()));
+        body = body.child(input("HTTP/HTTPS 저장소 또는 서비스 URL", self.url.clone()));
         if self.method == AuthMethod::Password {
             body = body.child(input("ID", self.username.clone()));
         }

@@ -163,7 +163,7 @@ pub fn erase_existing_for(
 
 fn existing_profile(credential: &ExistingCredential) -> Option<AuthProfile> {
     let mut parsed = url::Url::parse(credential.target.strip_prefix("git:")?).ok()?;
-    if parsed.scheme() != "https" {
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
     let account = if credential.username.trim().is_empty() {
@@ -411,18 +411,18 @@ impl SecretStore for SystemSecrets {
 
 pub fn normalize_url(value: &str) -> Result<String> {
     if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        bail!("공백 없는 HTTPS URL을 입력하세요.");
+        bail!("공백 없는 HTTP 또는 HTTPS URL을 입력하세요.");
     }
-    let url =
-        url::Url::parse(value).map_err(|_| anyhow::anyhow!("올바른 HTTPS URL을 입력하세요."))?;
-    if url.scheme() != "https"
+    let url = url::Url::parse(value)
+        .map_err(|_| anyhow::anyhow!("올바른 HTTP 또는 HTTPS URL을 입력하세요."))?;
+    if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        bail!("사용자 정보·쿼리·프래그먼트 없는 HTTPS URL을 입력하세요.");
+        bail!("사용자 정보·쿼리·프래그먼트 없는 HTTP 또는 HTTPS URL을 입력하세요.");
     }
     Ok(url.to_string())
 }
@@ -435,15 +435,16 @@ pub fn credential_request(value: &str, username: Option<&str>) -> Result<Vec<u8>
     }
     let url =
         url::Url::parse(value).map_err(|_| anyhow::anyhow!("올바른 인증 URL이 필요합니다."))?;
-    if url.scheme() != "https" || url.host_str().is_none() {
-        bail!("HTTPS 인증 주소가 필요합니다.");
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        bail!("HTTP 또는 HTTPS 인증 주소가 필요합니다.");
     }
     let host = &url[url::Position::BeforeHost..url::Position::AfterPort];
     let account = username
         .filter(|name| !name.is_empty())
         .or_else(|| (!url.username().is_empty()).then(|| url.username()));
     Ok(format!(
-        "protocol=https\nhost={host}\npath={}\n{}\n",
+        "protocol={}\nhost={host}\npath={}\n{}\n",
+        url.scheme(),
         url.path().trim_start_matches('/'),
         account
             .map(|name| format!("username={name}\n"))
@@ -670,12 +671,43 @@ pub fn remove(id: &str) -> Result<Vec<AuthProfile>> {
     remove_at(&store_path()?, &SystemSecrets, id)
 }
 
+fn remote_account(value: &str) -> Option<String> {
+    let mut bytes = value.bytes();
+    let mut decoded = Vec::with_capacity(value.len());
+    while let Some(byte) = bytes.next() {
+        decoded.push(if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            (high * 16 + low) as u8
+        } else {
+            byte
+        });
+    }
+    let account = String::from_utf8(decoded).ok()?;
+    (!account.chars().any(char::is_control)).then_some(account)
+}
+
 pub fn select<'a>(
     profiles: &'a [AuthProfile],
     remote: &str,
     username: Option<&str>,
 ) -> Option<&'a AuthProfile> {
-    let url = normalize_url(remote).ok()?;
+    if remote.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let mut parsed = url::Url::parse(remote).ok()?;
+    let account = remote_account(parsed.username())?;
+    let url_account = (!account.is_empty()).then_some(account.as_str());
+    if username
+        .zip(url_account)
+        .is_some_and(|(explicit, url)| explicit != url)
+    {
+        return None;
+    }
+    let username = username.or(url_account);
+    parsed.set_username("").ok()?;
+    parsed.set_password(None).ok()?;
+    let url = normalize_url(parsed.as_str()).ok()?;
     profiles
         .iter()
         .filter_map(|p| {
@@ -700,7 +732,7 @@ pub fn for_remote_urls(profiles: &[AuthProfile], remotes: &[String]) -> Vec<Auth
         let Ok(mut parsed) = url::Url::parse(remote) else {
             continue;
         };
-        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             continue;
         }
         let _ = parsed.set_username("");
@@ -798,6 +830,140 @@ pub fn resolve(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn remote_account_decodes_url_ids_without_form_encoding_or_invalid_bytes() {
+        for (encoded, expected) in [
+            ("alice", "alice"),
+            ("alice%40example.invalid", "alice@example.invalid"),
+            ("alice+git", "alice+git"),
+            ("%ED%99%8D", "홍"),
+        ] {
+            assert_eq!(remote_account(encoded).as_deref(), Some(expected));
+        }
+        for invalid in ["%", "%0", "%GG", "%FF", "alice%0A", "alice%00"] {
+            assert!(remote_account(invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn remote_url_account_resolves_registered_secret_without_crossing_scopes() {
+        for protocol in ["http", "https"] {
+            let temp = tempfile::tempdir().unwrap();
+            let vault = Vault::default();
+            let profiles = register_at(
+                &temp.path().join("auth.json"),
+                &vault,
+                &format!("{protocol}://example.invalid:8080/team"),
+                "alice@example.invalid",
+                AuthMethod::Password,
+                Some(&Secret::new("local-test-secret".into())),
+            )
+            .unwrap();
+            let remote =
+                format!("{protocol}://alice%40example.invalid@example.invalid:8080/team/repo.git");
+            for username in [None, Some("alice@example.invalid")] {
+                let Some(ResolvedAuth::Direct { username, secret }) =
+                    resolve(&profiles, &vault, &remote, username).unwrap()
+                else {
+                    panic!("registered HTTP account must resolve");
+                };
+                assert_eq!(username, "alice@example.invalid");
+                assert_eq!(secret.expose(), "local-test-secret");
+            }
+            assert!(select(&profiles, &remote, Some("bob")).is_none());
+            for remote in [
+                format!("{protocol}://bob@example.invalid:8080/team/repo.git"),
+                format!("{protocol}://alice%40example.invalid@example.invalid:8081/team/repo.git"),
+                format!(
+                    "{protocol}://alice%40example.invalid@example.invalid:8080/teammate/repo.git"
+                ),
+                format!(
+                    "{protocol}://alice%40example.invalid@example.invalid.evil:8080/team/repo.git"
+                ),
+                format!(
+                    "{protocol}://alice%40example.invalid@example.invalid:8080/team/repo.git?token=value"
+                ),
+            ] {
+                assert!(select(&profiles, &remote, None).is_none());
+            }
+            let other_protocol = if protocol == "http" { "https" } else { "http" };
+            assert!(
+                select(
+                    &profiles,
+                    &remote.replacen(protocol, other_protocol, 1),
+                    None
+                )
+                .is_none()
+            );
+            assert!(normalize_url(&remote).is_err());
+        }
+    }
+
+    #[test]
+    fn http_auth_preserves_scope_and_separates_https() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let vault = Vault::default();
+        let http = "http://example.invalid:8080/team";
+        let profiles = register_at(
+            &path,
+            &vault,
+            http,
+            "alice",
+            AuthMethod::Password,
+            Some(&Secret::new("secret".into())),
+        )
+        .unwrap();
+        assert_eq!(profiles[0].url, http);
+        assert_eq!(
+            String::from_utf8(credential_request(http, Some("alice")).unwrap()).unwrap(),
+            "protocol=http\nhost=example.invalid:8080\npath=team\nusername=alice\n\n"
+        );
+        let remote = "http://example.invalid:8080/team/repo.git";
+        assert_eq!(select(&profiles, remote, None).unwrap().username, "alice");
+        assert!(
+            select(
+                &profiles,
+                "https://example.invalid:8080/team/repo.git",
+                None
+            )
+            .is_none()
+        );
+        assert_eq!(for_remote_urls(&profiles, &[remote.into()]), profiles);
+        assert_eq!(
+            manageable_for_remote_urls(&profiles, &[remote.into()]),
+            profiles
+        );
+        assert!(matches!(
+            resolve(&profiles, &vault, remote, None).unwrap(),
+            Some(ResolvedAuth::Direct { .. })
+        ));
+        assert!(credential_request(http, Some("alice\npassword=bad")).is_err());
+        assert!(
+            remove_at(&path, &vault, &profiles[0].id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn imports_http_credentials_with_a_distinct_protocol_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        let credentials = ["http", "https"].map(|scheme| ExistingCredential {
+            target: format!("git:{scheme}://alice@example.invalid/team"),
+            username: "alice".into(),
+        });
+        let profiles = merge_existing_at(&path, &credentials).unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_ne!(profiles[0].id, profiles[1].id);
+        assert!(matches_existing(&profiles[0], &credentials[0]));
+        assert!(!matches_existing(&profiles[0], &credentials[1]));
+        let linked = for_remote_urls(&profiles, &["http://example.invalid/team/repo.git".into()]);
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].url, "http://example.invalid/team");
+    }
     #[derive(Default)]
     struct Vault {
         values: Mutex<std::collections::BTreeMap<String, String>>,
@@ -1382,7 +1548,7 @@ mod tests {
         let path = temp.path().join("auth.json");
         let mut vault = Vault::default();
         for url in [
-            "http://example.invalid",
+            "ftp://example.invalid",
             "https://user:secret@example.invalid",
             "https://example.invalid?token=secret",
             "https://example.invalid\n",

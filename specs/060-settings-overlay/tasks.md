@@ -1,0 +1,34 @@
+# 작업 목록: 환경설정 오버레이
+
+> 정리 안내: 단계별 설계·작업 기록이며 후속 변경은 [현재 명세 색인](../README.md)과 해당 기능의 spec.md를 따른다. 기존 체크 상태와 과거 검증 이력은 현재 재검증 완료를 의미하지 않는다.
+
+## 1단계: 준비와 기반
+- [x] T001 참조 settings/auth UI와 backend를 src/settings.rs, src/auth_settings.rs, src/settings_git.rs, src/auth_profiles.rs, src/credentials.rs로 이식하고 필요한 작은 어댑터만 추가한다.
+- [x] T002 src/text_input.rs에 읽기 전용·비활성·비밀번호 입력과 Unicode 좌표 매핑 테스트와 보안 정책 점검을 수행한다.
+
+## 2단계: 설정 열기 (사용자 이야기 1)
+독립 검증: 우측 하단 버튼에서 공용 창을 열고 확인·취소/포커스 복원을 확인한다.
+- [x] T003 [US1] src/ui.rs와 src/main.rs에 하단 버튼·공용 Dialog·패널 수명주기·키보드·하위 창·작업 중 가드를 연결한다.
+
+## 3단계: 작성자 및 원격 (사용자 이야기 2)
+독립 검증: 격리된 설정 파일과 저장소에서 저장·원복·원격 목록/추가/삭제를 확인한다.
+- [x] T004 [US2] src/settings_native.rs와 src/settings_git.rs에서 설정/원격 기능과 오류 구분·잠금·다중 값 테스트를 완료한다.
+
+## 4단계: 인증 (사용자 이야기 3)
+독립 검증: 모의 보관소와 helper로 등록·취소·삭제·비밀 미노출을 확인한다.
+- [x] T005 [US3] src/auth_settings.rs, src/auth_profiles.rs, src/credentials.rs와 src/repository.rs의 인증 적용 경로를 연결하고 격리 테스트를 실행한다.
+
+## 5단계: 전체 검증
+- [x] T006 cargo fmt, 전체 테스트, clippy 및 별도 실행 파일 빌드를 수행하고 검증 결과를 quickstart.md에 기록한다.
+- [x] T007 명세·계획·구현을 speckit-converge로 비교하고 누락을 해결한다.
+
+## 의존성과 구현 전략
+T001 → T002 → T003, T004 → T005 → T006 → T007 순서로 수행한다. 사용자 이야기별로 독립 검증하되 최종 결과는 전체 범위를 포함한다. 읽기 전용 조사만 병렬 가능하며 구현은 순차 수행한다.
+
+
+## 6단계: 확인 및 취소 동작 변경
+- [x] T008 [US1] src/encoding_dialog.rs에서 임시 선택과 확인을 분리하고 취소·확인 회귀 테스트를 갱신한다.
+- [x] T009 [US1] src/settings.rs, src/auth_settings.rs, src/ui.rs, src/form_controls.rs에서 단축키를 제거하고 확인·취소 버튼 및 저장 성공 닫기를 연결한다.
+- [x] T010 전체 테스트·정적 분석·빌드 및 명세 수렴을 점검한다.
+
+T008 → T009 → T010 순서로 수행한다. 키 핸들러 제거에 따른 사용하지 않는 보조 코드는 함께 제거한다.

@@ -16,3 +16,14 @@ cargo check --offline, cargo test --offline, cargo clippy --offline --all-target
 ## 수렴 결과
 
 FR-001은 함수별 cfg(test) 전달 및 호출 관계, FR-002는 미사용 필드·메서드 제거와 그래프 테스트 유지, FR-003은 f32 리터럴, FR-004는 같은 버전의 로컬 가시성 패치, FR-005는 전체 검사 결과로 확인했다. 미구현 요구사항과 명세·구현 불일치 없음. 로컬 패치의 라이선스 및 원본 테스트를 보존했다.
+
+## Windows 링커 안내 정리 검증
+
+- 변경 전 cargo build --release --offline에서 임포트 라이브러리·내보내기 보조 파일 생성 안내 경고 1건을 재현했다.
+- build.rs가 Windows MSVC의 feather-git 실행 파일에만 /NOIMPLIB·/NOEXP를 전달한다. 경고 억제 속성이나 전역 설정은 추가하지 않았다.
+- 변경 후 실제 재링크한 cargo build --release --offline: 종료코드 0, 경고 0건.
+- PE 헤더 전후 비교: 내보내기 이름 950개 전부 동일, GUI 서브시스템 2 유지.
+- cargo check --all-targets --offline: 종료코드 0, 경고 없음. 개발·테스트 타깃 컴파일 통과.
+- rustfmt --check build.rs 및 git diff --check: 통과.
+- 이번 추가 변경에서는 전체 테스트 실행·실제 GUI 실행·다른 플랫폼 빌드를 수행하지 않았다. 이전 테스트 실행 기록은 재검증으로 취급하지 않는다.
+- 수렴 점검: 추가 요구사항 FR-006~FR-008·성공 기준 SC-002·사용자 이야기 2의 수용 시나리오와 계획의 대상 제한·보조 파일 생략·내보내기 보존을 확인했다. 미해결 불일치 0건이다. 기존 기능 구현은 수정하지 않았다. 헌장은 미작성 템플릿으로 검사를 생략했다.

@@ -911,7 +911,7 @@ fn file_open_dialog(
         dialog_options |= FOS_ALLOWMULTISELECT;
     }
     if options.directories {
-        dialog_options |= FOS_PICKFOLDERS;
+        dialog_options |= FOS_PICKFOLDERS | FOS_FORCESHOWHIDDEN;
     }
 
     unsafe {

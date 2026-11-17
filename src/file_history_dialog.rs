@@ -116,6 +116,7 @@ fn can_open_revision(file: &FileChange) -> bool {
 
 pub struct FileHistoryDialog {
     root: PathBuf,
+    workdir: PathBuf,
     label: String,
     state: FileHistoryState,
     project: Project,
@@ -135,6 +136,7 @@ impl EventEmitter<FileHistoryClosed> for FileHistoryDialog {}
 impl FileHistoryDialog {
     pub fn new(
         root: PathBuf,
+        workdir: PathBuf,
         file: FileChange,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -176,6 +178,7 @@ impl FileHistoryDialog {
         .detach();
         let mut this = Self {
             root,
+            workdir,
             label: file.label,
             viewer,
             detail_viewer,
@@ -275,7 +278,7 @@ impl FileHistoryDialog {
         let Some(entry) = self.state.action_entry(generation, index) else {
             return;
         };
-        if let Ok(path) = crate::path_display::absolute_file_path(&self.root, &entry.file.path) {
+        if let Ok(path) = crate::path_display::absolute_file_path(&self.workdir, &entry.file.path) {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 crate::path_display::display_path(&path),
             ));

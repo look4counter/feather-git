@@ -16,7 +16,10 @@ pub(crate) fn open(path: &Path) -> Result<gix::Repository> {
     options.permissions.config.system = false;
     options.permissions.attributes.git_binary = false;
     options.permissions.attributes.system = false;
-    let mut repo = gix::open_opts(path, options.filter_config_section(|_| false))?;
+    let git = git2::Repository::open_ext(path, git2::RepositoryOpenFlags::NO_SEARCH, std::iter::empty::<&Path>())?;
+    let mut repo = gix::open_opts(git.path(), options.open_path_as_is(true).filter_config_section(|_| false))?;
+    // 명령 실행 관련 설정 필터는 유지하고 libgit2가 확인한 작업 폴더만 전달한다.
+    repo.set_workdir(git.workdir().map(Path::to_path_buf))?;
     inherit_line_endings(&mut repo, &git2::Config::open_default()?)?;
     Ok(repo)
 }
@@ -138,13 +141,22 @@ fn status(repo: &gix::Repository) -> Result<Vec<FileChange>> {
         Some(repo.head_commit()?.tree()?)
     };
     let mut files = Vec::new();
+    let mut patterns = Vec::<gix::bstr::BString>::new();
+    if let Some(workdir) = repo.workdir() {
+        for directory in crate::repository::git_metadata_directories(workdir)? {
+            let name = directory.file_name().context("Git 디렉터리 이름을 읽을 수 없습니다.")?;
+            let mut pattern = b":(top,exclude,literal)".to_vec();
+            pattern.extend_from_slice(gix::path::into_bstr(Path::new(name))?.as_ref());
+            patterns.push(pattern.into());
+        }
+    }
     let iter = repo
         .status(gix::progress::Discard)?
         .index_worktree_options_mut(|options| options.thread_limit = Some(1))
         .untracked_files(gix::status::UntrackedFiles::Files)
         .index_worktree_rewrites(None)
         .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
-        .into_iter(Vec::<gix::bstr::BString>::new())?;
+        .into_iter(patterns)?;
     for item in iter {
         let item = item?;
         if normalization_only(repo, &index, &item)? { continue; }
@@ -584,6 +596,7 @@ pub fn toggle_stage(root: &Path, file: &FileChange) -> Result<()> {
     for (index, component) in components.iter().enumerate() {
         if !matches!(component, std::path::Component::Normal(_)) { bail!("잘못된 파일 경로입니다."); }
         path.push(component.as_os_str());
+        if component.as_os_str().to_string_lossy().eq_ignore_ascii_case(".git") || crate::repository::is_git_directory(&path) { bail!("Git 메타데이터는 Stage할 수 없습니다."); }
         if !file.staged && index + 1 < components.len() {
             let metadata = match fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && matches!(file.after, Content::Empty) => continue,
@@ -734,6 +747,7 @@ fn discard_path(worktree: &Path, raw: &[u8]) -> Result<PathBuf> {
             bail!("안전하지 않은 파일 경로입니다.");
         }
         path.push(component.as_os_str());
+        if crate::repository::is_git_directory(&path) { bail!("Git 메타데이터는 변경할 수 없습니다."); }
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,

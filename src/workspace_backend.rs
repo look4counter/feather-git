@@ -20,7 +20,8 @@ pub fn prepare_file_location(
     raw: &[u8],
     reveal: bool,
 ) -> Result<FileLocation, String> {
-    let path = crate::path_display::absolute_file_path(root, raw)?;
+    let workdir = repository::worktree_directory(root).unwrap_or_else(|_| root.to_path_buf());
+    let path = crate::path_display::absolute_file_path(&workdir, raw)?;
     if !reveal {
         std::fs::metadata(&path)
             .map_err(|error| format!("{}: {error}", crate::path_display::display_path(&path)))?;
@@ -352,6 +353,40 @@ mod tests {
     };
 
     #[test]
+    fn git_directory_identity_restores_two_repositories_and_file_locations_use_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let mut projects = Vec::new();
+        for name in [".git", ".git2"] {
+            let project = repository::execute(repository::Request {
+                operation: repository::Operation::Create, source: String::new(),
+                path: root.join(name).to_string_lossy().into_owned(), name: "project".into(),
+            }).unwrap();
+            projects.push(project);
+        }
+        std::fs::write(root.join("file.txt"), "keep").unwrap();
+        let entries: Vec<_> = projects.iter().map(|project| session::RepositoryEntry {
+            name: project.name.clone(), path: project.path.clone().unwrap(),
+        }).collect();
+        let path = dir.path().join("workspace.json");
+        session::write(&path, &Session {
+            open: entries.clone(), recent: entries.clone(), active: Some(entries[0].path.clone()),
+            ..Default::default()
+        }).unwrap();
+        let restored = RestoredWorkspace::read(&path).unwrap();
+        assert_eq!(restored.projects.len(), 2);
+        assert_eq!(restored.project, 0);
+        assert_eq!(restored.saved.recent.len(), 2);
+        for project in &restored.projects {
+            let gitdir = project.path.as_ref().unwrap();
+            assert_eq!(prepare_file_location(gitdir, b"file.txt", false).unwrap().path,
+                root.canonicalize().unwrap().join("file.txt"));
+            assert_eq!(execute_directory_action(gitdir, DirectoryAction::Explorer).unwrap(),
+                Some(PathBuf::from(crate::path_display::display_path(&root.canonicalize().unwrap()))));
+        }
+    }
+
+    #[test]
     fn file_locations_open_exact_files_and_reveal_missing_files_in_existing_parent() {
         let parent = std::env::current_dir()
             .unwrap()
@@ -620,6 +655,29 @@ pub fn prepare_repository_directory(root: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
+fn configure_repository_shell(command: &mut std::process::Command, selected: &Path) -> Result<(), String> {
+    let repo = match git2::Repository::open_ext(selected, git2::RepositoryOpenFlags::NO_SEARCH,
+        std::iter::empty::<&Path>()) {
+        Ok(repo) => repo,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(()),
+        Err(error) => return Err(format!("터미널에서 열 저장소를 확인할 수 없습니다: {error}")),
+    };
+    let gitdir = repo.path().canonicalize().map_err(|error| error.to_string())?;
+    command.env("GIT_DIR", crate::path_display::display_path(&gitdir))
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR");
+    if let Some(workdir) = repo.workdir() {
+        let workdir = workdir.canonicalize().map_err(|error| error.to_string())?;
+        command.current_dir(PathBuf::from(crate::path_display::display_path(&workdir)))
+            .env("GIT_WORK_TREE", crate::path_display::display_path(&workdir));
+    } else {
+        command.current_dir(PathBuf::from(crate::path_display::display_path(&gitdir)))
+            .env_remove("GIT_WORK_TREE");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn powershell_command(root: &Path) -> Result<std::process::Command, String> {
     use std::os::windows::process::CommandExt;
     let system =
@@ -629,6 +687,7 @@ fn powershell_command(root: &Path) -> Result<std::process::Command, String> {
     command
         .args(["-NoLogo", "-NoProfile", "-NoExit"])
         .current_dir(root);
+    configure_repository_shell(&mut command, root)?;
     command.creation_flags(windows::Win32::System::Threading::CREATE_NEW_CONSOLE.0);
     Ok(command)
 }
@@ -679,26 +738,30 @@ fn locate_git_bash() -> Result<PathBuf, String> {
 }
 
 #[cfg(windows)]
-fn git_bash_command(root: &Path, executable: &Path) -> std::process::Command {
+fn git_bash_command(root: &Path, executable: &Path) -> Result<std::process::Command, String> {
     let mut command = std::process::Command::new(executable);
     // 런처의 기본 동작으로 현재 폴더를 유지하며 경로를 명령 인수로 만들지 않는다.
     command.current_dir(root);
-    command
+    configure_repository_shell(&mut command, root)?;
+    Ok(command)
 }
 
 pub fn execute_directory_action(
     root: &Path,
     action: DirectoryAction,
 ) -> Result<Option<PathBuf>, String> {
-    let root = prepare_repository_directory(root)?;
+    #[cfg(windows)]
+    let selected = root;
+    let workdir = repository::worktree_directory(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = prepare_repository_directory(&workdir)?;
     if action == DirectoryAction::Explorer {
         return Ok(Some(root));
     }
     #[cfg(windows)]
     {
         let (mut command, label) = match action {
-            DirectoryAction::GitBash => (git_bash_command(&root, &locate_git_bash()?), "Git Bash"),
-            DirectoryAction::PowerShell => (powershell_command(&root)?, "PowerShell"),
+            DirectoryAction::GitBash => (git_bash_command(selected, &locate_git_bash()?)?, "Git Bash"),
+            DirectoryAction::PowerShell => (powershell_command(selected)?, "PowerShell"),
             DirectoryAction::Explorer => return Ok(Some(root)),
         };
         command
@@ -715,6 +778,58 @@ pub fn execute_directory_action(
 #[cfg(test)]
 mod directory_action_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn shell_commands_keep_selected_git_directory_and_clear_other_git_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("한글 폴더 & 이름 (test)");
+        let default = git2::Repository::init(&root).unwrap();
+        let gitdir = root.join(".git2");
+        let project = repository::execute(repository::Request {
+            operation: repository::Operation::Create, source: String::new(),
+            path: gitdir.to_string_lossy().into_owned(), name: "selected".into(),
+        }).unwrap();
+        let selected = project.path.unwrap();
+        let commands = [powershell_command(&selected).unwrap(), git_bash_command(&selected, Path::new("git-bash.exe")).unwrap()];
+        for command in commands {
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(env.get(std::ffi::OsStr::new("GIT_DIR")), Some(&Some(std::ffi::OsStr::new(&crate::path_display::display_path(&selected)))));
+            assert_eq!(env.get(std::ffi::OsStr::new("GIT_WORK_TREE")), Some(&Some(std::ffi::OsStr::new(&crate::path_display::display_path(project.workdir.as_ref().unwrap())))));
+            for key in ["GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+                assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None));
+            }
+            let mut child = std::process::Command::new("git");
+            child.current_dir(command.get_current_dir().unwrap());
+            child.env("GIT_DIR", default.path()).env("GIT_INDEX_FILE", default.path().join("index"));
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value { child.env(key, value); } else { child.env_remove(key); }
+            }
+            let output = child.args(["rev-parse", "--absolute-git-dir"]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let resolved = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+            assert_eq!(resolved.canonicalize().unwrap(), selected);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_commands_preserve_bare_repository_context_without_a_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path().join("bare.git")).unwrap();
+        for command in [powershell_command(repo.path()).unwrap(), git_bash_command(repo.path(), Path::new("git-bash.exe")).unwrap()] {
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
+            assert_eq!(env.get(std::ffi::OsStr::new("GIT_WORK_TREE")), Some(&None));
+            let mut child = std::process::Command::new("git");
+            child.current_dir(command.get_current_dir().unwrap()).env("GIT_WORK_TREE", dir.path());
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value { child.env(key, value); } else { child.env_remove(key); }
+            }
+            let output = child.args(["rev-parse", "--is-bare-repository"]).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "true");
+        }
+    }
+
     #[test]
     fn directory_actions_validate_target_and_preserve_special_path_as_data() {
         let dir = tempfile::tempdir().unwrap();
@@ -802,7 +917,7 @@ mod git_bash_tests {
     fn git_bash_keeps_special_path_in_working_directory_and_has_no_shell_arguments() {
         let root = PathBuf::from("D:/한글 폴더 '$value' & (test); value");
         let executable = PathBuf::from("C:/Program Files/Git/git-bash.exe");
-        let command = git_bash_command(&root, &executable);
+        let command = git_bash_command(&root, &executable).unwrap();
         assert_eq!(command.get_program(), executable.as_os_str());
         assert_eq!(command.get_current_dir(), Some(root.as_path()));
         assert_eq!(command.get_args().count(), 0);

@@ -109,6 +109,7 @@ pub struct Project {
     pub work_state: RepositoryWorkState,
     pub name: String,
     pub path: Option<PathBuf>,
+    pub workdir: Option<PathBuf>,
     pub branch: String,
     pub head: Option<String>,
     pub branches: Vec<String>,
@@ -268,6 +269,20 @@ pub fn name_from_path(path: &str) -> String {
         .unwrap_or_default()
         .into()
 }
+pub fn selected_repository_path(operation: Operation, folder: &Path) -> PathBuf {
+    if operation == Operation::Open { folder.to_path_buf() } else { folder.join(".git") }
+}
+
+pub fn suggested_name(operation: Operation, path: &str) -> String {
+    let path = path.trim().trim_end_matches(['/', '\\']);
+    let last = name_from_path(path);
+    let git_name = last.strip_prefix(".git").is_some_and(|suffix| suffix.bytes().all(|b| b.is_ascii_digit()));
+    if operation != Operation::Open || git_name {
+        return path.rsplit_once(['/', '\\']).map(|(parent, _)| name_from_path(parent)).unwrap_or_default();
+    }
+    last
+}
+
 pub fn execute(request: Request) -> Result<Project> {
     run(request)
 }
@@ -330,8 +345,7 @@ pub fn commit_files(path: &Path, id: &str) -> Result<Vec<ChangedFile>> {
         .collect()
 }
 
-pub fn delete_repository_files(path: &Path) -> Result<()> {
-    anyhow::ensure!(path.is_absolute(), "삭제 대상은 절대 경로여야 합니다.");
+fn ensure_unlinked_repository_path(path: &Path) -> Result<()> {
     // 연결된 경로를 정규화해 다른 폴더를 삭제하지 않도록 원본 구성 요소부터 검사합니다.
     for ancestor in path.ancestors() {
         let metadata =
@@ -345,6 +359,32 @@ pub fn delete_repository_files(path: &Path) -> Result<()> {
         let linked = metadata.file_type().is_symlink();
         anyhow::ensure!(!linked, "연결된 경로의 저장소는 삭제할 수 없습니다.");
     }
+    Ok(())
+}
+
+pub fn delete_repository_files(path: &Path) -> Result<()> {
+    anyhow::ensure!(path.is_absolute(), "삭제 대상은 절대 경로여야 합니다.");
+    ensure_unlinked_repository_path(path)?;
+    let selected_repo = open_exact(path)?;
+    let selected = path.canonicalize()?;
+    let gitdir = selected_repo.path().canonicalize()?;
+    let root = selected_repo.workdir().map(Path::canonicalize).transpose()?;
+    let target = if let Some(root) = root {
+        anyhow::ensure!(root.join(".git").canonicalize().ok().as_ref() == Some(&gitdir),
+            "사용자 지정 또는 외부 Git 디렉터리의 작업 폴더는 삭제할 수 없습니다. 항목만 삭제하세요.");
+        ensure_unlinked_repository_path(&root.join(".git"))?;
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.path().canonicalize().ok().as_ref() != Some(&gitdir) && is_git_directory(&entry.path()) {
+                bail!("다른 저장소와 공유하는 작업 폴더는 삭제할 수 없습니다. 항목만 삭제하세요.");
+            }
+        }
+        anyhow::ensure!(selected == root || selected == gitdir, "저장소 루트만 삭제할 수 있습니다.");
+        root
+    } else { selected };
+    drop(selected_repo);
+    let path = target.as_path();
+    ensure_unlinked_repository_path(path)?;
     let target = path
         .canonicalize()
         .context("삭제 대상 폴더를 찾을 수 없습니다.")?;
@@ -386,6 +426,30 @@ pub fn github_repository(path: &Path) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn git_command(repo: &Repository) -> Result<std::process::Command> {
+    let root = repo.workdir().context("작업 폴더가 없습니다.")?.canonicalize()?;
+    let gitdir = repo.path().canonicalize()?;
+    let root = crate::path_display::display_path(&root);
+    let gitdir = crate::path_display::display_path(&gitdir);
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("--git-dir").arg(gitdir)
+        .arg("--work-tree").arg(&root)
+        .arg("-C").arg(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    Ok(command)
 }
 
 fn open_exact(path: &Path) -> Result<Repository> {
@@ -479,40 +543,151 @@ fn run(request: Request) -> Result<Project> {
     }
     match request.operation {
         Operation::Create => {
-            if open_exact(path).is_ok() || path.join(".git").symlink_metadata().is_ok() {
-                bail!("이미 Git 저장소 또는 .git 정보가 존재합니다.");
-            }
+            let workdir = new_repository_workdir(path)?;
+            std::fs::create_dir_all(&workdir).context("작업 폴더를 만들지 못했습니다.")?;
             let mut options = git2::RepositoryInitOptions::new();
-            options.no_reinit(true).mkdir(true).mkpath(true);
-            Repository::init_opts(path, &options).context("Git 저장소를 생성하지 못했습니다.")?;
+            options.bare(true).no_reinit(true).mkdir(true).mkpath(true);
+            let repo = Repository::init_opts(path, &options).context("Git 저장소를 생성하지 못했습니다.")?;
+            attach_workdir(&repo, &workdir)?;
         }
         Operation::Open => {
             open_exact(path)?;
         }
         Operation::Clone => {
-            if path.exists()
-                && std::fs::read_dir(path)
-                    .context("대상 폴더에 접근할 수 없습니다.")?
-                    .next()
-                    .transpose()?
-                    .is_some()
-            {
-                bail!("복제할 저장소 경로가 비어 있지 않습니다.");
+            let workdir = new_repository_workdir(path)?;
+            if workdir.exists() {
+                for entry in std::fs::read_dir(&workdir).context("대상 폴더에 접근할 수 없습니다.")? {
+                    let entry = entry?;
+                    // 다른 저장소의 메타데이터만 허용하며 작업 파일을 덮어쓰지 않는다.
+                    if !entry.file_type()?.is_dir() || !is_git_directory(&entry.path()) {
+                        bail!("복제할 작업 폴더가 비어 있지 않습니다.");
+                    }
+                }
             }
-            let mut fetch = git2::FetchOptions::new();
-            fetch.remote_callbacks(credentials());
-            git2::build::RepoBuilder::new()
-                .fetch_options(fetch)
-                .clone(source, path)
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "저장소를 복제하지 못했습니다. 소스 접근 권한 및 대상 경로를 확인하세요."
-                    )
-                })?;
+            std::fs::create_dir_all(&workdir).context("작업 폴더를 만들지 못했습니다.")?;
+            clone_to_git_directory(source, path, &workdir).map_err(|_| {
+                anyhow::anyhow!("저장소를 복제하지 못했습니다. 소스 접근 권한 및 대상 경로를 확인하세요.")
+            })?;
         }
+    }
+    if request.operation != Operation::Open {
+        hide_git_directory(path).context("Git 디렉터리는 만들어졌지만 숨김 속성을 적용하지 못했습니다.")?;
     }
     snapshot(path, name)
 }
+
+#[cfg(windows)]
+fn hide_git_directory(path: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, GetFileAttributesW,
+            INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
+        },
+        core::PCWSTR,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let path = PCWSTR(wide.as_ptr());
+    let attributes = unsafe { GetFileAttributesW(path) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(std::io::Error::last_os_error()).context("Git 디렉터리 속성을 읽지 못했습니다.");
+    }
+    if attributes & FILE_ATTRIBUTE_HIDDEN.0 == 0 {
+        unsafe { SetFileAttributesW(path, FILE_FLAGS_AND_ATTRIBUTES(attributes | FILE_ATTRIBUTE_HIDDEN.0)) }
+            .context("Git 디렉터리에 숨김 속성을 설정하지 못했습니다.")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn hide_git_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// 작업 폴더 경로와 구분하여 새 메타데이터 경로를 검증한다.
+fn new_repository_workdir(path: &Path) -> Result<PathBuf> {
+    if path.symlink_metadata().is_ok() {
+        bail!("지정한 Git 디렉터리 경로가 이미 존재합니다.");
+    }
+    let absolute = std::path::absolute(path)?;
+    anyhow::ensure!(absolute.file_name().is_some(), "Git 디렉터리의 이름을 지정하세요.");
+    let workdir = absolute.parent().context("부모 작업 폴더를 지정하세요.")?;
+    anyhow::ensure!(workdir.parent().is_some(), "드라이브 루트에는 저장소를 생성할 수 없습니다.");
+    Ok(workdir.to_path_buf())
+}
+
+fn attach_workdir(repo: &Repository, workdir: &Path) -> Result<()> {
+    // update_gitlink=false로 기존 .git이나 다른 저장소 연결 파일을 건드리지 않는다.
+    repo.set_workdir(workdir, false)?;
+    let mut config = repo.config()?;
+    config.set_bool("core.bare", false)?;
+    config.set_bool("core.logallrefupdates", true)?;
+    config.set_str("core.worktree", workdir.to_str().context("작업 폴더 경로를 읽을 수 없습니다.")?)?;
+    Ok(())
+}
+
+fn clone_to_git_directory(source: &str, path: &Path, workdir: &Path) -> Result<()> {
+    let mut fetch = git2::FetchOptions::new();
+    fetch.remote_callbacks(credentials());
+    let repo = git2::build::RepoBuilder::new().bare(true).fetch_options(fetch).clone(source, path)?;
+    let head_name = repo.find_reference("HEAD")?.symbolic_target().ok().flatten().map(str::to_owned);
+    let branches: Vec<_> = repo.references_glob("refs/heads/*")?
+        .map(|reference| {
+            let reference = reference?;
+            Ok((reference.name()?.to_owned(), reference.target().context("브랜치 대상을 읽을 수 없습니다.")?))
+        }).collect::<Result<_>>()?;
+    for (name, id) in branches {
+        let branch = name.strip_prefix("refs/heads/").unwrap();
+        repo.reference(&format!("refs/remotes/origin/{branch}"), id, true, "clone")?;
+        if head_name.as_deref() != Some(&name) { repo.find_reference(&name)?.delete()?; }
+    }
+    repo.config()?.set_str("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*")?;
+    attach_workdir(&repo, workdir)?;
+    // bare 상태에서 연 핸들의 캐시를 갱신한다.
+    let repo = open_exact(path)?;
+    if let Some(head) = &head_name {
+        let branch = head.strip_prefix("refs/heads/").context("기본 브랜치를 읽을 수 없습니다.")?;
+        match repo.find_branch(branch, git2::BranchType::Local) {
+            Ok(mut local) => {
+                local.set_upstream(Some(&format!("origin/{branch}")))?;
+                repo.reference_symbolic("refs/remotes/origin/HEAD", &format!("refs/remotes/origin/{branch}"), true, "clone")?;
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match repo.head() {
+        Ok(_) => { repo.checkout_head(Some(git2::build::CheckoutBuilder::new().safe()))?; }
+        Err(error) if matches!(error.code(), git2::ErrorCode::UnbornBranch | git2::ErrorCode::NotFound) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub fn is_git_directory(path: &Path) -> bool {
+    Repository::open_ext(path, RepositoryOpenFlags::NO_SEARCH | RepositoryOpenFlags::NO_DOTGIT,
+        std::iter::empty::<&Path>()).is_ok()
+}
+
+pub fn git_metadata_directories(workdir: &Path) -> Result<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for entry in std::fs::read_dir(workdir)? {
+        let path = entry?.path();
+        if is_git_directory(&path) { directories.push(path); }
+    }
+    Ok(directories)
+}
+
+pub fn repository_identity(path: &Path) -> PathBuf {
+    open_exact(path).ok().and_then(|repo| repo.path().canonicalize().ok())
+        .unwrap_or_else(|| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+pub fn worktree_directory(path: &Path) -> Result<PathBuf> {
+    let repo = open_exact(path)?;
+    repo.workdir().context("작업 디렉터리가 없습니다.")?.canonicalize().context("작업 폴더를 확인할 수 없습니다.")
+}
+
 pub fn commit_snapshot(path: &Path, name: &str, id: &str) -> Result<Project> {
     let repo = open_exact(path)?; let id = git2::Oid::from_str(id)?; repo.find_commit(id)?;
     snapshot_with_target(path, name, Some(id))
@@ -540,8 +715,7 @@ pub fn remote_branch_label<'a>(label: &'a str, remote_names: &[String]) -> &'a s
 fn snapshot_with_target(path: &Path, name: &str, target: Option<git2::Oid>) -> Result<Project> {
     let repo = open_exact(path)?;
     let root = repo
-        .workdir()
-        .unwrap_or(repo.path())
+        .path()
         .canonicalize()
         .context("저장소 경로를 확인할 수 없습니다.")?;
     let head = match repo.head() {
@@ -577,6 +751,7 @@ fn snapshot_with_target(path: &Path, name: &str, target: Option<git2::Oid>) -> R
         work_state: read_work_state(&repo)?,
         name: name.into(),
         path: Some(root),
+        workdir: repo.workdir().map(Path::canonicalize).transpose()?,
         branch,
         head: head_id,
         ..Default::default()
@@ -659,7 +834,13 @@ fn snapshot_with_target(path: &Path, name: &str, target: Option<git2::Oid>) -> R
     if !repo.is_bare() {
         let mut options = git2::StatusOptions::new();
         options.include_untracked(true).recurse_untracked_dirs(true);
+        let workdir = repo.workdir().context("작업 폴더가 없습니다.")?;
+        let metadata_dirs = git_metadata_directories(workdir)?;
         for entry in repo.statuses(Some(&mut options))?.iter() {
+            if let Ok(path) = entry.path() {
+                let absolute = workdir.join(path);
+                if metadata_dirs.iter().any(|dir| absolute.starts_with(dir)) { continue; }
+            }
             let status = entry.status();
             let label = if status.is_conflicted() {
                 "!"
@@ -849,7 +1030,6 @@ mod tests {
         for path in [
             dir.path().to_path_buf(),
             child,
-            target.join(".git"),
             target.join("missing"),
         ] {
             assert!(delete_repository_files(&path.canonicalize().unwrap_or(path)).is_err());
@@ -1003,7 +1183,7 @@ mod tests {
         Request {
             operation,
             source: String::new(),
-            path: path.to_string_lossy().into(),
+            path: if operation == Operation::Open { path.to_path_buf() } else { path.join(".git") }.to_string_lossy().into(),
             name: "테스트 저장소".into(),
         }
     }
@@ -1092,7 +1272,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.path().join("parent/child");
         let project = execute(request(Operation::Create, &path)).unwrap();
-        assert_eq!(project.path, Some(path.canonicalize().unwrap()));
+        assert_eq!(project.path, Some(path.join(".git").canonicalize().unwrap()));
         let mut req = request(Operation::Open, &path);
         req.path.clear();
         assert!(execute(req).is_err());
@@ -1217,6 +1397,219 @@ mod tests {
                 .is_empty()
         );
     }
+    #[cfg(windows)]
+    #[test]
+    fn hidden_attribute_preserves_other_attributes_is_idempotent_and_reports_missing_path() {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
+        }};
+        let dir = tempdir();
+        let path = dir.path().join("사용자 지정");
+        std::fs::create_dir(&path).unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let original = std::fs::metadata(&path).unwrap().file_attributes() | FILE_ATTRIBUTE_ARCHIVE.0;
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(original)) }.unwrap();
+        hide_git_directory(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().file_attributes(), original | FILE_ATTRIBUTE_HIDDEN.0);
+        hide_git_directory(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().file_attributes(), original | FILE_ATTRIBUTE_HIDDEN.0);
+        assert!(hide_git_directory(&dir.path().join("missing")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opening_existing_git_directory_does_not_change_hidden_attribute() {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        use windows::{core::PCWSTR, Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_HIDDEN, FILE_FLAGS_AND_ATTRIBUTES, SetFileAttributesW,
+        }};
+        let dir = tempdir();
+        seed(dir.path());
+        let gitdir = dir.path().join(".git");
+        let wide: Vec<u16> = gitdir.as_os_str().encode_wide().chain(Some(0)).collect();
+        let visible = std::fs::metadata(&gitdir).unwrap().file_attributes() & !FILE_ATTRIBUTE_HIDDEN.0;
+        unsafe { SetFileAttributesW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(visible)) }.unwrap();
+        execute(request(Operation::Open, &gitdir)).unwrap();
+        assert_eq!(std::fs::metadata(&gitdir).unwrap().file_attributes(), visible);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn new_git_directories_are_hidden_for_create_and_clone_without_hiding_worktree() {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        seed(&source);
+        for operation in [Operation::Create, Operation::Clone] {
+            for name in [".git", ".git2", "사용자 지정"] {
+                let root = dir.path().join(format!("{operation:?}-{name}"));
+                let gitdir = root.join(name);
+                let mut req = request(operation, &root);
+                req.path = gitdir.to_string_lossy().into_owned();
+                req.source = source.to_string_lossy().into_owned();
+                execute(req).unwrap();
+                assert_ne!(std::fs::metadata(&gitdir).unwrap().file_attributes() & FILE_ATTRIBUTE_HIDDEN.0, 0,
+                    "{operation:?}: {name}");
+                assert_eq!(std::fs::metadata(&root).unwrap().file_attributes() & FILE_ATTRIBUTE_HIDDEN.0, 0);
+                if operation == Operation::Clone {
+                    assert_eq!(std::fs::metadata(root.join("tracked.txt")).unwrap().file_attributes() & FILE_ATTRIBUTE_HIDDEN.0, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_git_directories_create_independent_repositories_in_one_worktree() {
+        let dir = tempdir();
+        let root = dir.path().join("한글 프로젝트");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("keep.txt"), "keep").unwrap();
+        let mut identities = Vec::new();
+        for name in [".git", ".git2"] {
+            let gitdir = root.join(name);
+            let mut req = request(Operation::Create, &gitdir);
+            req.path = gitdir.to_string_lossy().into_owned();
+            let project = execute(req).unwrap();
+            assert!(gitdir.join("HEAD").is_file());
+            assert!(!gitdir.join(".git").exists());
+            assert_eq!(project.path, Some(gitdir.canonicalize().unwrap()));
+            let repo = open_exact(&gitdir).unwrap();
+            assert_eq!(repo.workdir().unwrap().canonicalize().unwrap(), root.canonicalize().unwrap());
+            identities.push(project.path);
+        }
+        assert_ne!(identities[0], identities[1]);
+        assert_eq!(std::fs::read_to_string(root.join("keep.txt")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn explicit_clone_uses_parent_worktree_and_remote_tracking() {
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        seed(&source);
+        let source_repo = open_exact(&source).unwrap();
+        let head = source_repo.head().unwrap().peel_to_commit().unwrap();
+        source_repo.branch("other", &head, false).unwrap();
+        for name in [".git", ".git2"] {
+            let root = dir.path().join(format!("clone-{name}"));
+            let gitdir = root.join(name);
+            let mut req = request(Operation::Clone, &gitdir);
+            req.path = gitdir.to_string_lossy().into_owned();
+            req.source = source.to_string_lossy().into_owned();
+            let project = execute(req).unwrap();
+            assert_eq!(project.path, Some(gitdir.canonicalize().unwrap()));
+            assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original");
+            let repo = open_exact(&gitdir).unwrap();
+            let exports = crate::history_temp::Session::default();
+            let exported = crate::file_history::export_revision(&gitdir, &project.commits[0].id, b"tracked.txt", &exports).unwrap();
+            assert_eq!(std::fs::read(&exported).unwrap(), b"original");
+            exports.close();
+            assert!(!repo.is_bare());
+            assert!(repo.find_reference("refs/remotes/origin/other").is_ok());
+            assert!(repo.find_branch("other", git2::BranchType::Local).is_err());
+            assert!(repo.find_branch(&project.branch, git2::BranchType::Local).unwrap().upstream().is_ok());
+            std::fs::write(root.join("tracked.txt"), "changed").unwrap();
+            let files = crate::diff_git::load_stage(&gitdir).unwrap();
+            assert!(files.iter().any(|file| file.path == b"tracked.txt"));
+            assert!(!files.iter().any(|file| file.label.starts_with(name)));
+            let file = files.iter().find(|file| file.path == b"tracked.txt").unwrap();
+            crate::diff_git::toggle_stage(&gitdir, file).unwrap();
+            assert_eq!(repo.index().unwrap().get_path(Path::new("tracked.txt"), 0).unwrap().id, repo.blob(b"changed").unwrap());
+        }
+    }
+
+    #[test]
+    fn shared_worktree_metadata_is_hidden_and_cannot_be_staged_discarded_or_deleted() {
+        let dir = tempdir();
+        let root = dir.path().join("project");
+        seed(&root);
+        let second = root.join(".git2");
+        let mut req = request(Operation::Create, &second);
+        req.path = second.to_string_lossy().into_owned();
+        execute(req).unwrap();
+        for gitdir in [root.join(".git"), second.clone()] {
+            let project = execute(request(Operation::Open, &gitdir)).unwrap();
+            assert!(project.files.iter().all(|file| !file.path.starts_with(".git")));
+            let files = crate::diff_git::load_stage(&gitdir).unwrap();
+            assert!(files.iter().all(|file| !file.label.starts_with(".git")));
+            assert!(delete_repository_files(&gitdir.canonicalize().unwrap()).is_err());
+        }
+        let files = crate::diff_git::load_stage(&second).unwrap();
+        let first_index = std::fs::read(root.join(".git/index")).unwrap();
+        let tracked = files.iter().find(|file| file.path == b"tracked.txt").unwrap();
+        crate::diff_git::toggle_stage(&second, tracked).unwrap();
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), first_index);
+        let mut forged = files.iter().find(|file| file.path == b"tracked.txt").unwrap().clone();
+        forged.path = b".git2/config".to_vec();
+        forged.label = ".git2/config".into();
+        let config = std::fs::read(second.join("config")).unwrap();
+        assert!(crate::diff_git::toggle_stage(&second, &forged).is_err());
+        assert!(crate::diff_git::set_worktree_content(&second, &forged, &config, b"bad").is_err());
+        assert_eq!(std::fs::read(second.join("config")).unwrap(), config);
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original");
+    }
+
+    #[test]
+    fn direct_default_git_directory_deletion_removes_only_its_unshared_worktree() {
+        let dir = tempdir();
+        let root = dir.path().join("delete");
+        seed(&root);
+        let gitdir = root.join(".git").canonicalize().unwrap();
+        assert!(gitdir.starts_with(dir.path().canonicalize().unwrap()));
+        delete_repository_files(&gitdir).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn clone_detached_source_checks_out_its_head_in_parent_worktree() {
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        seed(&source);
+        let repo = open_exact(&source).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = git2::Signature::now("Tester", "test@example.invalid").unwrap();
+        let head = repo.commit(None, &sig, &sig, "detached", &parent.tree().unwrap(), &[&parent]).unwrap();
+        repo.set_head_detached(head).unwrap();
+        let root = dir.path().join("clone");
+        let gitdir = root.join(".git2");
+        let mut req = request(Operation::Clone, &gitdir);
+        req.path = gitdir.to_string_lossy().into_owned();
+        req.source = source.to_string_lossy().into_owned();
+        let project = execute(req).unwrap();
+        assert_eq!(project.head, Some(head.to_string()));
+        assert_eq!(std::fs::read(root.join("tracked.txt")).unwrap(), b"original");
+        assert!(open_exact(&gitdir).unwrap().head_detached().unwrap());
+    }
+
+    #[test]
+    fn clone_can_share_empty_worktree_without_overwriting_existing_git_directory() {
+        let dir = tempdir();
+        let source = dir.path().join("source");
+        seed(&source);
+        let root = dir.path().join("target");
+        let first = Repository::init(&root).unwrap();
+        let original_config = std::fs::read(first.path().join("config")).unwrap();
+        let second = root.join(".git2");
+        let mut req = request(Operation::Clone, &second);
+        req.path = second.to_string_lossy().into_owned();
+        req.source = source.to_string_lossy().into_owned();
+        execute(req).unwrap();
+        assert_eq!(std::fs::read(first.path().join("config")).unwrap(), original_config);
+        assert!(root.join("tracked.txt").is_file());
+    }
+
+    #[test]
+    fn explicit_create_never_reuses_existing_git_directory() {
+        let dir = tempdir();
+        let target = dir.path().join(".git2");
+        std::fs::create_dir(&target).unwrap();
+        let mut req = request(Operation::Create, &target);
+        req.path = target.to_string_lossy().into_owned();
+        assert!(execute(req).is_err());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none());
+    }
+
     #[test]
     fn names_follow_final_folder() {
         assert_eq!(name_from_path("D:\\work\\repo\\"), "repo");

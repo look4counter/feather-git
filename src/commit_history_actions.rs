@@ -1,10 +1,10 @@
-use super::{index_conflict_paths, open_exact};
+use super::{git_command, index_conflict_paths, open_exact};
 use anyhow::{Context, Result, bail};
 use git2::{Oid, RepositoryState};
 use std::{
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -81,24 +81,6 @@ fn validate(repo: &git2::Repository, request: &CommitHistoryRequest) -> Result<O
     Ok(id)
 }
 
-fn command(repo: &git2::Repository) -> Result<Command> {
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo.workdir().context("작업 폴더가 없습니다.")?)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    Ok(command)
-}
 fn run(repo: &git2::Repository, mut command: Command, reverting: bool) -> Result<()> {
     let output = command.output().context("Git을 실행하지 못했습니다.")?;
     if !output.status.success() {
@@ -211,7 +193,7 @@ pub fn continue_revert(path: &Path, expected_head: &str) -> Result<()> {
         }
         .into());
     }
-    let mut cmd = command(&repo)?;
+    let mut cmd = git_command(&repo)?;
     cmd.args([
         "revert",
         if context.is_some_and(|context| context.no_commit) {
@@ -227,7 +209,7 @@ pub fn continue_revert(path: &Path, expected_head: &str) -> Result<()> {
 pub fn abort_revert(path: &Path, expected_head: &str) -> Result<()> {
     let repo = open_exact(path)?;
     validate_revert_control(&repo, expected_head)?;
-    let mut cmd = command(&repo)?;
+    let mut cmd = git_command(&repo)?;
     cmd.args(["revert", "--abort"]);
     let outcome = run(&repo, cmd, true);
     finish_revert_context(&repo, outcome)
@@ -253,7 +235,7 @@ pub fn revert_commit(path: &Path, request: &CommitHistoryRequest, no_commit: boo
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
-    let mut cmd = command(&repo)?;
+    let mut cmd = git_command(&repo)?;
     cmd.args(["revert", "--no-edit"]);
     if no_commit {
         cmd.arg("--no-commit");
@@ -268,7 +250,7 @@ pub fn revert_commit(path: &Path, request: &CommitHistoryRequest, no_commit: boo
 pub fn reset_commit(path: &Path, request: &CommitHistoryRequest, mode: ResetMode) -> Result<()> {
     let repo = open_exact(path)?;
     let target = validate(&repo, request)?;
-    let mut cmd = command(&repo)?;
+    let mut cmd = git_command(&repo)?;
     cmd.args(["reset", mode.flag()])
         .arg(target.to_string())
         .arg("--");
@@ -276,9 +258,9 @@ pub fn reset_commit(path: &Path, request: &CommitHistoryRequest, mode: ResetMode
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    fn commit(repo: &git2::Repository, text: &str) -> Oid {
+    pub(crate) fn commit(repo: &git2::Repository, text: &str) -> Oid {
         std::fs::write(repo.workdir().unwrap().join("file.txt"), text).unwrap();
         let mut index = repo.index().unwrap();
         index.add_path(Path::new("file.txt")).unwrap();
@@ -329,6 +311,113 @@ mod tests {
         let entry = index.get_path(Path::new("file.txt"), 0).unwrap();
         repo.find_blob(entry.id).unwrap().content().to_vec()
     }
+    pub(crate) fn custom_fixture(layout: &str) -> (tempfile::TempDir, git2::Repository, git2::Repository, Oid, Oid) {
+        let dir = temporary_repo_dir();
+        // 잘못된 Git 탐색도 테스트 영역 밖의 저장소에 도달하지 못하게 한다.
+        std::fs::write(dir.path().join(".git"), "invalid test boundary").unwrap();
+        let source = dir.path().join("source");
+        let original = git2::Repository::init(&source).unwrap();
+        let first = commit(&original, "first\n");
+        let second = commit(&original, "second\n");
+        let root = match layout {
+            "shared" => source.clone(),
+            "ancestor" => source.join("nested"),
+            _ => dir.path().join("standalone"),
+        };
+        std::fs::create_dir_all(&root).unwrap();
+        let gitdir = root.join(".git2");
+        let selected = git2::build::RepoBuilder::new().bare(true).clone(source.to_str().unwrap(), &gitdir).unwrap();
+        super::super::attach_workdir(&selected, &root).unwrap();
+        drop(selected);
+        let selected = git2::Repository::open(&gitdir).unwrap();
+        let mut config = selected.config().unwrap();
+        config.set_str("user.name", "QA Tester").unwrap();
+        config.set_str("user.email", "qa@example.invalid").unwrap();
+        config.set_bool("commit.gpgsign", false).unwrap();
+        config.set_str("core.autocrlf", "false").unwrap();
+        let mut index = selected.index().unwrap();
+        index.read_tree(&selected.head().unwrap().peel_to_tree().unwrap()).unwrap();
+        index.write().unwrap();
+        if root != source {
+            std::fs::copy(source.join("file.txt"), root.join("file.txt")).unwrap();
+        }
+        (dir, original, selected, first, second)
+    }
+
+    #[test]
+    fn custom_git_command_explicitly_selects_repository_and_clears_inherited_paths() {
+        let (_dir, original, selected, _, _) = custom_fixture("shared");
+        let mut cmd = git_command(&selected).unwrap();
+        let env: std::collections::BTreeMap<_, _> = cmd.get_envs().collect();
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"] {
+            assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None));
+        }
+        // 명시적 인수는 다른 저장소의 환경변수가 있어도 우선해야 한다.
+        cmd.env("GIT_DIR", original.path()).env("GIT_WORK_TREE", original.workdir().unwrap());
+        let output = cmd.args(["rev-parse", "--absolute-git-dir"]).output().unwrap();
+        assert!(output.status.success());
+        let resolved = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        assert_eq!(resolved.canonicalize().unwrap(), selected.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn custom_git_reset_preserves_sibling_and_ancestor_metadata_in_all_modes() {
+        for layout in ["standalone", "shared", "ancestor"] {
+            for mode in ResetMode::ALL {
+                let (_dir, original, selected, first, second) = custom_fixture(layout);
+                let original_index = std::fs::read(original.path().join("index")).unwrap();
+                reset_commit(&selected.path().canonicalize().unwrap(), &request(&selected, first), mode).unwrap();
+                assert_eq!(selected.head().unwrap().target(), Some(first), "{layout}: {mode:?}");
+                assert_eq!(original.head().unwrap().target(), Some(second));
+                assert_eq!(std::fs::read(original.path().join("index")).unwrap(), original_index);
+                assert_eq!(indexed(&selected), if mode == ResetMode::Soft { b"second\n".as_slice() } else { b"first\n".as_slice() });
+            }
+        }
+    }
+
+    #[test]
+    fn custom_git_revert_preserves_sibling_and_ancestor_metadata() {
+        for layout in ["standalone", "shared", "ancestor"] {
+            for no_commit in [false, true] {
+                let (_dir, original, selected, _first, second) = custom_fixture(layout);
+                let original_index = std::fs::read(original.path().join("index")).unwrap();
+                revert_commit(&selected.path().canonicalize().unwrap(), &request(&selected, second), no_commit).unwrap();
+                assert_eq!(indexed(&selected), b"first\n", "{layout}");
+                assert_eq!(selected.head().unwrap().target() == Some(second), no_commit);
+                assert_eq!(original.head().unwrap().target(), Some(second));
+                assert_eq!(std::fs::read(original.path().join("index")).unwrap(), original_index);
+            }
+        }
+    }
+
+    #[test]
+    fn custom_git_revert_controls_only_consume_selected_repository_state() {
+        for layout in ["standalone", "shared", "ancestor"] {
+            for (abort, no_commit) in [(false, false), (false, true), (true, false), (true, true)] {
+                let (_dir, original, selected, _first, second) = custom_fixture(layout);
+                let original_index = std::fs::read(original.path().join("index")).unwrap();
+                let third = commit(&selected, "third\n");
+                assert!(revert_commit(&selected.path().canonicalize().unwrap(), &request(&selected, second), no_commit).is_err());
+                assert!(is_revert_state(selected.state()));
+                if abort {
+                    abort_revert(&selected.path().canonicalize().unwrap(), &third.to_string()).unwrap();
+                    assert_eq!(selected.head().unwrap().target(), Some(third));
+                } else {
+                    std::fs::write(selected.workdir().unwrap().join("file.txt"), "resolved\n").unwrap();
+                    let mut index = selected.index().unwrap();
+                    index.add_path(Path::new("file.txt")).unwrap();
+                    index.write().unwrap();
+                    continue_revert(&selected.path().canonicalize().unwrap(), &third.to_string()).unwrap();
+                    assert_eq!(selected.head().unwrap().target() == Some(third), no_commit);
+                }
+                assert_eq!(selected.state(), RepositoryState::Clean);
+                assert_eq!(original.head().unwrap().target(), Some(second));
+                assert_eq!(std::fs::read(original.path().join("index")).unwrap(), original_index);
+                assert_eq!(original.state(), RepositoryState::Clean);
+            }
+        }
+    }
+
     #[test]
     fn revert_modes_preserve_or_create_head_and_apply_inverse_to_index_and_worktree() {
         for no_commit in [false, true] {
@@ -563,7 +652,7 @@ mod tests {
     fn external_revert_continues_without_app_context_and_locks_preserve_pending_state() {
         let (dir, repo, _, second) = fixture();
         let head = commit(&repo, "third\n");
-        let mut cmd = command(&repo).unwrap();
+        let mut cmd = git_command(&repo).unwrap();
         cmd.args(["revert", "--no-edit"]).arg(second.to_string());
         assert!(!cmd.output().unwrap().status.success());
         assert!(!repo.path().join(REVERT_CONTEXT).exists());

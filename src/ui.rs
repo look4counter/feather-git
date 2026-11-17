@@ -1039,6 +1039,9 @@ impl Workspace {
             return Ok(());
         };
         result.map_err(|error| format!("{error:#}\n일부 파일은 이미 삭제되었을 수 있습니다."))?;
+        let deleted_root = if entry.path.file_name().is_some_and(|name| name == ".git") {
+            entry.path.parent().unwrap_or(&entry.path).to_path_buf()
+        } else { entry.path.clone() };
         self.invalidate_requests();
         let affected: Vec<_> = self
             .open_projects
@@ -1048,14 +1051,14 @@ impl Workspace {
                 self.projects[id]
                     .path
                     .as_ref()
-                    .is_some_and(|path| path.starts_with(&entry.path))
+                    .is_some_and(|path| path.starts_with(&deleted_root))
             })
             .collect();
         for id in affected {
             self.close_project(id);
         }
         self.recent_repositories
-            .retain(|item| !item.path.starts_with(&entry.path));
+            .retain(|item| !item.path.starts_with(&deleted_root));
         if self.open_projects.is_empty() {
             self.start_tab_open = true;
             self.start_tab_active = true;
@@ -2447,7 +2450,7 @@ impl Workspace {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("저장소 폴더 선택".into()),
+            prompt: Some(if dialog.read(cx).operation == Operation::Open { "Git 디렉터리 선택" } else { "작업 폴더 선택" }.into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = selected.await;
@@ -2465,6 +2468,7 @@ impl Workspace {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.first() {
+                            let path = repository::selected_repository_path(dialog.read(cx).operation, path);
                             let input = dialog.read(cx).path.clone();
                             input.update(cx, |input, cx| {
                                 input.set_text(&path.to_string_lossy(), cx)
@@ -6048,7 +6052,8 @@ impl Workspace {
         if !self.file_action_context(project, revision, historical) {
             return None;
         }
-        let root = self.projects.get(project)?.path.as_ref()?;
+        let project = self.projects.get(project)?;
+        let root = project.workdir.as_ref().or(project.path.as_ref())?;
         let files = self.viewer_files.as_ref().ok()?;
         let mut paths = Vec::new();
         for index in self.file_selection.indices(files.len()) {
@@ -6165,8 +6170,10 @@ impl Workspace {
 
     fn show_file_history(&mut self, root: std::path::PathBuf, file: FileChange, window: &mut Window, cx: &mut Context<Self>) {
         self.file_history_previous_focus = window.focused(cx);
+        let workdir = self.projects.iter().find(|project| project.path.as_ref() == Some(&root))
+            .and_then(|project| project.workdir.clone()).unwrap_or_else(|| root.clone());
         let dialog =
-            cx.new(|cx| crate::file_history_dialog::FileHistoryDialog::new(root, file, window, cx));
+            cx.new(|cx| crate::file_history_dialog::FileHistoryDialog::new(root, workdir, file, window, cx));
         self.file_history_subscription = Some(cx.subscribe_in(
             &dialog,
             window,
@@ -6741,8 +6748,8 @@ mod tab_tests {
         state.forget_recent(&entry);
         drive(&mut state);
         assert_eq!(state.open_projects, tabs);
-        assert!(entry.path.join(".git").exists());
-        assert!(entry.path.join("file.txt").exists());
+        assert!(entry.path.join("HEAD").exists());
+        assert!(entry.path.parent().unwrap().join("file.txt").exists());
         assert!(
             !state
                 .recent_repositories
@@ -7061,7 +7068,7 @@ mod tab_tests {
         let target = repo.revparse_single("HEAD~1550").unwrap();
         repo.tag_lightweight("jump-page", &target, false).unwrap();
         let target_id = target.id().to_string();
-        let worktree = std::fs::read(path.join("file.txt")).unwrap();
+        let worktree = std::fs::read(repo.workdir().unwrap().join("file.txt")).unwrap();
         let loaded = repository::execute(Request {
             operation: Operation::Open,
             source: String::new(),
@@ -7139,7 +7146,7 @@ mod tab_tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        assert_eq!(std::fs::read(path.join("file.txt")).unwrap(), worktree);
+        assert_eq!(std::fs::read(repo.workdir().unwrap().join("file.txt")).unwrap(), worktree);
     }
 
     fn workspace_with_repositories() -> (tempfile::TempDir, Workspace) {
@@ -7180,7 +7187,7 @@ mod tab_tests {
             let head = repo.head().unwrap().peel_to_commit().unwrap();
             repo.branch("develop", &head, false).unwrap();
             if project == 3 {
-                std::fs::write(path.join("file.txt"), "working change\n").unwrap();
+                std::fs::write(repo.workdir().unwrap().join("file.txt"), "working change\n").unwrap();
             }
             state.activate_repository(
                 repository::execute(Request {
@@ -8343,7 +8350,7 @@ mod tab_tests {
     fn file_row_menu_separates_clicked_file_from_selected_paths_in_both_tabs() {
         let (_repositories, mut state) = workspace_with_repositories();
         let project = state.project;
-        let root = state.projects[project].path.clone().unwrap();
+        let root = state.projects[project].workdir.clone().unwrap();
         let mut first = state.viewer_files.as_ref().unwrap()[0].clone();
         first.path = b"folder/one.txt".to_vec();
         first.label = "folder/one.txt".into();
@@ -8496,7 +8503,7 @@ mod tab_tests {
         let project = state.project;
         let root = state.projects[project].path.clone().unwrap();
         let files = state.viewer_files.as_ref().unwrap().clone();
-        let index = std::fs::read(root.join(".git/index")).unwrap();
+        let index = std::fs::read(root.join("index")).unwrap();
         let revision = state.panel_revision;
         let target = state.viewer_target();
         let prepare = || diff_git::prepare_discard(&root, &files).unwrap();
@@ -8514,7 +8521,7 @@ mod tab_tests {
         assert!(state.take_discard_choice(true).is_none());
         assert_eq!(state.panel_revision, revision);
         assert_eq!(state.viewer_target(), target);
-        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(std::fs::read(root.join("index")).unwrap(), index);
         state.discard_prompt = Some(DiscardPrompt {
             project,
             root: root.clone(),
@@ -8533,7 +8540,7 @@ mod tab_tests {
         assert!(discard_cancel_key("escape"));
         assert!(!discard_cancel_key("enter"));
         assert!(!discard_cancel_key("space"));
-        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        assert_eq!(std::fs::read(root.join("index")).unwrap(), index);
     }
 
     #[test]
@@ -9913,7 +9920,7 @@ mod tab_tests {
         let project = repository::execute(Request {
             operation: Operation::Create,
             source: String::new(),
-            path: path.to_string_lossy().into(),
+            path: path.join(".git").to_string_lossy().into(),
             name: "actual project".into(),
         })
         .unwrap();

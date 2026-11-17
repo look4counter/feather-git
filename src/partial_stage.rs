@@ -159,6 +159,7 @@ fn validate_path(root: &Path, raw: &[u8]) -> Result<()> {
             bail!("Git 메타데이터는 Stage할 수 없습니다.");
         }
         path.push(name);
+        if crate::repository::is_git_directory(&path) { bail!("Git 메타데이터는 Stage할 수 없습니다."); }
         match std::fs::symlink_metadata(&path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {

@@ -90,17 +90,8 @@ pub fn abort_merge(path: &Path, expected_head: &str) -> Result<()> {
     if !head.is_branch() || head.peel_to_commit()?.id().to_string() != expected_head {
         bail!("현재 브랜치가 변경되어 병합 취소를 중단했습니다.");
     }
-    let root = repo.workdir().context("작업 폴더가 없습니다.")?;
-    let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(root).args(["merge", "--abort"])
-        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE").env_remove("GIT_COMMON_DIR")
-        .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = super::git_command(&repo)?;
+    command.args(["merge", "--abort"]);
     let output = command.output().context("Git을 실행하지 못해 병합을 취소할 수 없습니다.")?;
     if !output.status.success() {
         bail!("병합 취소에 실패했습니다. 저장소 상태를 확인하세요.\n{}",
@@ -445,6 +436,27 @@ mod tests {
         repo.set_head("refs/heads/unborn").unwrap();
         assert!(merge_commit(&f.local, &before.to_string()).is_err());
     }
+    #[test]
+    fn custom_git_merge_abort_only_clears_selected_repository() {
+        use super::super::commit_history_actions::tests::{commit as change, custom_fixture};
+        for layout in ["standalone", "shared", "ancestor"] {
+            let (_dir, original, selected, _, base) = custom_fixture(layout);
+            let original_index = std::fs::read(original.path().join("index")).unwrap();
+            let theirs = change(&selected, "incoming\n");
+            selected.reset(selected.find_commit(base).unwrap().as_object(), git2::ResetType::Hard, None).unwrap();
+            let ours = change(&selected, "ours\n");
+            assert!(merge_commit(selected.path(), &theirs.to_string()).is_err());
+            assert_eq!(selected.state(), RepositoryState::Merge);
+            abort_merge(selected.path(), &ours.to_string()).unwrap();
+            assert_eq!(selected.state(), RepositoryState::Clean);
+            assert_eq!(selected.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(selected.workdir().unwrap().join("file.txt")).unwrap(), b"ours\n");
+            assert_eq!(original.head().unwrap().target(), Some(base));
+            assert_eq!(original.state(), RepositoryState::Clean);
+            assert_eq!(std::fs::read(original.path().join("index")).unwrap(), original_index);
+        }
+    }
+
     #[test]
     fn merge_abort_preserves_head_local_files_and_rejects_locks_or_stale_targets() {
         for resolve in [false, true] {

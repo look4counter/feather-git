@@ -40,7 +40,7 @@ impl Default for Session {
 }
 
 fn normalized_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    crate::repository::repository_identity(path)
 }
 
 pub fn remember(recent: &mut Vec<RepositoryEntry>, mut entry: RepositoryEntry) {
@@ -83,6 +83,13 @@ pub fn read(path: &Path) -> Result<Session> {
         remember(&mut recent, entry);
     }
     session.recent = recent;
+    let mut open = Vec::new();
+    for mut entry in session.open {
+        entry.path = normalized_path(&entry.path);
+        if !open.iter().any(|old: &RepositoryEntry| old.path == entry.path) { open.push(entry); }
+    }
+    session.open = open;
+    session.active = session.active.as_deref().map(normalized_path);
     Ok(session)
 }
 
@@ -129,6 +136,33 @@ mod tests {
             path: path.into(),
         }
     }
+    #[test]
+    fn legacy_worktree_paths_migrate_and_shared_worktrees_stay_distinct() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        git2::Repository::init(&root).unwrap();
+        let second = root.join(".git2");
+        let repo = git2::Repository::init_bare(&second).unwrap();
+        repo.set_workdir(&root, false).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_bool("core.bare", false).unwrap();
+        config.set_str("core.worktree", root.to_str().unwrap()).unwrap();
+        let path = dir.path().join("session.json");
+        let first = root.join(".git");
+        let session = Session {
+            open: vec![entry(&root), entry(&first), entry(&second)],
+            recent: vec![entry(&root), entry(&first), entry(&second)],
+            active: Some(root.clone()),
+            ..Default::default()
+        };
+        write(&path, &session).unwrap();
+        let loaded = read(&path).unwrap();
+        assert_eq!(loaded.open.len(), 2);
+        assert_eq!(loaded.recent.len(), 2);
+        assert_eq!(loaded.active, Some(first.canonicalize().unwrap()));
+        assert!(loaded.recent.iter().any(|item| item.path == second.canonicalize().unwrap()));
+    }
+
     #[test]
     fn pull_mode_defaults_for_old_json_and_survives_serialization() {
         let old:Session=serde_json::from_str(r#"{"version":1,"open":[],"recent":[]}"#).unwrap();

@@ -145,6 +145,9 @@ macro_rules! install {
                 ChangedFile,
                 Project,
                 name_from_path,
+                suggested_name,
+                selected_repository_path,
+                is_git_directory,
                 remote_branch_label,
                 stash_display_label,
                 HistoryCursor,
@@ -170,6 +173,9 @@ macro_rules! install {
                 StashApplyFailure
             ],
             {
+                pub fn git_metadata_directories(workdir: &std::path::Path) -> anyhow::Result<Vec<std::path::PathBuf>>;
+                pub fn repository_identity(path: &std::path::Path) -> std::path::PathBuf;
+                pub fn worktree_directory(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf>;
                 pub fn execute(request: Request) -> anyhow::Result<Project>;
                 pub fn synchronize(path: &std::path::Path, mode: SyncMode) -> anyhow::Result<()>;
                 pub fn work_state(path: &std::path::Path) -> anyhow::Result<RepositoryWorkState>;

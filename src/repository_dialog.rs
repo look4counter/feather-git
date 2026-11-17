@@ -1,5 +1,5 @@
 use crate::dialog::Dialog;
-use crate::repository::{Operation, Request, name_from_path};
+use crate::repository::{Operation, Request, suggested_name};
 use crate::text_input::{Changed, TextInput};
 use gpui::{prelude::*, *};
 
@@ -39,7 +39,7 @@ impl RepositoryDialog {
         let name: Entity<TextInput> = cx.new(TextInput::new);
         let subscription = cx.subscribe(&path, |this: &mut Self, _, event: &Changed, cx| {
             this.name
-                .update(cx, |name, cx| name.set_text(&name_from_path(&event.0), cx));
+                .update(cx, |name, cx| name.set_text(&suggested_name(this.operation, &event.0), cx));
             cx.notify();
         });
         Self {
@@ -108,7 +108,7 @@ impl Render for RepositoryDialog {
                         .child(self.input(self.source.clone())),
                 )
             })
-            .child(div().flex_shrink_0().child("저장소 경로"))
+            .child(div().flex_shrink_0().child("Git 디렉터리 경로"))
             .child(
                 div()
                     .flex()
@@ -201,6 +201,23 @@ impl Render for RepositoryDialog {
 #[cfg(test)]
 mod tests {
     use super::DialogActivity;
+
+    #[test]
+    fn selected_paths_and_names_follow_operation_without_changing_manual_paths() {
+        use crate::repository::{Operation, selected_repository_path, suggested_name};
+        use std::path::Path;
+        for operation in [Operation::Create, Operation::Clone] {
+            assert_eq!(selected_repository_path(operation, Path::new("project")), Path::new("project/.git"));
+            for path in ["D:/work/my-app/.git", "D:/work/my-app/.git2", "D:/work/my-app/custom"] {
+                assert_eq!(suggested_name(operation, path), "my-app");
+            }
+        }
+        assert_eq!(selected_repository_path(Operation::Open, Path::new("project/.git2")), Path::new("project/.git2"));
+        assert_eq!(suggested_name(Operation::Open, "D:/work/my-app/.git2"), "my-app");
+        assert_eq!(suggested_name(Operation::Open, "D:/work/my-app"), "my-app");
+        assert_eq!(suggested_name(Operation::Open, "D:/work/bare.git"), "bare.git");
+        assert_eq!(suggested_name(Operation::Clone, "D:/"), "");
+    }
 
     #[test]
     fn browsing_blocks_duplicate_actions_until_the_folder_prompt_returns() {

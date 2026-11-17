@@ -37,6 +37,17 @@ pub fn search(root: &Path, query: &str) -> Result<Vec<Match>> {
         std::iter::empty::<&Path>(),
     )
     .context("검색할 저장소를 열지 못했습니다")?;
+    let workdir = repo.workdir().map(Path::canonicalize).transpose()?;
+    let metadata_dirs = workdir.as_deref().map(crate::repository::git_metadata_directories)
+        .transpose()?.unwrap_or_default();
+    let is_metadata = |path: &str| {
+        Path::new(path).components().any(|part| {
+            matches!(part, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".git"))
+        }) || workdir.as_ref().is_some_and(|root| {
+            let absolute = root.join(path);
+            metadata_dirs.iter().any(|directory| absolute.starts_with(directory))
+        })
+    };
     let mut walk = repo.revwalk()?;
     for reference in repo.references()? {
         let reference = reference?;
@@ -75,6 +86,7 @@ pub fn search(root: &Path, query: &str) -> Result<Vec<Match>> {
             for entry in tree.iter() {
                 crate::backend::checkpoint();
                 let path = format!("{}{}", prefix, entry.name().unwrap_or(""));
+                if is_metadata(&path) { continue; }
                 if entry.kind() == Some(ObjectType::Tree) {
                     trees.push((format!("{path}/"), repo.find_tree(entry.id())?));
                     continue;
@@ -107,6 +119,7 @@ pub fn search(root: &Path, query: &str) -> Result<Vec<Match>> {
             if path.is_empty()
                 || Path::new(path).is_absolute()
                 || path.split('/').any(|part| part == "..")
+                || is_metadata(path)
             {
                 return;
             }
@@ -155,6 +168,36 @@ pub fn search(root: &Path, query: &str) -> Result<Vec<Match>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_excludes_actual_metadata_but_keeps_similarly_named_files_and_commits() {
+        let root = tempfile::tempdir_in(Path::new(env!("CARGO_MANIFEST_DIR")).join("target")).unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        std::fs::create_dir(root.path().join(".git2")).unwrap();
+        std::fs::create_dir(root.path().join(".git2-notes")).unwrap();
+        std::fs::write(root.path().join(".git2/config"), "[audit]\n marker = internal-marker\n").unwrap();
+        std::fs::write(root.path().join(".git2-notes/readme.txt"), "ordinary-marker\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ordinary-marker\n").unwrap();
+        let mut index = repo.index().unwrap();
+        for path in [".git2/config", ".git2-notes/readme.txt", ".gitignore"] {
+            index.add_path(Path::new(path)).unwrap();
+        }
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("QA", "qa@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "ordinary-marker commit", &tree, &[]).unwrap();
+        Repository::init_bare(root.path().join(".git2")).unwrap();
+        let other = Repository::init_bare(root.path().join("metadata-store")).unwrap();
+        other.config().unwrap().set_str("audit.marker", "internal-marker").unwrap();
+        assert!(search(repo.path(), "internal-marker").unwrap().is_empty());
+        let matches = search(repo.path(), ".git2").unwrap();
+        assert_eq!(matches, [Match::File { path: ".git2-notes/readme.txt".into(), content: false }]);
+        let normal = search(repo.path(), "ordinary-marker").unwrap();
+        assert!(normal.iter().any(|entry| matches!(entry, Match::Commit { .. })));
+        for path in [".git2-notes/readme.txt", ".gitignore"] {
+            assert!(normal.contains(&Match::File { path: path.into(), content: true }));
+        }
+    }
+
     #[test]
     fn searches_commit_path_and_old_file_content_across_refs() {
         let root =

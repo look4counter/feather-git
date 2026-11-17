@@ -3,6 +3,7 @@ use crate::{
     repository::{Commit, CommitReference},
 };
 use anyhow::{Context, Result};
+use gix::bstr::ByteSlice;
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
@@ -187,13 +188,14 @@ fn export_revision_to(
 ) -> Result<std::path::PathBuf> {
     use std::io::Write;
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let path = crate::path_display::absolute_file_path(root, raw).map_err(anyhow::Error::msg)?;
     let repo = git2::Repository::open(root)?;
+    let workdir = repo.workdir().unwrap_or(root);
+    let path = crate::path_display::absolute_file_path(workdir, raw).map_err(anyhow::Error::msg)?;
     let commit = repo.find_commit(git2::Oid::from_str(id)?)?;
     let tree = commit.tree()?;
-    let relative = path.strip_prefix(root)?;
+    let relative = gix::path::from_bstr(raw.as_bstr())?;
     let entry = tree
-        .get_path(relative)
+        .get_path(relative.as_ref())
         .context("해당 커밋에 파일이 없습니다.")?;
     anyhow::ensure!(
         entry.filemode() & 0o170000 == 0o100000,

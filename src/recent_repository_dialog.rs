@@ -116,7 +116,7 @@ pub fn render(
         .into_iter()
         .map(|(id, label, choice)| {
             let callback = callback.clone();
-            crate::dialog::button(id, label, choice == RemovalChoice::Files, true)
+            crate::dialog::button(id, "", choice == RemovalChoice::Files, true)
                 .relative()
                 .overflow_hidden()
                 .when(choice == RemovalChoice::Files, |button| {

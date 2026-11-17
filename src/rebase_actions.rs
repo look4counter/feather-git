@@ -313,21 +313,8 @@ pub fn abort_rebase(path: &Path, expected_head: &str) -> Result<()> {
             Err(error) => return Err(error).context("리베이스 잠금 상태를 확인하지 못했습니다."),
         }
     }
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(repo.workdir().context("작업 폴더가 없습니다.")?)
-        .args(["rebase", "--abort"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
+    let mut command = super::git_command(&repo)?;
+    command.args(["rebase", "--abort"]);
     let output = command
         .output()
         .context("Git을 실행하지 못해 리베이스를 취소할 수 없습니다.")?;
@@ -568,6 +555,27 @@ mod tests {
         checkout(repo, "refs/heads/main");
         (ours, theirs)
     }
+    #[test]
+    fn custom_git_rebase_abort_only_clears_selected_repository() {
+        use super::super::commit_history_actions::tests::{commit as change, custom_fixture};
+        for layout in ["standalone", "shared", "ancestor"] {
+            let (_dir, original, selected, _, base) = custom_fixture(layout);
+            let original_index = std::fs::read(original.path().join("index")).unwrap();
+            let theirs = change(&selected, "incoming\n");
+            selected.reset(selected.find_commit(base).unwrap().as_object(), git2::ResetType::Hard, None).unwrap();
+            let ours = change(&selected, "ours\n");
+            assert!(start_rebase(selected.path(), &request(&selected, theirs, false)).is_err());
+            assert!(is_rebase_state(selected.state()));
+            abort_rebase(selected.path(), &head(&selected).to_string()).unwrap();
+            assert_eq!(selected.state(), RepositoryState::Clean);
+            assert_eq!(selected.head().unwrap().target(), Some(ours));
+            assert_eq!(std::fs::read(selected.workdir().unwrap().join("file.txt")).unwrap(), b"ours\n");
+            assert_eq!(original.head().unwrap().target(), Some(base));
+            assert_eq!(original.state(), RepositoryState::Clean);
+            assert_eq!(std::fs::read(original.path().join("index")).unwrap(), original_index);
+        }
+    }
+
     #[test]
     fn reverse_rebase_rejects_damaged_return_context_before_continuing_or_aborting() {
         let (dir, repo) = fixture();

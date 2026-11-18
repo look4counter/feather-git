@@ -38,6 +38,7 @@ pub struct TextInput {
     read_only: bool,
     secret: bool,
     multiline: bool,
+    compact: bool,
     text_area_scroll: ScrollHandle,
     last_lines: Vec<(usize, ShapedLine)>,
     reveal_cursor: bool,
@@ -61,6 +62,7 @@ impl TextInput {
             read_only: false,
             secret: false,
             multiline: false,
+            compact: false,
             text_area_scroll: ScrollHandle::new(),
             last_lines: Vec::new(),
             reveal_cursor: false,
@@ -74,6 +76,9 @@ impl TextInput {
             is_selecting: false,
             scroll_offset: px(0.),
         }
+    }
+    pub fn compact(cx: &mut Context<Self>) -> Self {
+        Self { compact: true, ..Self::new(cx) }
     }
     pub fn single_line(value: &str, cx: &mut Context<Self>) -> Self {
         let mut input = Self::new(cx);
@@ -893,8 +898,8 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .bg(rgb(self.background_color()))
-            .line_height(px(24.))
-            .text_size(px(13.))
+            .line_height(px(if self.compact { 20. } else { 24. }))
+            .text_size(px(if self.compact { 12. } else { 13. }))
             .text_color(rgb(TEXT))
             .when(self.multiline, |input| {
                 input
@@ -911,7 +916,7 @@ impl Render for TextInput {
                     .into_any_element()
             } else {
                 div()
-                    .h(px(32.))
+                    .h(px(if self.compact { 28. } else { 32. }))
                     .w_full()
                     .p(px(4.))
                     .bg(rgb(self.background_color()))

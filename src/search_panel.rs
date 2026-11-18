@@ -3,7 +3,7 @@ use crate::{
     repository_search::{self, Match},
     text_input::TextInput,
     theme::*,
-    virtual_list::{ListLoading, SingleSelection, panel_message, virtual_list},
+    virtual_list::{ListLoading, ListScrollHandle, SingleSelection, panel_message, virtual_list},
 };
 use gpui::{prelude::*, *};
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ pub struct SearchPanel {
     reads: ReadSlot,
     results: Vec<Match>,
     selection: SingleSelection,
+    scroll: ListScrollHandle,
     error: Option<String>,
     searched: bool,
     enabled: bool,
@@ -64,12 +65,13 @@ impl SearchPanel {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         Self {
             root,
-            editor: cx.new(TextInput::new),
+            editor: cx.new(TextInput::compact),
             revision: 0,
             loading: Default::default(),
             reads: Default::default(),
             results: Vec::new(),
             selection: Default::default(),
+            scroll: Default::default(),
             error: None,
             searched: false,
             enabled: true,
@@ -107,6 +109,7 @@ impl SearchPanel {
             return;
         }
         self.enabled = enabled;
+        self.scroll.set_suspended(!enabled);
         self.editor.update(cx, |editor, cx| {
             editor.enabled = enabled;
             cx.notify();
@@ -115,6 +118,7 @@ impl SearchPanel {
     }
     pub fn deactivate(&mut self) {
         self.enabled = false;
+        self.scroll.set_suspended(true);
         self.reads.cancel();
         self.loading.reset();
         self.revision = self.revision.wrapping_add(1);
@@ -131,6 +135,7 @@ impl SearchPanel {
         let revision = self.revision;
         self.error = None;
         self.selection.clear();
+        self.scroll.reset_for_content();
         self.searched = true;
         self.reads.cancel();
         self.loading.reset();
@@ -218,28 +223,32 @@ impl Render for SearchPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.results.len();
         div().flex().flex_col().flex_1().min_h_0().min_w_0()
-            .child(div().px_3().py_2().flex().gap_2()
+            .child(div().px_3().py_2().flex().items_center().gap_2()
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     let editor = this.editor.read(cx);
                     if search_enter(&event.keystroke, editor.focus_handle.is_focused(window), editor.is_composing(), this.enabled) {
                         this.search(window, cx); cx.stop_propagation();
                     }
                 }))
-                .child(div().flex_1().min_w_0().child(crate::form_controls::input(self.editor.clone())))
-                .child(crate::dialog::button("search-run", "검색", true, self.enabled).on_click(cx.listener(|this, _, window, cx| this.search(window, cx)))))
+                .child(div().flex_1().min_w_0().child(crate::form_controls::input(self.editor.clone()).h(px(30.)).min_h(px(30.))))
+                .child(crate::dialog::button("search-run", "검색", true, self.enabled).h(px(30.)).px_3().text_size(px(12.)).on_click(cx.listener(|this, _, window, cx| this.search(window, cx)))))
             .when(!self.loading.is_pending() && count == 0, |body| body.child(panel_message(self.error.clone().unwrap_or_else(|| if self.searched { "검색 결과가 없습니다.".into() } else { "커밋 메시지·파일 경로·내용을 검색하세요.".into() }))))
             .when(count > 0 || self.loading.is_pending(), |body| body.child(virtual_list(
                 "search-results", count, self.selection.selected(count), PANEL,
                 cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                     range.filter_map(|index| this.results.get(index).map(|result| {
-                        let text = match result { Match::Commit { title, .. } => format!("C  {title}"), Match::File { path, content } => format!("F  {path}{}", if *content { " · 내용 일치" } else { "" }) };
-                        div().id(("search-result", index)).h_full().px_2().flex().items_center().min_w_0()
-                            .child(div().min_w_0().truncate().text_size(px(12.)).child(text))
+                        let (marker, color, text) = match result {
+                            Match::Commit { title, .. } => ("C", 0xe6bc73, title.clone()),
+                            Match::File { path, content } => ("F", ACCENT, format!("{path}{}", if *content { " · 내용 일치" } else { "" })),
+                        };
+                        div().id(("search-result", index)).h_full().px_2().flex().items_center().gap_2().min_w_0().text_size(px(12.))
+                            .child(div().flex_shrink_0().text_color(rgb(color)).child(marker))
+                            .child(div().min_w_0().truncate().child(text))
                             .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, window, cx| this.menu(index, event.position, window, cx)))
                     })).collect::<Vec<_>>()
                 }),
                 cx.processor(|this, index, _, cx| this.select_result(index, cx)),
-            ).loading(self.loading.clone()).keyboard_selection(self.enabled)))
+            ).scroll_handle(self.scroll.clone()).loading(self.loading.clone()).keyboard_selection(self.enabled)))
     }
 }
 

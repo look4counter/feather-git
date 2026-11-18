@@ -9,7 +9,7 @@ pub use tag_actions::create_tag;
 mod reference_actions { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/reference_actions.rs")); }
 pub use reference_actions::{ReferenceDeletion, prepare_reference_deletion, delete_reference, delete_reference_with_remote_tag};
 mod branch_actions { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/branch_actions.rs")); }
-pub use branch_actions::{BranchOutcome, checkout_reference, checkout_commit_branch, create_branch, create_tracking_branch, push_branch};
+pub use branch_actions::{BranchOutcome, checkout_reference, checkout_commit_branch, create_branch, create_tracking_branch, push_branch, push_branch_with_lease};
 mod committing {include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/committing.rs"));}
 pub use committing::{CommitDraft,CommitRequest,CommitOutcome,prepare_commit,commit_staged};
 mod synchronization { include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/synchronization.rs")); }

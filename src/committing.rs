@@ -217,6 +217,29 @@ pub(super) fn push_to(
     remote_name: &str,
     destination: &str,
 ) -> Result<()> {
+    push_to_options(repo, reference, remote_name, destination, None)
+}
+
+pub(super) fn push_to_with_lease(
+    repo: &Repository,
+    reference: &str,
+    remote_name: &str,
+    destination: &str,
+    expected: git2::Oid,
+) -> Result<()> {
+    if !destination.starts_with("refs/heads/") {
+        bail!("안전한 강제 푸시는 브랜치에만 사용할 수 있습니다.");
+    }
+    push_to_options(repo, reference, remote_name, destination, Some(expected))
+}
+
+fn push_to_options(
+    repo: &Repository,
+    reference: &str,
+    remote_name: &str,
+    destination: &str,
+    lease: Option<git2::Oid>,
+) -> Result<()> {
     if !(destination.starts_with("refs/heads/") || destination.starts_with("refs/tags/")) || !git2::Reference::is_valid_name(destination) {
         bail!("푸시 대상 참조 설정을 확인하세요.");
     }
@@ -226,8 +249,17 @@ pub(super) fn push_to(
     let rejected = Arc::new(AtomicBool::new(false));
     let remote_rejected = rejected.clone();
     let mut callbacks = credentials();
+    let lease_rejected = Arc::new(AtomicBool::new(false));
+    let failed_lease = lease_rejected.clone();
     let tag_push = destination.starts_with("refs/tags/");
     callbacks.push_negotiation(move |updates| {
+        // src는 서버 현재 값이며 dst는 전송할 새 값이다.
+        if let Some(expected) = lease
+            && updates.iter().any(|update| update.src() != expected)
+        {
+            failed_lease.store(true, Ordering::Relaxed);
+            return Err(git2::Error::from_str("원격 추적 정보와 서버 상태가 다릅니다."));
+        }
         if tag_push && updates.iter().any(|update| !update.src().is_zero() && update.src() != update.dst()) {
             return Err(git2::Error::from_str("기존 원격 태그는 덮어쓸 수 없습니다."));
         }
@@ -241,8 +273,15 @@ pub(super) fn push_to(
     });
     let mut options = git2::PushOptions::new();
     options.remote_callbacks(callbacks);
-    remote.push(&[format!("{reference}:{destination}")],Some(&mut options))
-        .map_err(|_|anyhow::anyhow!("원격 연결·인증 또는 참조 거부로 푸시하지 못했습니다. 강제 푸시는 수행하지 않았습니다."))?;
+    let prefix = if lease.is_some() { "+" } else { "" };
+    remote.push(&[format!("{prefix}{reference}:{destination}")], Some(&mut options))
+        .map_err(|_| {
+            if lease_rejected.load(Ordering::Relaxed) {
+                anyhow::anyhow!("원격 추적 정보와 서버 상태가 달라 안전한 강제 푸시를 거부했습니다. Fetch 후 원격 변경을 확인하세요.")
+            } else {
+                anyhow::anyhow!("원격 연결·인증 또는 참조 거부로 푸시하지 못했습니다.")
+            }
+        })?;
     if rejected.load(Ordering::Relaxed) {
         bail!("원격 서버가 푸시를 거부했습니다. 원격 참조와 권한을 확인하세요.");
     }

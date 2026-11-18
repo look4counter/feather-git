@@ -3193,7 +3193,10 @@ impl Workspace {
         match (&mut prompt.action, options) {
             (PendingGitAction::Toolbar(workspace_backend::ToolbarAction::RevertCommit { no_commit, .. }), ActionOptions::Revert(value)) => *no_commit = value,
             (PendingGitAction::Toolbar(workspace_backend::ToolbarAction::ResetCommit { mode, .. }), ActionOptions::Reset(value)) => *mode = value,
-            (PendingGitAction::Toolbar(workspace_backend::ToolbarAction::MergeCommit { .. } | workspace_backend::ToolbarAction::RebaseCommit { .. } | workspace_backend::ToolbarAction::Push) | PendingGitAction::Sync(_), ActionOptions::Confirm) => {},
+            (PendingGitAction::Toolbar(workspace_backend::ToolbarAction::MergeCommit { .. } | workspace_backend::ToolbarAction::RebaseCommit { .. }) | PendingGitAction::Sync(_), ActionOptions::Confirm) => {},
+            (PendingGitAction::Toolbar(action @ (workspace_backend::ToolbarAction::Push | workspace_backend::ToolbarAction::PushWithLease)), ActionOptions::Push(value)) => {
+                *action = if value { workspace_backend::ToolbarAction::PushWithLease } else { workspace_backend::ToolbarAction::Push };
+            }
             _ => return None,
         }
         Some(prompt.action)
@@ -3208,7 +3211,7 @@ impl Workspace {
             PendingGitAction::Toolbar(workspace_backend::ToolbarAction::ResetCommit { .. }) => ("Reset", ActionOptions::Reset(repository::ResetMode::Mixed), "선택한 커밋으로 현재 HEAD를 이동합니다.".to_owned()),
             PendingGitAction::Toolbar(workspace_backend::ToolbarAction::MergeCommit { .. }) => ("병합 확인", ActionOptions::Confirm, "선택한 커밋을 현재 브랜치에 병합합니다.".to_owned()),
             PendingGitAction::Toolbar(workspace_backend::ToolbarAction::RebaseCommit { request }) => ("리베이스 확인", ActionOptions::Confirm, request.reverse_branch.as_ref().map_or_else(|| "현재 브랜치를 선택한 커밋 위에 리베이스합니다.".into(), |branch| format!("{branch} 브랜치를 현재 HEAD 위에 리베이스합니다."))),
-            PendingGitAction::Toolbar(workspace_backend::ToolbarAction::Push) => ("Push 확인", ActionOptions::Confirm, "현재 브랜치를 원격 저장소로 Push합니다.".to_owned()),
+            PendingGitAction::Toolbar(workspace_backend::ToolbarAction::Push | workspace_backend::ToolbarAction::PushWithLease) => ("Push 확인", ActionOptions::Push(false), "현재 브랜치를 원격 저장소로 Push합니다.".to_owned()),
             PendingGitAction::Sync(_) => ("Pull 병합 확인", ActionOptions::Confirm, "원격 변경을 가져와 현재 브랜치에 병합합니다.".to_owned()),
             _ => return,
         };
@@ -3289,7 +3292,7 @@ impl Workspace {
             return;
         }
         if matches!(action, workspace_backend::ToolbarAction::RevertCommit { .. } | workspace_backend::ToolbarAction::ResetCommit { .. }
-            | workspace_backend::ToolbarAction::MergeCommit { .. } | workspace_backend::ToolbarAction::RebaseCommit { .. } | workspace_backend::ToolbarAction::Push) {
+            | workspace_backend::ToolbarAction::MergeCommit { .. } | workspace_backend::ToolbarAction::RebaseCommit { .. } | workspace_backend::ToolbarAction::Push | workspace_backend::ToolbarAction::PushWithLease) {
             self.open_git_confirmation(PendingGitAction::Toolbar(action), window, cx);
         } else { self.execute_toolbar_action(action, window, cx); }
     }
@@ -3581,6 +3584,7 @@ impl Workspace {
             | workspace_backend::ToolbarAction::AbortMerge { .. }
             | workspace_backend::ToolbarAction::MergeCommit { .. }
             | workspace_backend::ToolbarAction::Push
+            | workspace_backend::ToolbarAction::PushWithLease
             | workspace_backend::ToolbarAction::ApplyStash { .. }
             | workspace_backend::ToolbarAction::DeleteReference { .. }
             | workspace_backend::ToolbarAction::Checkout { .. } => {
@@ -3637,7 +3641,7 @@ impl Workspace {
             workspace_backend::ToolbarAction::AbortRebase { .. } => "리베이스 취소 중…",
             workspace_backend::ToolbarAction::AbortMerge { .. } => "병합 취소 중…",
             workspace_backend::ToolbarAction::MergeCommit { .. } => "병합 실행 중…",
-            workspace_backend::ToolbarAction::Push => "Push 실행 중…",
+            workspace_backend::ToolbarAction::Push | workspace_backend::ToolbarAction::PushWithLease => "Push 실행 중…",
             workspace_backend::ToolbarAction::ApplyStash { .. } => "스태시 적용 중…",
             workspace_backend::ToolbarAction::CreateStash { .. } => "스태시 생성 중…",
             workspace_backend::ToolbarAction::CreateTag { .. } => "태그 생성 중…",
@@ -11407,10 +11411,14 @@ mod history_operation_tests {
         state.git_action_prompt = Some(push.clone()); assert!(state.repository_busy());
         assert!(state.take_git_confirmation(None).is_none());
         state.git_action_prompt = Some(push.clone());
-        assert!(matches!(state.take_git_confirmation(Some(ActionOptions::Confirm)), Some(PendingGitAction::Toolbar(workspace_backend::ToolbarAction::Push))));
+        assert!(matches!(state.take_git_confirmation(Some(ActionOptions::Push(false))), Some(PendingGitAction::Toolbar(workspace_backend::ToolbarAction::Push))));
+        assert!(state.take_git_confirmation(Some(ActionOptions::Push(false))).is_none());
+        state.git_action_prompt = Some(push.clone());
+        assert!(matches!(state.take_git_confirmation(Some(ActionOptions::Push(true))), Some(PendingGitAction::Toolbar(workspace_backend::ToolbarAction::PushWithLease))));
+        state.git_action_prompt = Some(push.clone());
         assert!(state.take_git_confirmation(Some(ActionOptions::Confirm)).is_none());
         state.git_action_prompt = Some(push.clone()); state.projects[0].head = Some("changed".into());
-        assert!(state.take_git_confirmation(Some(ActionOptions::Confirm)).is_none());
+        assert!(state.take_git_confirmation(Some(ActionOptions::Push(false))).is_none());
         state.projects[0].head = push.head.clone();
         let request = repository::CommitHistoryRequest { target: "selected".into(), expected_head: "head".into(), expected_reference: None };
         for reset in [false, true] {

@@ -1108,6 +1108,7 @@ pub enum ToolbarAction {
     AbortMerge { expected_head: String },
     MergeCommit { id: String },
     Push,
+    PushWithLease,
     ApplyStash {
         request: repository::ReferenceDeletion,
     },
@@ -1183,6 +1184,7 @@ impl ToolbarRequest {
             ToolbarAction::AbortMerge { expected_head } => repository::abort_merge(&self.path, expected_head).map(|()| None),
             ToolbarAction::MergeCommit { id } => repository::merge_commit(&self.path, id).map(|()| None),
             ToolbarAction::Push => repository::push_branch(&self.path).map(|()| None),
+            ToolbarAction::PushWithLease => repository::push_branch_with_lease(&self.path).map(|()| None),
             ToolbarAction::CheckoutCommitBranch { reference, id } => repository::checkout_commit_branch(&self.path, reference, id).map(|()| None),
             ToolbarAction::Checkout { reference } => {
                 repository::checkout_reference(&self.path, reference).map(|()| None)

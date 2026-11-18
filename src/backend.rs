@@ -227,6 +227,7 @@ macro_rules! install {
                     push: bool,
                 ) -> anyhow::Result<Option<String>>;
                 pub fn push_branch(path: &std::path::Path) -> anyhow::Result<()>;
+                pub fn push_branch_with_lease(path: &std::path::Path) -> anyhow::Result<()>;
                 pub fn create_branch(
                     path: &std::path::Path,
                     name: &str,

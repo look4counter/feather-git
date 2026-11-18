@@ -4,6 +4,7 @@ use gpui::{prelude::*, *};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionOptions {
     Confirm,
+    Push(bool),
     Revert(bool),
     Reset(ResetMode),
 }
@@ -17,7 +18,7 @@ impl ActionOptions {
                     .unwrap_or(1);
                 *mode = ResetMode::ALL[(index + if key == "up" { 2 } else { 1 }) % 3];
             }
-            Self::Revert(value) if key == "space" => *value = !*value,
+            Self::Revert(value) | Self::Push(value) if key == "space" => *value = !*value,
             _ => {}
         }
     }
@@ -91,6 +92,25 @@ impl Render for GitActionDialog {
         let mut options = div().flex().flex_col().gap_1().track_focus(&options_focus);
         match self.options {
             ActionOptions::Confirm => {}
+            ActionOptions::Push(checked) => {
+                options = options.child(
+                    crate::form_controls::checkbox(
+                        "push-force-with-lease",
+                        checked,
+                        "안전한 강제 푸시 (--force-with-lease)",
+                        true,
+                    )
+                    .on_click(cx.listener(|this, event, window, cx| {
+                        if crate::form_controls::checkbox_click(event) {
+                            this.controls[0].focus(window);
+                            if let ActionOptions::Push(value) = &mut this.options {
+                                *value = !*value;
+                            }
+                            cx.notify();
+                        }
+                    })),
+                );
+            }
             ActionOptions::Revert(checked) => {
                 options = options.child(
                     crate::form_controls::checkbox(
@@ -198,6 +218,13 @@ mod tests {
         assert_eq!(reset, ActionOptions::Reset(ResetMode::Soft));
         reset.key("up");
         assert_eq!(reset, ActionOptions::Reset(ResetMode::Hard));
+        let mut push = ActionOptions::Push(false);
+        push.key("space");
+        assert_eq!(push, ActionOptions::Push(true));
+        push.key("space");
+        assert_eq!(push, ActionOptions::Push(false));
+        push.key("enter");
+        assert_eq!(push, ActionOptions::Push(false));
         let mut revert = ActionOptions::Revert(false);
         revert.key("space");
         assert_eq!(revert, ActionOptions::Revert(true));

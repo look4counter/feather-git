@@ -1,4 +1,4 @@
-use super::{committing::push_to, credentials, open_exact};
+use super::{committing::{push_to, push_to_with_lease}, credentials, open_exact};
 use anyhow::{Context, Result, bail};
 use git2::{Branch, RepositoryState};
 use std::path::Path;
@@ -9,6 +9,14 @@ pub struct BranchOutcome {
 }
 
 pub fn push_branch(path: &Path) -> Result<()> {
+    push_branch_options(path, false)
+}
+
+pub fn push_branch_with_lease(path: &Path) -> Result<()> {
+    push_branch_options(path, true)
+}
+
+fn push_branch_options(path: &Path, force_with_lease: bool) -> Result<()> {
     let repo = open_exact(path)?;
     let head = match repo.head() {
         Ok(head) => head,
@@ -32,7 +40,26 @@ pub fn push_branch(path: &Path) -> Result<()> {
     let (remote, destination) = upstream
         .clone()
         .unwrap_or_else(|| ("origin".into(), reference.into()));
-    if !push_is_empty(&repo, reference, &remote, &destination)? {
+    if force_with_lease {
+        // 네트워크 연결 전에 로컬 추적 값을 고정한다.
+        let configured_remote = repo.find_remote(&remote)
+            .context("푸시할 원격 저장소를 찾지 못했습니다.")?;
+        let tracking = configured_remote.refspecs()
+            .find(|spec| spec.direction() == git2::Direction::Fetch && spec.src_matches(&destination))
+            .map(|spec| spec.transform(&destination)).transpose()?;
+        let expected = match tracking {
+            Some(tracking) => {
+                let name = tracking.as_str().context("원격 추적 참조 이름을 읽지 못했습니다.")?;
+                match repo.refname_to_id(name) {
+                    Ok(id) => id,
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => git2::Oid::ZERO_SHA1,
+                    Err(error) => return Err(error).context("원격 추적 참조를 읽지 못했습니다."),
+                }
+            }
+            None => git2::Oid::ZERO_SHA1,
+        };
+        push_to_with_lease(&repo, reference, &remote, &destination, expected)?;
+    } else if !push_is_empty(&repo, reference, &remote, &destination)? {
         push_to(&repo, reference, &remote, &destination)?;
     }
     if upstream.is_none() {
@@ -317,6 +344,59 @@ mod tests {
         assert!(result.error.is_some());
         assert!(repo.find_reference("refs/heads/created").is_ok());
         assert_eq!(repo.head().unwrap().name().unwrap(), "refs/heads/main");
+    }
+    #[test]
+    fn force_with_lease_rewrites_only_when_tracking_matches_remote() {
+        let (dir, repo) = fixture();
+        let first = file_commit(&repo, "first");
+        let remote = Repository::init_bare(dir.path().join("remote")).unwrap();
+        repo.remote("origin", remote.path().to_str().unwrap()).unwrap();
+        let path = repo.workdir().unwrap();
+        push_branch_with_lease(path).unwrap();
+        assert_eq!(repo.config().unwrap().get_string("branch.main.remote").unwrap(), "origin");
+        assert_eq!(repo.config().unwrap().get_string("branch.main.merge").unwrap(), "refs/heads/main");
+        let second = file_commit(&repo, "second");
+        push_branch(path).unwrap();
+        repo.reference("refs/heads/main", first, true, "rewrite").unwrap();
+        let rewritten = file_commit(&repo, "rewritten");
+        assert!(push_branch(path).is_err());
+        push_branch_with_lease(path).unwrap();
+        assert_eq!(remote.refname_to_id("refs/heads/main").unwrap(), rewritten);
+        assert_ne!(second, rewritten);
+        let server = file_commit(&repo, "server");
+        push_branch(path).unwrap();
+        repo.reference("refs/remotes/origin/main", rewritten, true, "stale").unwrap();
+        repo.reference("refs/heads/main", first, true, "rewrite").unwrap();
+        file_commit(&repo, "stale rewrite");
+        let error = push_branch_with_lease(path).unwrap_err().to_string();
+        assert!(error.contains("원격 추적"), "{error}");
+        assert_eq!(remote.refname_to_id("refs/heads/main").unwrap(), server);
+        assert_eq!(repo.refname_to_id("refs/remotes/origin/main").unwrap(), rewritten);
+        remote.find_reference("refs/heads/main").unwrap().delete().unwrap();
+        assert!(push_branch_with_lease(path).is_err());
+        assert!(remote.find_reference("refs/heads/main").is_err());
+    }
+
+    #[test]
+    fn force_with_lease_missing_tracking_only_creates_absent_remote_branch() {
+        let (dir, repo) = fixture();
+        let first = file_commit(&repo, "first");
+        let remote = Repository::init_bare(dir.path().join("remote")).unwrap();
+        repo.remote("custom", remote.path().to_str().unwrap()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("branch.main.remote", "custom").unwrap();
+        config.set_str("branch.main.merge", "refs/heads/target").unwrap();
+        config.set_str("remote.custom.fetch", "+refs/heads/*:refs/remotes/mapped/*").unwrap();
+        let path = repo.workdir().unwrap();
+        push_branch_with_lease(path).unwrap();
+        assert_eq!(remote.refname_to_id("refs/heads/target").unwrap(), first);
+        let second = file_commit(&repo, "second");
+        repo.find_reference("refs/remotes/mapped/target").unwrap().delete().unwrap();
+        assert!(push_branch_with_lease(path).is_err());
+        assert_eq!(remote.refname_to_id("refs/heads/target").unwrap(), first);
+        repo.reference("refs/remotes/mapped/target", first, true, "known").unwrap();
+        push_branch_with_lease(path).unwrap();
+        assert_eq!(remote.refname_to_id("refs/heads/target").unwrap(), second);
     }
     #[test]
     fn initial_push_sets_upstream_existing_upstream_is_used_and_rejection_is_safe() {

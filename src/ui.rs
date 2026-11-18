@@ -414,6 +414,15 @@ fn copy_paths_shortcut(key: &gpui::Keystroke) -> bool {
         && !key.modifiers.function
 }
 
+fn select_all_files_shortcut(key: &gpui::Keystroke) -> bool {
+    key.key == "a"
+        && key.modifiers.control
+        && !key.modifiers.shift
+        && !key.modifiers.alt
+        && !key.modifiers.platform
+        && !key.modifiers.function
+}
+
 fn discard_shortcut(key: &gpui::Keystroke) -> bool {
     key.key == "d"
         && key.modifiers.control
@@ -5743,15 +5752,31 @@ impl Workspace {
         Some(workspace_backend::ToolbarAction::Refresh { selected_files })
     }
 
+    fn select_all_worktree_files(&mut self) -> bool {
+        if self.file_history
+            || self.footer_actions_blocked()
+            || self.panel_waiting
+            || self.start_tab_active
+            || !self.open_projects.contains(&self.project)
+            || self.viewer_files.is_err()
+        {
+            return false;
+        }
+        let count = self.changed_files().len();
+        self.file_selection.restore(0..count, count);
+        true
+    }
+
     fn files_key_down(
         &mut self,
         event: &gpui::KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let select_all = select_all_files_shortcut(&event.keystroke);
         let discard = discard_shortcut(&event.keystroke);
         let copy_paths = copy_paths_shortcut(&event.keystroke);
-        if (!plain_space(&event.keystroke) && !discard && !copy_paths)
+        if (!plain_space(&event.keystroke) && !discard && !copy_paths && !select_all)
             || !window.is_window_active()
             || !self
                 .panel_focus
@@ -5764,7 +5789,12 @@ impl Workspace {
         {
             return;
         }
-        if copy_paths {
+        if select_all {
+            if self.select_all_worktree_files() {
+                cx.notify();
+                cx.stop_propagation();
+            }
+        } else if copy_paths {
             self.copy_file_paths(self.project, self.panel_revision, self.file_history, cx);
             cx.stop_propagation();
         } else if discard {
@@ -8182,6 +8212,59 @@ mod tab_tests {
     }
 
     #[test]
+    fn select_all_shortcut_requires_only_control_a() {
+        assert!(select_all_files_shortcut(&gpui::Keystroke::parse("ctrl-a").unwrap()));
+        for key in ["a", "ctrl-shift-a", "ctrl-alt-a", "cmd-a", "ctrl-d"] {
+            assert!(!select_all_files_shortcut(&gpui::Keystroke::parse(key).unwrap()), "{key}");
+        }
+    }
+
+    #[test]
+    fn select_all_worktree_files_handles_repeated_empty_and_blocked_states() {
+        let (_repos, mut state) = workspace_with_repositories();
+        let template = state.viewer_files.as_ref().unwrap()[0].clone();
+        let files: Vec<_> = (0..100).map(|index| {
+            let mut file = template.clone();
+            file.path = format!("file-{index}.txt").into_bytes();
+            file.label = format!("file-{index}.txt");
+            file.staged = index % 2 == 0;
+            file
+        }).collect();
+        state.projects[state.project].files = workspace_backend::changed_files(&files, false);
+        state.viewer_files = Ok(files.clone());
+        state.file_selection.select(3, files.len());
+        let count = state.changed_files().len();
+        assert_eq!(count, 100);
+        assert!(state.select_all_worktree_files());
+        assert_eq!(state.file_selection.indices(count), (0..count).collect::<Vec<_>>());
+        let ViewerTarget::Files { files: targets, .. } = state.viewer_target() else {
+            panic!("다중 파일 뷰어로 연결되어야 합니다.");
+        };
+        assert_eq!(targets, files);
+        assert!(state.select_all_worktree_files());
+        let before = state.file_selection.clone();
+        state.file_history = true;
+        assert!(!state.select_all_worktree_files());
+        state.file_history = false;
+        state.panel_waiting = true;
+        assert!(!state.select_all_worktree_files());
+        state.panel_waiting = false;
+        state.footer_action_busy = true;
+        assert!(!state.select_all_worktree_files());
+        state.footer_action_busy = false;
+        state.start_tab_active = true;
+        assert!(!state.select_all_worktree_files());
+        state.start_tab_active = false;
+        state.viewer_files = Err("읽기 실패".into());
+        assert!(!state.select_all_worktree_files());
+        assert_eq!(state.file_selection, before);
+        state.viewer_files = Ok(Vec::new());
+        state.projects[state.project].files.clear();
+        assert!(state.select_all_worktree_files());
+        assert!(state.file_selection.indices(count).is_empty());
+    }
+
+    #[test]
     fn worktree_modifier_selection_drives_multiple_targets_and_restores_identities() {
         let (_repos, mut state) = workspace_with_repositories();
         let project = state.project;
@@ -8575,8 +8658,19 @@ mod tab_tests {
     #[test]
     fn files_space_requests_require_current_worktree_selection_and_idle_state() {
         let (_repos, mut state) = workspace_with_repositories();
+        let template = state.viewer_files.as_ref().unwrap()[0].clone();
+        let files: Vec<_> = (0..100).map(|index| {
+            let mut file = template.clone();
+            file.path = format!("file-{index}.txt").into_bytes();
+            file.label = format!("file-{index}.txt");
+            file.staged = index % 2 == 0;
+            file
+        }).collect();
+        state.projects[state.project].files = workspace_backend::changed_files(&files, false);
+        state.viewer_files = Ok(files.clone());
+        state.file_selection.select(3, files.len());
         let count = state.changed_files().len();
-        assert!(count > 0);
+        assert_eq!(count, 100);
         assert!(state.selected_stage_requests().is_none());
         state.file_selection.select(0, count);
         assert!(state.selected_stage_requests().is_some());

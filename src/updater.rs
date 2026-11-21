@@ -85,7 +85,8 @@ impl Release {
 
 fn client(hosts: &'static [&'static str]) -> Result<avatar_http::blocking::Client> {
     use avatar_http::redirect::Policy;
-    Ok(avatar_http::blocking::Client::builder()
+    let mut builder = avatar_http::blocking::Client::builder()
+        .use_native_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(180))
         .user_agent(concat!("FeatherGit/", env!("CARGO_PKG_VERSION")))
@@ -100,8 +101,11 @@ fn client(hosts: &'static [&'static str]) -> Result<avatar_http::blocking::Clien
             } else {
                 attempt.error("허용되지 않은 업데이트 리디렉션")
             }
-        }))
-        .build()?)
+        }));
+    for certificate in crate::update_certificates::certificates()? {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder.build()?)
 }
 
 pub fn check() -> Result<Option<Release>> {

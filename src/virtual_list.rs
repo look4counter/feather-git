@@ -34,6 +34,44 @@ pub struct ListScrollHandle {
 }
 
 impl ListScrollHandle {
+    pub fn for_vertical_scroll(base: ScrollHandle) -> Self {
+        let scroll = Self::default();
+        scroll.vertical.0.borrow_mut().base_handle = base;
+        scroll
+    }
+
+    pub fn vertical_scroll_view(&self, content: impl IntoElement) -> gpui::Div {
+        let drag = self.clone();
+        let wheel = self.clone();
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .pr(px(SCROLLBAR))
+            .child(content)
+            .child(
+                self.scrollbar(ScrollAxis::Vertical, 0., Visibility::default(), 0.)
+                    .child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |_, _, window, _| {
+                                drag.register_drag_events(window);
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .on_scroll_wheel(move |event, window, cx| {
+                        if wheel.wheel(event, false) {
+                            cx.stop_propagation();
+                            window.refresh();
+                        }
+                    }),
+            )
+    }
+
     /// 새 내용의 위치를 초기화하고 측정된 뷰포트를 유지합니다.
     pub fn reset_for_content(&mut self) {
         *self = Self {
@@ -194,7 +232,7 @@ impl ListScrollHandle {
         true
     }
 
-    fn register_events(&self, window: &mut Window, horizontal: bool) {
+    fn register_drag_events(&self, window: &mut Window) {
         let state = self.clone();
         window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if phase != DispatchPhase::Capture || state.drag.get().is_none() {
@@ -229,6 +267,10 @@ impl ListScrollHandle {
             cx.stop_propagation();
             window.refresh();
         });
+    }
+
+    fn register_events(&self, window: &mut Window, horizontal: bool) {
+        self.register_drag_events(window);
         let state = self.clone();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase != DispatchPhase::Capture
@@ -262,7 +304,9 @@ impl ListScrollHandle {
                 ScrollAxis::Horizontal => "horizontal-scroll",
             })
             .absolute()
-            .bg(rgb(BASE))
+            .when(visible.vertical || visible.horizontal, |bar| {
+                bar.bg(rgb(BASE))
+            })
             .cursor_pointer()
             .occlude()
             .when(axis == ScrollAxis::Vertical, |bar| {
@@ -284,6 +328,9 @@ impl ListScrollHandle {
                         let Some((bounds, thumb)) = paint.thumb(axis) else {
                             return;
                         };
+                        if thumb.maximum <= 0. {
+                            return;
+                        }
                         let rectangle = match axis {
                             ScrollAxis::Vertical => Bounds::new(
                                 bounds.origin + point(px(2.), px(thumb.start)),
@@ -323,12 +370,10 @@ impl ListScrollHandle {
                 window.refresh();
             })
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
-                if press.suspended.get() {
-                    return;
+                if press.begin_drag(axis, event.position) {
+                    cx.stop_propagation();
+                    window.refresh();
                 }
-                press.begin_drag(axis, event.position);
-                cx.stop_propagation();
-                window.refresh();
             })
     }
 }

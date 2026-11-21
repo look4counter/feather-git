@@ -49,6 +49,8 @@ mod text_selection;
 mod theme;
 mod ui;
 #[cfg(windows)]
+mod update_certificates;
+#[cfg(windows)]
 mod update_dialog;
 #[cfg(windows)]
 mod updater;

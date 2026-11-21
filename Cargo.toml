@@ -19,6 +19,7 @@ gpui_http_client = "0.2.2"
 avatar_http = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
 
 [target.'cfg(windows)'.dependencies]
+avatar_http = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = ["native-tls"] }
 windows = { version = "0.62.2", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 roxmltree = "0.20.0"
 semver = "1.0.28"

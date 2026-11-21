@@ -441,6 +441,7 @@ impl AvatarClient {
             .name("avatar-images".into())
             .spawn(move || {
                 let client = avatar_http::blocking::Client::builder()
+                    .use_rustls_tls()
                     .timeout(Duration::from_secs(3))
                     .redirect(avatar_http::redirect::Policy::custom(|attempt| {
                         let original = attempt.previous().first();

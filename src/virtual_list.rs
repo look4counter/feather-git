@@ -347,10 +347,14 @@ struct ListLoadingState {
 
 impl ListLoading {
     pub fn begin(&self, revision: u64, now: Instant) {
+        self.begin_retaining(revision);
+        self.0.borrow_mut().loading.begin(revision, now);
+    }
+
+    /// 기존 내용을 보존하는 목록에서 안내 없이 입력만 차단합니다.
+    pub fn begin_retaining(&self, revision: u64) {
         self.reset();
-        let mut state = self.0.borrow_mut();
-        state.revision = Some(revision);
-        state.loading.begin(revision, now);
+        self.0.borrow_mut().revision = Some(revision);
     }
 
     pub fn reset(&self) {
@@ -1288,6 +1292,18 @@ mod loading_tests {
         let weak = Rc::downgrade(&loading.0);
         drop(loading);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn retained_refresh_blocks_selection_without_replacing_content() {
+        let loading = ListLoading::default();
+        let now = Instant::now();
+        loading.begin_retaining(1);
+        assert!(loading.is_pending());
+        assert!(!loading.reveal(1, now + crate::loading::LOADING_DELAY));
+        assert!(!loading.replaces_content(true));
+        loading.reset();
+        assert!(!loading.is_pending());
     }
 
     #[test]

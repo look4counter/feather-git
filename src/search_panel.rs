@@ -25,6 +25,7 @@ pub struct SearchPanel {
     error: Option<String>,
     searched: bool,
     enabled: bool,
+    button_enabled: bool,
 }
 fn search_enter(key: &Keystroke, focused: bool, composing: bool, enabled: bool) -> bool {
     let modifiers = key.modifiers;
@@ -75,6 +76,7 @@ impl SearchPanel {
             error: None,
             searched: false,
             enabled: true,
+            button_enabled: true,
         }
     }
     pub fn search_pending(&self) -> bool {
@@ -108,16 +110,19 @@ impl SearchPanel {
         }
         cx.notify();
     }
-    pub fn set_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.enabled == enabled {
+    pub fn set_enabled(&mut self, enabled: bool, button_enabled: bool, cx: &mut Context<Self>) {
+        if self.enabled == enabled && self.button_enabled == button_enabled {
             return;
         }
-        self.enabled = enabled;
-        self.scroll.set_suspended(!enabled);
-        self.editor.update(cx, |editor, cx| {
-            editor.enabled = enabled;
-            cx.notify();
-        });
+        self.button_enabled = button_enabled;
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.scroll.set_suspended(!enabled);
+            self.editor.update(cx, |editor, cx| {
+                editor.enabled = enabled;
+                cx.notify();
+            });
+        }
         cx.notify();
     }
     pub fn deactivate(&mut self) {
@@ -235,7 +240,7 @@ impl Render for SearchPanel {
                     }
                 }))
                 .child(div().flex_1().min_w_0().child(crate::form_controls::input(self.editor.clone()).h(px(30.)).min_h(px(30.))))
-                .child(crate::dialog::button("search-run", "검색", true, self.enabled).h(px(30.)).px_3().text_size(px(12.)).on_click(cx.listener(|this, _, window, cx| this.search(window, cx)))))
+                .child(crate::dialog::button("search-run", "검색", true, self.button_enabled).h(px(30.)).px_3().text_size(px(12.)).on_click(cx.listener(|this, _, window, cx| this.search(window, cx)))))
             .when(!self.loading.is_pending() && count == 0, |body| body.child(panel_message(self.error.clone().unwrap_or_else(|| if self.searched { "검색 결과가 없습니다.".into() } else { "커밋 메시지·파일 경로·내용을 검색하세요.".into() }))))
             .when(count > 0 || self.loading.is_pending(), |body| body.child(virtual_list(
                 "search-results", count, self.selection.selected(count), PANEL,

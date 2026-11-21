@@ -17,6 +17,7 @@ pub struct SplitButton {
     options: Vec<SharedString>,
     selected: usize,
     enabled: bool,
+    appearance_enabled: Option<bool>,
     busy: bool,
     execute: Option<Execute>,
     select: Option<Select>,
@@ -36,6 +37,7 @@ impl SplitButton {
             options,
             selected,
             enabled: true,
+            appearance_enabled: None,
             busy: false,
             execute: None,
             select: None,
@@ -43,6 +45,10 @@ impl SplitButton {
     }
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        self
+    }
+    pub fn appearance_enabled(mut self, enabled: bool) -> Self {
+        self.appearance_enabled = Some(enabled);
         self
     }
     pub fn busy(mut self, busy: bool) -> Self {
@@ -61,6 +67,7 @@ impl SplitButton {
 impl RenderOnce for SplitButton {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
         let enabled = self.enabled && !self.busy;
+        let appearance_enabled = self.appearance_enabled.unwrap_or(self.enabled) && !self.busy;
         let can_execute = enabled && self.execute.is_some();
         let can_select = enabled
             && self.select.is_some()
@@ -81,7 +88,7 @@ impl RenderOnce for SplitButton {
             .rounded_md()
             .overflow_hidden()
             .text_color(rgb(TEXT))
-            .when(!enabled, |button| button.opacity(0.45))
+            .when(!appearance_enabled, |button| button.opacity(0.45))
             .child(
                 canvas(
                     |_, _, _| (),

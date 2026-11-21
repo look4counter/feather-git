@@ -986,11 +986,17 @@ impl Workspace {
     }
 
     fn delayed_progress_pending(&self, cx: &gpui::App) -> bool {
-        self.file_stage_busy
-            || self.viewer.as_ref().is_some_and(|viewer| {
-                viewer.read(cx).worktree_write_pending(cx)
-            })
-            || (self.screen() == WorkspaceScreen::Project
+        self.delayed_worktree_edit_pending(cx) || self.search_progress_pending(cx)
+    }
+
+    fn delayed_worktree_edit_pending(&self, cx: &gpui::App) -> bool {
+        self.file_stage_busy || self.viewer.as_ref().is_some_and(|viewer| {
+            viewer.read(cx).worktree_write_pending(cx)
+        })
+    }
+
+    fn search_progress_pending(&self, cx: &gpui::App) -> bool {
+        self.screen() == WorkspaceScreen::Project
                 && self.repository_tab == RepositoryTab::Search
                 && self.search_owner == Some(self.project)
                 && self.search_panel.as_ref().is_some_and(|panel| {
@@ -1000,7 +1006,7 @@ impl Workspace {
                             .path
                             .as_deref()
                             .is_some_and(|root| panel.is_for(root))
-                }))
+                })
     }
 
     fn update_delayed_progress(&mut self, cx: &mut Context<Self>) {
@@ -1033,11 +1039,14 @@ impl Workspace {
     }
 
     fn repository_busy(&self) -> bool {
+        self.file_stage_busy || self.repository_busy_except_file_edit()
+    }
+
+    fn repository_busy_except_file_edit(&self) -> bool {
         self.git_action_prompt.is_some() || self.checkout_branch_prompt.is_some()
             || self.merge_abort_confirmation.is_some()
             || self.reference_delete.is_some()
             || self.checkout_confirmation.is_some()
-            || self.file_stage_busy
             || self.commit_busy
             || self.commit_dialog.is_some()
             || self.branch_dialog.is_some()
@@ -1744,28 +1753,32 @@ impl Workspace {
     }
 
     fn refresh_file_data(&mut self) {
-        self.request_file_data(true);
+        self.request_file_data(false);
     }
 
-    fn request_file_data(&mut self, prepare_history: bool) {
-        let (files, detail) = self.display_file_list();
-        let previous = (files.to_vec(), detail);
+    fn request_file_data(&mut self, preserve_worktree: bool) {
+        let previous = (!preserve_worktree).then(|| {
+            let (files, detail) = self.display_file_list();
+            (files.to_vec(), detail)
+        });
         for ((kind, project, _), scroll) in &self.panel_scrolls {
             if *kind == "files" && *project == self.project {
                 scroll.cancel_drag();
             }
         }
         self.invalidate_file_request();
-        self.file_selection.clear();
-        self.history_files = Ok(Vec::new());
-        self.viewer_files = Ok(Vec::new());
+        if !preserve_worktree {
+            self.file_selection.clear();
+            self.history_files = Ok(Vec::new());
+            self.viewer_files = Ok(Vec::new());
+        }
         let Some(project) = self.projects.get_mut(self.project) else {
             return;
         };
-        if !self.file_history {
+        if !preserve_worktree && !self.file_history {
             project.files.clear();
         }
-        let graph = (prepare_history
+        let graph = (!preserve_worktree
             && self
                 .histories
                 .get(&self.project)
@@ -1783,10 +1796,14 @@ impl Workspace {
             graph,
             selected_files: Vec::new(),
         });
-        self.retained_file_list = Some(previous);
+        self.retained_file_list = previous;
+        self.viewer_refresh_pending = preserve_worktree;
         self.panel_waiting = true;
-        self.panel_loading
-            .begin(self.panel_revision, std::time::Instant::now());
+        if preserve_worktree && !self.changed_files().is_empty() {
+            self.panel_loading.begin_retaining(self.panel_revision);
+        } else {
+            self.panel_loading.begin(self.panel_revision, Instant::now());
+        }
     }
 
     fn finish_panel(&mut self, result: PanelResult) -> bool {
@@ -1827,6 +1844,8 @@ impl Workspace {
                     .position(|file| &file.path == path && file.staged == *staged)
             });
             self.file_selection.restore(rows, files.len());
+        } else {
+            self.file_selection.clear();
         }
         true
     }
@@ -2137,16 +2156,27 @@ impl Workspace {
         self.save_session();
     }
     fn footer_actions_blocked(&self) -> bool {
+        self.file_stage_busy || self.footer_actions_blocked_except_file_edit()
+    }
+
+    fn footer_actions_blocked_except_file_edit(&self) -> bool {
         self.checkout_branch_prompt.is_some()
             || self.merge_abort_confirmation.is_some()
             || self.reference_delete.is_some()
             || self.checkout_confirmation.is_some()
             || self.restoring
-            || self.repository_busy()
+            || self.repository_busy_except_file_edit()
             || self.alert.is_some()
             || self.repository_dialog.is_some()
             || self.footer_action_busy
     }
+    fn chrome_actions_enabled(&self, cx: &gpui::App) -> bool {
+        !self.footer_actions_blocked_except_file_edit()
+            && !self.viewer.as_ref().is_some_and(|viewer| {
+                viewer.read(cx).conflict_write_pending(cx)
+            })
+    }
+
     fn footer_directory(&self) -> Option<std::path::PathBuf> {
         if self.restoring || self.start_tab_active || !self.open_projects.contains(&self.project) {
             return None;
@@ -2353,12 +2383,8 @@ impl Workspace {
             .as_ref()
             .filter(|path| !self.notice.is_empty() && **path != self.notice)
             .map(|_| self.notice.clone());
-        let viewer_busy = self
-            .viewer
-            .as_ref()
-            .is_some_and(|viewer| viewer.read(cx).is_busy(cx));
-        let folder_enabled = self.directory_action_context().is_some() && !viewer_busy;
-        let encoding_enabled = !self.footer_actions_blocked() && !viewer_busy;
+        let encoding_enabled = self.chrome_actions_enabled(cx);
+        let folder_enabled = directory.is_some() && encoding_enabled;
         row()
             .h(px(32.))
             .flex_shrink_0()
@@ -3762,7 +3788,7 @@ impl Workspace {
                 this.progress_focus = None;
                 if refreshing && completed && this.repository_tab == RepositoryTab::Search && this.search_owner == Some(this.project)
                     && let Some(panel) = this.search_panel.clone() {
-                    panel.update(cx, |panel, cx| { panel.set_enabled(true, cx); panel.refresh(window, cx); });
+                    panel.update(cx, |panel, cx| { panel.set_enabled(true, true, cx); panel.refresh(window, cx); });
                 }
                 let previous = this.progress_previous_focus.take();
                 if let Some(dialog) = this.branch_dialog.clone() {
@@ -3873,6 +3899,7 @@ impl Workspace {
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
         let execute_owner = cx.weak_entity();
         let select_owner = cx.weak_entity();
+        let enabled = self.footer_directory().is_some() && self.chrome_actions_enabled(cx);
         let selected = repository::SyncMode::OPTIONS
             .iter()
             .position(|mode| *mode == self.selected_sync_mode)
@@ -3891,11 +3918,11 @@ impl Workspace {
                     "commit-button",
                     "Commit",
                     crate::split_button::commit_icon(),
-                    self.sync_available(cx),
+                    enabled,
                 )
                 .rounded_md()
                 .overflow_hidden()
-                .when(!self.sync_available(cx), |button| button.opacity(0.45))
+                .when(!enabled, |button| button.opacity(0.45))
                 .on_click(cx.listener(|this, _, window, cx| this.open_commit_dialog(window, cx))),
             )
             .child(
@@ -3914,6 +3941,7 @@ impl Workspace {
                     selected,
                 )
                 .enabled(self.sync_available(cx))
+                .appearance_enabled(enabled)
                 .busy(self.sync_busy)
                 .on_execute(move |window, cx| {
                     let _ = execute_owner.update(cx, |this, cx| {
@@ -3936,11 +3964,11 @@ impl Workspace {
                     "push-button",
                     "Push",
                     crate::split_button::push_icon(),
-                    self.sync_available(cx),
+                    enabled,
                 )
                 .rounded_md()
                 .overflow_hidden()
-                .when(!self.sync_available(cx), |button| button.opacity(0.45))
+                .when(!enabled, |button| button.opacity(0.45))
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.start_toolbar_action(workspace_backend::ToolbarAction::Push, window, cx)
                 })),
@@ -3950,11 +3978,11 @@ impl Workspace {
                     "branch-button",
                     "Branch",
                     crate::split_button::branch_icon(),
-                    self.sync_available(cx),
+                    enabled,
                 )
                 .rounded_md()
                 .overflow_hidden()
-                .when(!self.sync_available(cx), |button| button.opacity(0.45))
+                .when(!enabled, |button| button.opacity(0.45))
                 .on_click(cx.listener(|this, _, window, cx| this.open_branch_dialog(window, cx))),
             )
             .child(
@@ -3962,11 +3990,11 @@ impl Workspace {
                     "stash-button",
                     "Stash",
                     crate::split_button::stash_icon(),
-                    self.sync_available(cx),
+                    enabled,
                 )
                 .rounded_md()
                 .overflow_hidden()
-                .when(!self.sync_available(cx), |button| button.opacity(0.45))
+                .when(!enabled, |button| button.opacity(0.45))
                 .on_click(cx.listener(|this, _, window, cx| this.open_stash_dialog(window, cx))),
             )
     }
@@ -4766,8 +4794,10 @@ impl Workspace {
             }));
             self.search_owner = Some(owner); self.search_panel = Some(panel);
         }
-        let panel = self.search_panel.as_ref().unwrap().clone(); let enabled = !self.footer_actions_blocked();
-        panel.update(cx, |panel, cx| panel.set_enabled(enabled, cx));
+        let panel = self.search_panel.as_ref().unwrap().clone();
+        let enabled = !self.footer_actions_blocked() && !self.delayed_worktree_edit_pending(cx);
+        let button_enabled = self.chrome_actions_enabled(cx);
+        panel.update(cx, |panel, cx| panel.set_enabled(enabled, button_enabled, cx));
         div().flex().flex_col().flex_1().min_h_0().child(heading("저장소", "GIT")).child(self.panel_tabs(false, cx)).child(panel)
     }
 
@@ -5125,7 +5155,8 @@ impl Workspace {
         )
         .keyboard_selected(self.file_list_selected_row())
         .scroll_handle(list_scroll)
-        .loading(self.panel_loading.clone());
+        .loading(self.panel_loading.clone())
+        .keep_content_while_loading(self.viewer_refresh_pending && !files.is_empty());
         div()
             .flex()
             .flex_col()
@@ -5783,7 +5814,7 @@ impl Workspace {
                         .collect()
                 })
                 .unwrap_or_default();
-            self.request_file_data(false);
+            self.request_file_data(true);
             if let Some(request) = &mut self.panel_pending {
                 request.selected_files = selected;
             }
@@ -6502,8 +6533,10 @@ impl Workspace {
         let refresh = self.viewer_refresh_pending && !self.panel_waiting;
         if refresh { self.viewer_refresh_pending = false; }
         let viewer = self.viewer.as_ref().unwrap().clone();
-        let interactive =
-            self.repository_dialog.is_none() && self.alert.is_none() && !self.repository_busy();
+        let interactive = self.repository_dialog.is_none()
+            && self.alert.is_none()
+            && !self.repository_busy()
+            && !(self.panel_waiting && self.viewer_refresh_pending);
         viewer.update(cx, |this, cx| {
             this.set_interactive(interactive);
             if refresh { this.refresh_target(target, window, cx); } else { this.set_target(target, window, cx); }
@@ -8400,8 +8433,16 @@ mod tab_tests {
         assert!(matches!(state.viewer_target(), ViewerTarget::Text { .. }));
         state.file_selection.restore([1, 4], 6);
         let root = state.projects[project].path.clone().unwrap();
+        let before = state.viewer_target();
         state.viewer_changed(&ViewerChanged { root });
-        let request = state.panel_pending.take().unwrap();
+        assert!(state.panel_waiting);
+        assert_eq!(state.file_selection.indices(6), [1, 4]);
+        assert_eq!(state.viewer_target(), before);
+        assert!(state.viewer_refresh_pending);
+        assert!(state.panel_loading.is_pending());
+        assert!(!state.panel_loading.reveal(state.panel_revision, Instant::now() + LOADING_DELAY));
+        assert!(state.selected_stage_requests().is_none());
+        let mut request = state.panel_pending.take().unwrap();
         assert_eq!(
             request.selected_files,
             [
@@ -8410,7 +8451,9 @@ mod tab_tests {
             ]
         );
         assert!(request.graph.is_none());
-        let reversed: Vec<_> = files.iter().cloned().rev().collect();
+        let mut reversed: Vec<_> = files.iter().cloned().rev().collect();
+        reversed[1].staged = true;
+        request.selected_files[1].1 = true;
         assert!(state.finish_panel(PanelResult {
             work_state: Ok(Default::default()),
             displayed_files: Ok(workspace_backend::changed_files(&reversed, false)),
@@ -8422,7 +8465,22 @@ mod tab_tests {
         let ViewerTarget::Files { files: targets, .. } = state.viewer_target() else {
             panic!("다중 선택이 복원되어야 합니다.");
         };
-        assert_eq!(targets, [files[4].clone(), files[1].clone()]);
+        let mut staged = files[4].clone();
+        staged.staged = true;
+        assert_eq!(targets, [staged, files[1].clone()]);
+
+        let root = state.projects[project].path.clone().unwrap();
+        state.viewer_changed(&ViewerChanged { root });
+        let request = state.panel_pending.take().unwrap();
+        assert!(state.finish_panel(PanelResult {
+            request,
+            work_state: Ok(Default::default()),
+            files: Err("read failed".into()),
+            history: None,
+            displayed_files: Err("read failed".into()),
+        }));
+        assert!(state.file_selection.indices(6).is_empty());
+        assert!(matches!(state.viewer_target(), ViewerTarget::Text { lines, .. } if lines == ["read failed"]));
         state.file_history = true;
         state.history_files = Ok(workspace_backend::changed_files(&files, true));
         state.viewer_files = Ok(files);

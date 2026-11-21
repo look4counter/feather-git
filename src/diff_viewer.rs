@@ -92,6 +92,13 @@ impl ViewerTarget {
         matches!((self, other), (Self::File {root: a, file: left, ..}, Self::File {root: b, file: right, ..})
             if a == b && left.path == right.path && left.staged == right.staged)
     }
+    fn same_worktree_file(&self, other: &Self) -> bool {
+        matches!((self, other),
+            (Self::File { root: a, file: left, historical: false },
+             Self::File { root: b, file: right, historical: false })
+                if a == b && left.path == right.path)
+    }
+
     #[cfg(test)]
     fn load(&self) -> anyhow::Result<(Diff, Option<FileChange>)> {
         self.load_with_encoding(crate::text_encoding::TextEncoding::Utf8)
@@ -520,6 +527,13 @@ impl DiffViewer {
             })
     }
 
+    pub fn conflict_write_pending(&self, cx: &App) -> bool {
+        matches!(self.mutation, Some(ViewerMutation::ResolveConflict))
+            || self.file_viewers.iter().any(|child| {
+                child.view.read(cx).conflict_write_pending(cx)
+            })
+    }
+
     pub fn is_busy(&self, cx: &App) -> bool {
         self.mutation.is_some()
             || self
@@ -581,6 +595,11 @@ impl DiffViewer {
         }
         self.reads.cancel();
         self.list_loading.reset();
+        let preserve_scroll = force && self.encoding == encoding && self.target.as_ref().is_some_and(|previous| {
+            previous.same_worktree_file(&target)
+                || matches!((previous, &target), (ViewerTarget::Files { root: a, .. },
+                    ViewerTarget::Files { root: b, .. }) if a == b)
+        });
         self.retaining_content = prepare_content_transition(
             &mut self.data, self.target.as_ref(), &target, self.encoding == encoding,
         );
@@ -593,7 +612,7 @@ impl DiffViewer {
         self.selection = Selection::default();
         self.active_file = None;
         self.error = None;
-        if !self.retaining_content {
+        if !self.retaining_content && !preserve_scroll {
             self.width = None;
             self.scroll.reset_for_content();
         }
@@ -605,7 +624,17 @@ impl DiffViewer {
                 let position = self
                     .file_viewers
                     .iter()
-                    .position(|child| child.target.same_file(file_target));
+                    .position(|child| child.target.same_file(file_target))
+                    .or_else(|| {
+                        if !force {
+                            return None;
+                        }
+                        self.file_viewers.iter().position(|child| {
+                            !child.active
+                                && child.target.same_worktree_file(file_target)
+                                && !targets.iter().any(|target| child.target.same_file(target))
+                        })
+                    });
                 let position = position.unwrap_or_else(|| {
                     let view = cx.new(Self::new);
                     let events = cx.subscribe(&view, |_, _, event: &ViewerChanged, cx| {
@@ -668,8 +697,11 @@ impl DiffViewer {
             return;
         }
         self.loading = true;
-        self.list_loading
-            .begin(generation, std::time::Instant::now());
+        if preserve_scroll && self.retaining_content {
+            self.list_loading.begin_retaining(generation);
+        } else {
+            self.list_loading.begin(generation, std::time::Instant::now());
+        }
         let completed = self.list_loading.completion();
         let expected = target.clone();
         let task = self.reads.spawn(cx.background_executor(), move || {
@@ -690,8 +722,10 @@ impl DiffViewer {
                 this.loading = false;
                 this.retaining_content = false;
                 this.list_loading.reset();
-                this.width = None;
-                this.scroll.reset_for_content();
+                if !preserve_scroll {
+                    this.width = None;
+                    this.scroll.reset_for_content();
+                }
                 match result {
                     Ok((data, file)) => {
                         this.data = data;
@@ -930,15 +964,10 @@ impl DiffViewer {
         let task = crate::backend::spawn(cx.background_executor(), move || work(&root));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let _ = this.update_in(cx, |this, _, cx| {
                 this.mutation = None;
                 match result {
-                    Ok(()) => {
-                        if this.target == target {
-                            this.reload(window, cx);
-                        }
-                        cx.emit(ViewerChanged { root: original });
-                    }
+                    Ok(()) => cx.emit(ViewerChanged { root: original }),
                     Err(error) => {
                         this.error = Some(format!(
                             "{}: 변경을 적용하지 못했습니다: {error:#}",
@@ -1684,7 +1713,7 @@ impl Render for DiffViewer {
         let count = self.data.lines.len();
         let empty_eof = !self.details() && self.data.empty_eof;
         let show_empty_message = !self.loading && count == 0 && !empty_eof;
-        let busy = self.mutation.is_some();
+        let busy = matches!(self.mutation, Some(ViewerMutation::ResolveConflict));
         let has_conflicts = self.data.conflict.is_some();
         let region = self.data.conflict_at_row(self.selection.cursor.row);
         let title = self

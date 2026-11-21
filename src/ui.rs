@@ -712,7 +712,15 @@ pub(crate) fn commit_grid_row(
                         reference_badge(reference.kind, reference.label.clone(), color)
                     }))
                 })
-                .child(div().min_w_0().truncate().child(title)),
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .when(show_graph && checked_out, |message| {
+                            message.font_weight(gpui::FontWeight::BOLD)
+                        })
+                        .child(title),
+                ),
         )
         .child(history_cell(columns[2]).child(label(author).w_full().truncate().text_size(px(12.))))
         .child(history_cell(columns[3]).child(label(date).w_full().truncate().text_size(px(12.))))

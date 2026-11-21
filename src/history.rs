@@ -143,56 +143,55 @@ impl HistoryState {
         let count = self.len().min(project.commits.len());
         (range.start.min(count)..range.end.min(count))
             .map(|index| {
-                self.rows[index]
-                    .get_or_insert_with(|| {
-                        let commit = &project.commits[index];
-                        PreparedHistoryRow {
-                            index,
-                            graph: RowGraph::new(&self.layouts[index]),
-                            title: commit
-                                .message
-                                .lines()
-                                .next()
-                                .unwrap_or_default()
-                                .to_owned()
-                                .into(),
-                            author: commit.author.clone().into(),
-                            date: commit.date.clone().into(),
-                            hash: commit.id.chars().take(8).collect::<String>().into(),
-                            reference: commit.reference.clone().into(),
-                            references: Rc::new({
-                                let mut references: Vec<PreparedReference> =
-                                    if commit.references.is_empty() {
-                                        if commit.reference.is_empty() {
-                                            Vec::new()
-                                        } else {
-                                            vec![PreparedReference {
-                                                label: commit.reference.clone().into(),
-                                                kind: ReferenceKind::Other,
-                                            }]
-                                        }
-                                    } else {
-                                        commit
-                                            .references
-                                            .iter()
-                                            .map(|reference| PreparedReference {
-                                                label: reference.label.clone().into(),
-                                                kind: reference.kind(),
-                                            })
-                                            .collect()
-                                    };
-                                references.sort_by_key(|reference| match reference.kind {
-                                    ReferenceKind::Tag => 0,
-                                    ReferenceKind::Local => 1,
-                                    ReferenceKind::Remote => 2,
-                                    ReferenceKind::Other => 3,
-                                });
-                                references
-                            }),
-                            checked_out: project.head.as_deref() == Some(commit.id.as_str()),
-                        }
-                    })
-                    .clone()
+                let commit = &project.commits[index];
+                let checked_out = project.head.as_deref() == Some(commit.id.as_str());
+                let row = self.rows[index].get_or_insert_with(|| PreparedHistoryRow {
+                    index,
+                    graph: RowGraph::new(&self.layouts[index]),
+                    title: commit
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned()
+                        .into(),
+                    author: commit.author.clone().into(),
+                    date: commit.date.clone().into(),
+                    hash: commit.id.chars().take(8).collect::<String>().into(),
+                    reference: commit.reference.clone().into(),
+                    references: Rc::new({
+                        let mut references: Vec<PreparedReference> = if commit.references.is_empty()
+                        {
+                            if commit.reference.is_empty() {
+                                Vec::new()
+                            } else {
+                                vec![PreparedReference {
+                                    label: commit.reference.clone().into(),
+                                    kind: ReferenceKind::Other,
+                                }]
+                            }
+                        } else {
+                            commit
+                                .references
+                                .iter()
+                                .map(|reference| PreparedReference {
+                                    label: reference.label.clone().into(),
+                                    kind: reference.kind(),
+                                })
+                                .collect()
+                        };
+                        references.sort_by_key(|reference| match reference.kind {
+                            ReferenceKind::Tag => 0,
+                            ReferenceKind::Local => 1,
+                            ReferenceKind::Remote => 2,
+                            ReferenceKind::Other => 3,
+                        });
+                        references
+                    }),
+                    checked_out,
+                });
+                row.checked_out = checked_out;
+                row.clone()
             })
             .collect()
     }
@@ -329,6 +328,12 @@ mod tests {
         assert_eq!(rows[0].reference.as_ref(), "main");
         assert_eq!(rows[0].hash.len(), 8);
         assert_eq!(state.lanes, 1);
+
+        project.head = Some(project.commits[1].id.clone());
+        let refreshed = state.prepare_rows(&project, 0..2);
+        assert!(!refreshed[0].checked_out);
+        assert!(refreshed[1].checked_out);
+        assert_eq!(rows[0].title.as_ptr(), refreshed[0].title.as_ptr());
     }
     #[test]
     fn empty_history_prepares_nothing() {

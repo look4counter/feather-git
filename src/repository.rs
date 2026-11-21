@@ -407,7 +407,7 @@ pub fn delete_repository_files(path: &Path) -> Result<()> {
         .context("저장소 폴더를 영구 삭제하지 못했습니다. 일부 파일은 이미 삭제되었을 수 있습니다.")
 }
 
-pub fn github_repository(path: &Path) -> Result<Option<String>> {
+pub fn avatar_repository(path: &Path) -> Result<Option<String>> {
     let repo = open_exact(path)?;
     let remotes = repo.remotes()?;
     let mut names: Vec<_> = remotes
@@ -415,17 +415,18 @@ pub fn github_repository(path: &Path) -> Result<Option<String>> {
         .filter_map(|name| name.ok().flatten())
         .collect();
     names.sort_by_key(|name| *name != "origin");
+    let mut hosted = None;
     for name in names {
         let remote = repo.find_remote(name)?;
-        if let Some(source) = remote
-            .url()
-            .ok()
-            .and_then(crate::avatar::repository_from_remote)
-        {
+        let Ok(url) = remote.url() else { continue };
+        if let Some(source) = crate::avatar::repository_from_remote(url) {
             return Ok(Some(source));
         }
+        if hosted.is_none() {
+            hosted = crate::avatar::web_repository_from_remote(url);
+        }
     }
-    Ok(None)
+    Ok(hosted)
 }
 
 fn git_command(repo: &Repository) -> Result<std::process::Command> {
@@ -938,19 +939,23 @@ mod tests {
     fn github_remote_prefers_origin_then_other_github_remotes() {
         let dir = tempdir();
         let repo = Repository::init(dir.path()).unwrap();
-        assert_eq!(github_repository(dir.path()).unwrap(), None);
-        repo.remote("upstream", "git@github.com:upstream/project.git")
-            .unwrap();
-        repo.remote("origin", "https://gitlab.com/owner/project.git")
+        assert_eq!(avatar_repository(dir.path()).unwrap(), None);
+        repo.remote("origin", "https://git.example.test/owner/project.git")
             .unwrap();
         assert_eq!(
-            github_repository(dir.path()).unwrap().as_deref(),
+            avatar_repository(dir.path()).unwrap().as_deref(),
+            Some("https://git.example.test/owner/project.git")
+        );
+        repo.remote("upstream", "git@github.com:upstream/project.git")
+            .unwrap();
+        assert_eq!(
+            avatar_repository(dir.path()).unwrap().as_deref(),
             Some("upstream/project")
         );
         repo.remote_set_url("origin", "https://github.com/fork/project.git")
             .unwrap();
         assert_eq!(
-            github_repository(dir.path()).unwrap().as_deref(),
+            avatar_repository(dir.path()).unwrap().as_deref(),
             Some("fork/project")
         );
     }

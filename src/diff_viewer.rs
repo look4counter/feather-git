@@ -141,7 +141,7 @@ impl ViewerTarget {
             Self::Detail { root, id } => crate::backend::run("viewer::load_detail", || {
                 let detail = diff_git::load_detail(root, id)?;
                 let mut data = text_diff(detail_rows(&detail));
-                let source = crate::repository::github_repository(root).ok().flatten();
+                let source = crate::repository::avatar_repository(root).ok().flatten();
                 data.identities = detail_identities(&detail, source.as_deref());
                 Ok((data, None))
             }),

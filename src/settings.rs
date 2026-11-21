@@ -22,6 +22,8 @@ enum Work {
 
 pub enum SettingsEvent {
     Confirmed,
+    #[cfg(windows)]
+    CheckForUpdates,
 }
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
@@ -32,6 +34,8 @@ pub struct SettingsPanel {
     email: Entity<CommitEditor>,
     auth: Entity<AuthPanel>,
     identity_focus: FocusHandle,
+    #[cfg(windows)]
+    update_focus: FocusHandle,
     remote_focus: FocusHandle,
     remote_delete_focus: BTreeMap<String, FocusHandle>,
     row_focus: BTreeMap<String, FocusHandle>,
@@ -73,6 +77,8 @@ impl SettingsPanel {
             email: cx.new(|cx| CommitEditor::single_line("", cx)),
             auth,
             identity_focus: cx.focus_handle(),
+            #[cfg(windows)]
+            update_focus: cx.focus_handle(),
             remote_focus: cx.focus_handle(),
             remote_delete_focus: BTreeMap::new(),
             row_focus: BTreeMap::new(),
@@ -494,6 +500,26 @@ impl SettingsPanel {
             .build()
     }
 
+    #[cfg(windows)]
+    fn update_section(&self, cx: &Context<Self>) -> Div {
+        let enabled = self.can_close(cx) && !self.child_popup_open(cx) && !self.is_composing(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_heading("업데이트"))
+            .child(div().flex().child(
+                action("settings-check-update", "업데이트 확인", enabled)
+                    .track_focus(&self.update_focus)
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        if enabled && crate::form_controls::checkbox_click(event) {
+                            this.update_focus.focus(window);
+                            cx.emit(SettingsEvent::CheckForUpdates);
+                        }
+                    })),
+            ))
+    }
+
     fn remote_section(&self, window: &Window, cx: &Context<Self>) -> Div {
         let available =
             self.work.is_none() && self.snapshot.is_some() && self.context.repository.is_some();
@@ -590,6 +616,8 @@ impl Render for SettingsPanel {
             .child(self.identity_section(cx))
             .child(self.remote_section(window, cx))
             .child(self.auth.clone());
+        #[cfg(windows)]
+        let body = body.child(self.update_section(cx));
         div()
             .flex()
             .flex_col()

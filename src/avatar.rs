@@ -45,12 +45,180 @@ pub fn repository_from_remote(remote: &str) -> Option<String> {
     repository_path(path.strip_suffix(".git").unwrap_or(path))
 }
 
+pub fn web_repository_from_remote(remote: &str) -> Option<String> {
+    let scp = remote
+        .split_once(':')
+        .filter(|(address, _)| address.contains('@') && !address.contains('/'))
+        .map(|(address, path)| format!("ssh://{address}/{path}"));
+    let mut remote = url::Url::parse(scp.as_deref().unwrap_or(remote)).ok()?;
+    if remote.scheme() == "ssh" {
+        let mut web = url::Url::parse("https://localhost/").ok()?;
+        web.set_host(remote.host_str()).ok()?;
+        web.set_path(remote.path());
+        remote = web;
+    }
+    if !matches!(remote.scheme(), "https" | "http") || remote.host_str()? == "github.com" {
+        return None;
+    }
+    remote.set_username("").ok()?;
+    remote.set_password(None).ok()?;
+    remote.set_query(None);
+    remote.set_fragment(None);
+    let path = remote.path().trim_matches('/');
+    if path.split('/').count() < 2
+        || !path.split('/').all(|part| {
+            !part.is_empty()
+                && !matches!(part, "." | "..")
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte))
+        })
+    {
+        return None;
+    }
+    let path = format!("/{path}");
+    remote.set_path(&path);
+    Some(remote.into())
+}
+
+struct HostedRequest {
+    repository: url::Url,
+    sha: String,
+    role: usize,
+}
+
+fn hosted_request(uri: &str) -> Option<HostedRequest> {
+    let uri = url::Url::parse(uri).ok()?;
+    if uri.origin()
+        != url::Url::parse("https://avatar.feather.invalid/")
+            .ok()?
+            .origin()
+    {
+        return None;
+    }
+    let (sha, role) = uri.path().strip_prefix("/hosted/")?.split_once('/')?;
+    if !valid_sha(sha) {
+        return None;
+    }
+    let role = match role {
+        "author" => 0,
+        "committer" => 1,
+        _ => return None,
+    };
+    let source = uri.query_pairs().find(|(key, _)| key == "repo")?.1;
+    let repository = web_repository_from_remote(&source)?.parse().ok()?;
+    Some(HostedRequest {
+        repository,
+        sha: sha.to_owned(),
+        role,
+    })
+}
+
+impl HostedRequest {
+    fn endpoints(&self) -> Option<[(url::Url, Option<String>); 2]> {
+        let (base_and_owner, repo) = self.repository.path().rsplit_once('/')?;
+        let repo = repo.strip_suffix(".git").unwrap_or(repo);
+        if matches!(repo, "" | "." | "..") {
+            return None;
+        }
+        let (base, owner) = base_and_owner.rsplit_once('/')?;
+        let mut gitea = self.repository.clone();
+        gitea.set_path(&format!(
+            "{base}/api/v1/repos/{owner}/{repo}/git/commits/{}",
+            self.sha
+        ));
+        gitea.set_query(Some("stat=false&verification=false&files=false"));
+        let base = base.strip_suffix("/scm").unwrap_or(base);
+        let mut bitbucket = self.repository.clone();
+        bitbucket.set_path(&format!(
+            "{base}/rest/api/1.0/projects/{owner}/repos/{repo}/commits/{}",
+            self.sha
+        ));
+        Some([(gitea, None), (bitbucket, Some(base.to_owned()))])
+    }
+
+    fn parse_profiles(
+        &self,
+        bytes: &[u8],
+        bitbucket_base: Option<&str>,
+        mut gitea_profile: impl FnMut(&url::Url) -> Option<String>,
+    ) -> anyhow::Result<GitHubProfiles> {
+        let data: serde_json::Value = serde_json::from_slice(bytes)?;
+        let id = if bitbucket_base.is_some() {
+            "id"
+        } else {
+            "sha"
+        };
+        anyhow::ensure!(
+            data[id]
+                .as_str()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&self.sha))
+        );
+        Ok(["author", "committer"].map(|role| {
+            let user = &data[role];
+            let image = if let Some(base) = bitbucket_base {
+                let slug = user["slug"].as_str()?;
+                if matches!(slug, "" | "." | "..") {
+                    return None;
+                }
+                let mut image = self.repository.clone();
+                image.set_path(&format!("{base}/users"));
+                image.path_segments_mut().ok()?.extend([slug, "avatar.png"]);
+                image.set_query(Some("s=80"));
+                image
+            } else {
+                return user["avatar_url"]
+                    .as_str()
+                    .and_then(|image| self.same_origin_avatar(image))
+                    .or_else(|| {
+                        let login = user["login"]
+                            .as_str()
+                            .or_else(|| user["username"].as_str())?;
+                        if login.is_empty() || matches!(login, "." | "..") {
+                            return None;
+                        }
+                        let mut profile = self.repository.join("../").ok()?;
+                        profile
+                            .path_segments_mut()
+                            .ok()?
+                            .pop_if_empty()
+                            .extend(["api", "v1", "users", login]);
+                        gitea_profile(&profile)
+                    });
+            };
+            Some(image.into())
+        }))
+    }
+
+    fn same_origin_avatar(&self, path: &str) -> Option<String> {
+        if path.trim().is_empty() {
+            return None;
+        }
+        let image = self.repository.join(path).ok()?;
+        (image.origin() == self.repository.origin()
+            && image.username().is_empty()
+            && image.password().is_none())
+        .then(|| image.into())
+    }
+}
+
 pub fn commit_url(
     repository: Option<&str>,
     sha: &str,
     committer: bool,
     email: &str,
 ) -> Option<String> {
+    let role = if committer { "committer" } else { "author" };
+    if let Some(repository) = repository.and_then(web_repository_from_remote)
+        && valid_sha(sha)
+    {
+        let mut uri = url::Url::parse(&format!(
+            "https://avatar.feather.invalid/hosted/{sha}/{role}"
+        ))
+        .ok()?;
+        uri.query_pairs_mut().append_pair("repo", &repository);
+        return Some(uri.into());
+    }
     let fallback = url(email);
     let Some(repository) = repository.and_then(repository_path) else {
         return fallback;
@@ -58,7 +226,6 @@ pub fn commit_url(
     if !valid_sha(sha) {
         return fallback;
     }
-    let role = if committer { "committer" } else { "author" };
     let mut uri = format!("https://avatar.feather.invalid/github/{repository}/{sha}/{role}");
     if !email.trim().is_empty() {
         uri.push_str(&format!(
@@ -134,7 +301,7 @@ fn allowed_image(uri: &str) -> bool {
 }
 
 fn allowed(uri: &str) -> bool {
-    allowed_image(uri) || github_request(uri).is_some()
+    allowed_image(uri) || github_request(uri).is_some() || hosted_request(uri).is_some()
 }
 
 type GitHubProfiles = [Option<String>; 2];
@@ -207,6 +374,41 @@ impl SessionCache {
             {
                 return Ok(bytes);
             }
+        } else if let Some(request) = hosted_request(uri) {
+            if let Some(endpoints) = request.endpoints() {
+                for (api, bitbucket_base) in endpoints {
+                    let profiles = self.commits.entry(api.to_string()).or_insert_with(|| {
+                        fetch(api.as_str())
+                            .and_then(|bytes| {
+                                request.parse_profiles(
+                                    &bytes,
+                                    bitbucket_base.as_deref(),
+                                    |profile| {
+                                        self.profiles
+                                            .entry(profile.to_string())
+                                            .or_insert_with(|| {
+                                                let response = fetch(profile.as_str()).ok()?;
+                                                let user: serde_json::Value =
+                                                    serde_json::from_slice(&response).ok()?;
+                                                request.same_origin_avatar(
+                                                    user["avatar_url"].as_str()?,
+                                                )
+                                            })
+                                            .clone()
+                                    },
+                                )
+                            })
+                            .ok()
+                    });
+                    if let Some(image) = profiles
+                        .as_ref()
+                        .and_then(|profiles| profiles[request.role].clone())
+                        && let Some(bytes) = self.image(&image, &mut fetch)
+                    {
+                        return Ok(bytes);
+                    }
+                }
+            }
         } else if allowed_image(uri)
             && let Some(bytes) = self.image(uri, &mut fetch)
         {
@@ -240,7 +442,21 @@ impl AvatarClient {
             .spawn(move || {
                 let client = avatar_http::blocking::Client::builder()
                     .timeout(Duration::from_secs(3))
-                    .redirect(avatar_http::redirect::Policy::limited(3))
+                    .redirect(avatar_http::redirect::Policy::custom(|attempt| {
+                        let original = attempt.previous().first();
+                        let public = original.is_some_and(|url| {
+                            url.host_str() == Some("api.github.com") || allowed_image(url.as_str())
+                        });
+                        if attempt.previous().len() > 3 {
+                            attempt.error("too many avatar redirects")
+                        } else if public
+                            || original.is_some_and(|url| url.origin() == attempt.url().origin())
+                        {
+                            attempt.follow()
+                        } else {
+                            attempt.error("cross-origin avatar redirect")
+                        }
+                    }))
                     .user_agent("FeatherGit/1.0")
                     .build();
                 let mut cache = SessionCache::default();
@@ -303,6 +519,125 @@ impl HttpClient for AvatarClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gitea_user_avatar_is_reused_across_commits() {
+        let repository = "https://git.example.test:8443/dev/team/repo.git";
+        let profile = "https://git.example.test:8443/dev/api/v1/users/writer";
+        let image = "https://git.example.test:8443/avatars/photo?size=512";
+        let mut cache = SessionCache::default();
+        let mut requests = Vec::new();
+        for sha in ["a".repeat(40), "b".repeat(40)] {
+            let uri = commit_url(Some(repository), &sha, false, "writer@example.test").unwrap();
+            assert_eq!(
+                cache
+                    .resolve(&uri, |url| {
+                        requests.push(url.to_owned());
+                        if url.contains("/git/commits/") {
+                            return Ok(serde_json::to_vec(&serde_json::json!({
+                                "sha": sha,
+                                "author": {"login": "writer"},
+                                "committer": {"username": "writer"}
+                            }))?);
+                        }
+                        if url == profile {
+                            return Ok(br#"{"avatar_url":"/avatars/photo?size=512"}"#.to_vec());
+                        }
+                        assert_eq!(url, image);
+                        Ok(b"avatar".to_vec())
+                    })
+                    .unwrap(),
+                b"avatar"
+            );
+        }
+        assert_eq!(requests.len(), 4);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|url| url.as_str() == profile)
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests.iter().filter(|url| url.as_str() == image).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ambiguous_remote_tries_gitea_then_bitbucket_and_shares_commit_results() {
+        let sha = "a".repeat(40);
+        let remote = "https://user:password@git.example.test:8443/dev/scm/team/repo.git";
+        let author = commit_url(Some(remote), &sha, false, "private@example.test").unwrap();
+        let committer = commit_url(Some(remote), &sha, true, "other@example.test").unwrap();
+        assert!(!author.contains("password"));
+        assert!(!author.contains("private"));
+        let mut cache = SessionCache::default();
+        let mut requests = Vec::new();
+        let mut fetch = |url: &str| {
+            requests.push(url.to_owned());
+            if url.contains("/api/v1/") {
+                return Ok(serde_json::to_vec(&serde_json::json!({
+                    "sha": sha,
+                    "author": {"avatar_url": "https://elsewhere.example.test/image"},
+                    "committer": {"avatar_url": "/avatars/committer"}
+                }))?);
+            }
+            if url.contains("/rest/api/") {
+                return Ok(serde_json::to_vec(&serde_json::json!({
+                    "id": sha,
+                    "author": {"slug": "writer"},
+                    "committer": {"name": "Raw Git name"}
+                }))?);
+            }
+            Ok(url.as_bytes().to_vec())
+        };
+        assert_eq!(
+            cache.resolve(&author, &mut fetch).unwrap(),
+            b"https://git.example.test:8443/dev/users/writer/avatar.png?s=80"
+        );
+        assert_eq!(
+            cache.resolve(&committer, &mut fetch).unwrap(),
+            b"https://git.example.test:8443/avatars/committer"
+        );
+        cache.resolve(&author, &mut fetch).unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].contains("/dev/scm/api/v1/repos/team/repo/git/commits/"));
+        assert!(requests[1].contains("/dev/rest/api/1.0/projects/team/repos/repo/commits/"));
+    }
+
+    #[test]
+    fn failed_hosted_probes_are_cached_without_gravatar() {
+        let remote =
+            web_repository_from_remote("ssh://git@internal.example.test:7999/TEAM/repo.git")
+                .unwrap();
+        assert_eq!(remote, "https://internal.example.test/TEAM/repo.git");
+        assert_eq!(
+            web_repository_from_remote("git@internal.example.test:TEAM/repo.git").as_deref(),
+            Some(remote.as_str())
+        );
+        let uri = commit_url(
+            Some(&remote),
+            &"b".repeat(40),
+            false,
+            "private@example.test",
+        )
+        .unwrap();
+        let mut cache = SessionCache::default();
+        let mut count = 0;
+        for _ in 0..2 {
+            assert!(
+                cache
+                    .resolve(&uri, |url| {
+                        assert!(url.starts_with("https://internal.example.test/"));
+                        count += 1;
+                        anyhow::bail!("unavailable")
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(count, 2);
+    }
+
     #[test]
     fn gravatar_bytes_and_invalid_api_results_are_cached() {
         let mut cache = SessionCache::default();

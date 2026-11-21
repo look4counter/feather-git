@@ -2264,13 +2264,19 @@ impl Workspace {
         self.settings_subscription = Some(cx.subscribe_in(
             &panel,
             window,
-            |this, panel, _: &crate::settings::SettingsEvent, window, cx| {
+            |this, panel, event: &crate::settings::SettingsEvent, window, cx| {
                 if this
                     .settings_panel
                     .as_ref()
                     .is_some_and(|current| current.entity_id() == panel.entity_id())
                 {
-                    this.close_settings(window, cx);
+                    match event {
+                        crate::settings::SettingsEvent::Confirmed => this.close_settings(window, cx),
+                        #[cfg(windows)]
+                        crate::settings::SettingsEvent::CheckForUpdates => {
+                            this.open_update_dialog(window, cx);
+                        }
+                    }
                 }
             },
         ));
@@ -2394,9 +2400,14 @@ impl Workspace {
     }
     #[cfg(windows)]
     fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.settings_panel.as_ref().map(|panel| panel.read(cx)) else {
+            return;
+        };
         if !window.is_window_active()
-            || self.footer_actions_blocked()
-            || self.viewer.as_ref().is_some_and(|viewer| viewer.read(cx).is_busy(cx))
+            || self.update_dialog.is_some()
+            || panel.child_popup_open(cx)
+            || !panel.can_close(cx)
+            || panel.is_composing(cx)
         {
             return;
         }
@@ -2506,15 +2517,7 @@ impl Workspace {
                         status_button("footer-settings", "환경설정", encoding_enabled).on_click(
                             cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
                         ),
-                    )
-                    .map(|bar| {
-                        #[cfg(windows)]
-                        let bar = bar.child(
-                            status_button("footer-update", "업데이트 확인", encoding_enabled)
-                                .on_click(cx.listener(|this, _, window, cx| this.open_update_dialog(window, cx))),
-                        );
-                        bar
-                    }),
+                    ),
             )
     }
 

@@ -238,7 +238,7 @@ macro_rules! install {
                     path: &std::path::Path,
                     request: CommitRequest,
                 ) -> anyhow::Result<CommitOutcome>;
-                pub fn github_repository(path: &std::path::Path) -> anyhow::Result<Option<String>>;
+                pub fn avatar_repository(path: &std::path::Path) -> anyhow::Result<Option<String>>;
                 pub fn delete_repository_files(path: &std::path::Path) -> anyhow::Result<()>;
                 pub fn panel_references(
                     path: &std::path::Path,

@@ -13,5 +13,9 @@ repository.rs에 원격 조회 게이트웨이를 추가해 origin 우선으로 
 ## 영향·헌법
 변경: src/avatar.rs, src/repository.rs, src/backend.rs, src/diff_viewer.rs. 새 의존성·공개 API·세션 디스크 형식 변경은 없다. 헌법은 미작성 템플릿이므로 규범 검사는 건너뛰며 AGENTS.md의 계층 분리·최소 변경을 따른다.
 
+## 내부 서버 조회 설계
+
+공개 GitHub를 기존대로 우선한다. 발견하지 못하면 `src/repository.rs`와 `src/backend.rs`를 통해 사용 가능한 우선 원격의 웹 주소를 전달한다. `src/avatar.rs`의 기존 작업 스레드에서 Gitea와 Bitbucket Data Center 커밋 응답을 순서대로 시도하고 같은 출처의 이미지만 조회한다. 두 역할이 커밋 응답과 이미지 캐시를 공유한다. Gitea 커밋의 최상위 계정에 사진 주소가 없으면 연결된 계정명으로 같은 설치 경로의 사용자 API를 조회하고 해당 결과를 세션에 캐시한다. 원격 주소의 인증정보는 제거하며 같은 출처의 리다이렉트만 허용한다.
+
 ## 검증
 외부 요청 함수를 주입한 테스트로 원격 파싱, 역할별 URL, 다른 커밋의 이메일 캐시, 같은 커밋 API 공유, 이미지 캐시, 실패 대체와 음성 캐시를 검증한다. 임시 Git 저장소의 origin 우선순위도 검증한다. fmt/check/test/clippy/build를 수행한다. 실제 GUI·외부 API는 미검증이면 명시한다.

@@ -54,6 +54,8 @@ mod update_dialog;
 mod updater;
 mod virtual_list;
 mod workspace_backend;
+#[cfg(windows)]
+mod worktree_watch;
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };

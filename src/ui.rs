@@ -231,6 +231,8 @@ pub struct Workspace {
     panel_pending: Option<PanelRequest>,
     panel_reads: crate::backend::ReadSlot,
     panel_waiting: bool,
+    #[cfg(windows)]
+    worktree_watch: Option<(usize, std::path::PathBuf, gpui::Task<()>)>,
     panel_loading: ListLoading,
     reference_revision: u64,
     reference_pending: Option<ReferenceRequest>,
@@ -375,6 +377,8 @@ impl Default for Workspace {
             panel_pending: None,
             panel_reads: crate::backend::ReadSlot::default(),
             panel_waiting: false,
+            #[cfg(windows)]
+            worktree_watch: None,
             panel_loading: ListLoading::default(),
             reference_revision: 0,
             reference_pending: None,
@@ -5839,6 +5843,83 @@ impl Workspace {
                 .collect(),
         }
     }
+    #[cfg(windows)]
+    fn active_worktree(&self) -> Option<&std::path::Path> {
+        if self.screen() != WorkspaceScreen::Project || self.file_history {
+            return None;
+        }
+        self.projects.get(self.project)?.workdir.as_deref()
+    }
+
+    #[cfg(windows)]
+    fn update_worktree_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.active_worktree().map(std::path::Path::to_path_buf) else {
+            self.worktree_watch = None;
+            return;
+        };
+        let project = self.project;
+        if self.worktree_watch.as_ref().is_some_and(|(owner, path, _)| {
+            *owner == project && *path == root
+        }) {
+            return;
+        }
+
+        let watched_root = root.clone();
+        let executor = cx.background_executor().clone();
+        let task = cx.spawn(async move |this, cx| {
+            let run = async {
+                let watch = crate::worktree_watch::WorktreeWatch::new(&watched_root)?;
+                let mut pending = false;
+                loop {
+                    executor.timer(std::time::Duration::from_secs(1)).await;
+                    pending |= watch.take_change()?;
+                    if !pending {
+                        continue;
+                    }
+                    match this.update(cx, |state, cx| {
+                        if state.project != project
+                            || state.active_worktree() != Some(watched_root.as_path())
+                        {
+                            return None;
+                        }
+                        if state.panel_waiting || state.repository_busy() {
+                            return Some(false);
+                        }
+                        state.refresh_worktree_preserving_selection();
+                        cx.notify();
+                        Some(true)
+                    }) {
+                        Ok(Some(started)) => pending = !started,
+                        _ => break,
+                    }
+                }
+                Ok::<(), windows::core::Error>(())
+            };
+            if let Err(error) = run.await {
+                eprintln!("작업트리 변경 감시를 계속할 수 없습니다: {error}");
+            }
+        });
+        self.worktree_watch = Some((project, root, task));
+    }
+
+    fn refresh_worktree_preserving_selection(&mut self) {
+        let selected = self
+            .viewer_files
+            .as_ref()
+            .map(|files| {
+                self.file_selection
+                    .indices(files.len())
+                    .into_iter()
+                    .map(|index| (files[index].path.clone(), files[index].staged))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.request_file_data(true);
+        if let Some(request) = &mut self.panel_pending {
+            request.selected_files = selected;
+        }
+    }
+
     fn viewer_changed(&mut self, event: &ViewerChanged) {
         let Some(owner) = self
             .projects
@@ -5852,21 +5933,7 @@ impl Workspace {
             && self.open_projects.contains(&owner)
             && !self.start_tab_active
         {
-            let selected = self
-                .viewer_files
-                .as_ref()
-                .map(|files| {
-                    self.file_selection
-                        .indices(files.len())
-                        .into_iter()
-                        .map(|index| (files[index].path.clone(), files[index].staged))
-                        .collect()
-                })
-                .unwrap_or_default();
-            self.request_file_data(true);
-            if let Some(request) = &mut self.panel_pending {
-                request.selected_files = selected;
-            }
+            self.refresh_worktree_preserving_selection();
         } else {
             self.projects[owner].files.clear();
         }
@@ -6601,6 +6668,8 @@ impl Workspace {
 }
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(windows)]
+        self.update_worktree_watch(cx);
         self.dispatch_pending(_window, cx);
         let screen = self.screen();
         self.update_delayed_progress(cx);

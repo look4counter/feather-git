@@ -1,50 +1,37 @@
-# [PROJECT_NAME] Constitution
-<!-- Example: Spec Constitution, TaskFlow Constitution, etc. -->
+<!--
+동기화 영향 보고서
+- 버전 변경: 미제정 → 1.0.0
+- 제정 원칙: 무단 커밋 금지
+- 추가 절: 개발 제약, 검증 절차, 운영 규칙
+- 이월 항목: 없음
+-->
 
-## Core Principles
+# Feather Git 헌법
 
-### [PRINCIPLE_1_NAME]
-<!-- Example: I. Library-First -->
-[PRINCIPLE_1_DESCRIPTION]
-<!-- Example: Every feature starts as a standalone library; Libraries must be self-contained, independently testable, documented; Clear purpose required - no organizational-only libraries -->
+## 핵심 원칙
 
-### [PRINCIPLE_2_NAME]
-<!-- Example: II. CLI Interface -->
-[PRINCIPLE_2_DESCRIPTION]
-<!-- Example: Every library exposes functionality via CLI; Text in/out protocol: stdin/args → stdout, errors → stderr; Support JSON + human-readable formats -->
+### Ⅰ. 사용자 요청 없는 커밋 금지
 
-### [PRINCIPLE_3_NAME]
-<!-- Example: III. Test-First (NON-NEGOTIABLE) -->
-[PRINCIPLE_3_DESCRIPTION]
-<!-- Example: TDD mandatory: Tests written → User approved → Tests fail → Then implement; Red-Green-Refactor cycle strictly enforced -->
+- AI 에이전트는 사용자가 현재 작업에서 커밋을 명시적으로 요청한 경우에만 커밋을 생성할 수 있다.
+- 이 규칙은 모든 브랜치와 작업 트리에서 적용한다. 임시 커밋과 스냅샷 커밋도 포함한다.
+- 명시적인 요청이 없으면 에이전트는 Git 명령, 도구, 훅, 스크립트 또는 자동화를 통해 직접 또는 간접적으로 커밋을 만들면 안 된다.
+- 구현 완료, 검증 성공, Spec Kit 단계 종료는 커밋 승인으로 간주하지 않는다. 변경 사항은 현재 작업 트리에 미커밋 상태로 남긴다.
 
-### [PRINCIPLE_4_NAME]
-<!-- Example: IV. Integration Testing -->
-[PRINCIPLE_4_DESCRIPTION]
-<!-- Example: Focus areas requiring integration tests: New library contract tests, Contract changes, Inter-service communication, Shared schemas -->
+## 개발 제약
 
-### [PRINCIPLE_5_NAME]
-<!-- Example: V. Observability, VI. Versioning & Breaking Changes, VII. Simplicity -->
-[PRINCIPLE_5_DESCRIPTION]
-<!-- Example: Text I/O ensures debuggability; Structured logging required; Or: MAJOR.MINOR.BUILD format; Or: Start simple, YAGNI principles -->
+저장소의 개발 규칙과 Spec Kit 절차를 따른다. 커밋을 만드는 선택적 훅이나 자동화가 구성되어 있어도
+사용자의 명시적인 요청 없이 실행하지 않는다.
 
-## [SECTION_2_NAME]
-<!-- Example: Additional Constraints, Security Requirements, Performance Standards, etc. -->
+## 검증 절차
 
-[SECTION_2_CONTENT]
-<!-- Example: Technology stack requirements, compliance standards, deployment policies, etc. -->
+변경을 마칠 때 현재 브랜치와 작업 트리 상태를 확인한다. 커밋 요청이 없었던 작업은 작업 전후의
+현재 브랜치 커밋이 동일한지 확인한다. 예상치 못한 이력 변경을 발견하면 사실을 보고하고 사용자의
+승인 없이 기존 이력을 되돌리지 않는다.
 
-## [SECTION_3_NAME]
-<!-- Example: Development Workflow, Review Process, Quality Gates, etc. -->
+## 운영 규칙
 
-[SECTION_3_CONTENT]
-<!-- Example: Code review requirements, testing gates, deployment approval process, etc. -->
+헌법 개정에는 사용자 승인이 필요하다. 원칙 삭제 또는 호환되지 않는 변경은 주 버전, 원칙 추가는
+부 버전, 의미를 유지하는 문구 수정은 수정 버전을 올린다. 개정 시 버전, 개정일, 변경 내용을 문서에
+기록하고 구현 계획과 작업 완료 검토에서 적용되는 조항의 준수 여부를 확인한다.
 
-## Governance
-<!-- Example: Constitution supersedes all other practices; Amendments require documentation, approval, migration plan -->
-
-[GOVERNANCE_RULES]
-<!-- Example: All PRs/reviews must verify compliance; Complexity must be justified; Use [GUIDANCE_FILE] for runtime development guidance -->
-
-**Version**: [CONSTITUTION_VERSION] | **Ratified**: [RATIFICATION_DATE] | **Last Amended**: [LAST_AMENDED_DATE]
-<!-- Example: Version: 2.1.1 | Ratified: 2025-06-13 | Last Amended: 2025-07-16 -->
+**버전** 1.0.0 | **제정일** 2026-11-21 | **최종 개정일** 2026-11-21

@@ -77,8 +77,12 @@ impl SearchPanel {
             enabled: true,
         }
     }
+    pub fn search_pending(&self) -> bool {
+        self.loading.is_pending()
+    }
+
     pub fn is_current(&self, revision: u64) -> bool {
-        self.enabled && self.revision == revision && !self.loading.is_pending()
+        self.enabled && self.revision == revision && !self.search_pending()
     }
     pub fn is_for(&self, root: &std::path::Path) -> bool {
         self.root == root

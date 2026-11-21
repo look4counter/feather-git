@@ -333,7 +333,7 @@ impl ViewerDiscardRequest {
                     this.target.as_ref(),
                     self.generation,
                     &self.target,
-                ) || this.busy
+                ) || this.mutation.is_some()
                     || !this.partial()
                 {
                     return false;
@@ -343,7 +343,7 @@ impl ViewerDiscardRequest {
                 let preview = self.preview;
                 let lines = self.lines;
                 let rows = self.rows;
-                this.mutate(self.root, window, cx, move |root| {
+                this.mutate(self.root, ViewerMutation::StageOrDiscard, window, cx, move |root| {
                     partial_stage::discard(root, &file, &preview, &lines, &rows)
                 });
                 true
@@ -442,6 +442,11 @@ impl CheckMenuRequest {
     }
 }
 
+enum ViewerMutation {
+    StageOrDiscard,
+    ResolveConflict,
+}
+
 pub struct DiffViewer {
     reads: crate::backend::ReadSlot,
     file_viewers: Vec<FileViewer>,
@@ -455,7 +460,7 @@ pub struct DiffViewer {
     loading: bool,
     retaining_content: bool,
     list_loading: ListLoading,
-    busy: bool,
+    mutation: Option<ViewerMutation>,
     error: Option<String>,
     focus: FocusHandle,
     focus_subscriptions: Vec<gpui::Subscription>,
@@ -493,7 +498,7 @@ impl DiffViewer {
             loading: false,
             retaining_content: false,
             list_loading: ListLoading::default(),
-            busy: false,
+            mutation: None,
             error: None,
             focus: cx.focus_handle(),
             focus_subscriptions: Vec::new(),
@@ -508,8 +513,15 @@ impl DiffViewer {
             key_editors: None,
         }
     }
+    pub fn worktree_write_pending(&self, cx: &App) -> bool {
+        matches!(self.mutation, Some(ViewerMutation::StageOrDiscard))
+            || self.file_viewers.iter().any(|child| {
+                child.view.read(cx).worktree_write_pending(cx)
+            })
+    }
+
     pub fn is_busy(&self, cx: &App) -> bool {
-        self.busy
+        self.mutation.is_some()
             || self
                 .file_viewers
                 .iter()
@@ -742,7 +754,7 @@ impl DiffViewer {
         request.rows(
             self.generation,
             &self.data,
-            self.interactive && !self.busy && self.key_editors.is_none() && self.partial(),
+            self.interactive && self.mutation.is_none() && self.key_editors.is_none() && self.partial(),
         )
     }
 
@@ -807,14 +819,14 @@ impl DiffViewer {
     }
 
     fn toggle(&mut self, rows: impl IntoIterator<Item = usize>, cx: &mut Context<Self>) {
-        if !self.interactive || !self.partial() || self.busy {
+        if !self.interactive || !self.partial() || self.mutation.is_some() {
             return;
         }
         toggle_checked_rows(&mut self.checked, &self.data.lines, rows);
         cx.notify();
     }
     fn request_discard_checked(&self, cx: &mut Context<Self>) {
-        if !self.interactive || self.busy || !self.partial() || self.checked.is_empty() {
+        if !self.interactive || self.mutation.is_some() || !self.partial() || self.checked.is_empty() {
             return;
         }
         let Some(
@@ -845,7 +857,7 @@ impl DiffViewer {
     }
 
     fn stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.interactive || !self.partial() || self.busy {
+        if !self.interactive || !self.partial() || self.mutation.is_some() {
             return;
         }
         let Some(ViewerTarget::File {
@@ -864,7 +876,7 @@ impl DiffViewer {
             return;
         }
         let data = self.data.clone();
-        self.mutate(root, window, cx, move |root| {
+        self.mutate(root, ViewerMutation::StageOrDiscard, window, cx, move |root| {
             partial_stage::apply(
                 root,
                 &file,
@@ -875,7 +887,7 @@ impl DiffViewer {
         });
     }
     fn resolve(&mut self, choice: Choice, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.interactive || self.loading || self.busy {
+        if !self.interactive || self.loading || self.mutation.is_some() {
             return;
         }
         let Some(ViewerTarget::File {
@@ -895,29 +907,31 @@ impl DiffViewer {
         let Some(preview) = self.data.conflict.clone() else {
             return;
         };
-        self.mutate(root, window, cx, move |root| {
+        self.mutate(root, ViewerMutation::ResolveConflict, window, cx, move |root| {
             conflict::apply(root, &file.path, &preview, region, choice)
         });
     }
     fn mutate(
         &mut self,
         root: PathBuf,
+        mutation: ViewerMutation,
         window: &mut Window,
         cx: &mut Context<Self>,
         work: impl FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
     ) {
-        if self.busy {
+        if self.mutation.is_some() {
             return;
         }
-        self.busy = true;
+        self.mutation = Some(mutation);
         self.error = None;
+        cx.notify();
         let original = root.clone();
         let target = self.target.clone();
         let task = crate::backend::spawn(cx.background_executor(), move || work(&root));
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = false;
+                this.mutation = None;
                 match result {
                     Ok(()) => {
                         if this.target == target {
@@ -1670,7 +1684,7 @@ impl Render for DiffViewer {
         let count = self.data.lines.len();
         let empty_eof = !self.details() && self.data.empty_eof;
         let show_empty_message = !self.loading && count == 0 && !empty_eof;
-        let busy = self.busy;
+        let busy = self.mutation.is_some();
         let has_conflicts = self.data.conflict.is_some();
         let region = self.data.conflict_at_row(self.selection.cursor.row);
         let title = self

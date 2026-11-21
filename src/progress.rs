@@ -166,6 +166,7 @@ pub struct ProgressOverlay {
     message: SharedString,
     top_inset: Pixels,
     focus: Option<FocusHandle>,
+    show_card: bool,
 }
 impl ProgressOverlay {
     pub fn new(message: impl Into<SharedString>) -> Self {
@@ -173,10 +174,15 @@ impl ProgressOverlay {
             message: message.into(),
             top_inset: px(0.),
             focus: None,
+            show_card: true,
         }
     }
     pub fn top_inset(mut self, inset: Pixels) -> Self {
         self.top_inset = inset;
+        self
+    }
+    pub fn show_card(mut self, show: bool) -> Self {
+        self.show_card = show;
         self
     }
     pub fn track_focus(mut self, focus: &FocusHandle) -> Self {
@@ -198,44 +204,46 @@ impl RenderOnce for ProgressOverlay {
             .items_center()
             .justify_center()
             .p_5()
-            .bg(rgba(0x00000099))
             .occlude()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .on_click(|_, _, cx| cx.stop_propagation())
             .on_mouse_move(|_, _, cx| cx.stop_propagation())
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_key_down(|_, _, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .id("progress-card")
-                    .w(px(280.))
-                    .max_w_full()
-                    .max_h_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .p_4()
-                    .bg(rgb(PANEL))
-                    .border_1()
-                    .border_color(rgb(LINE))
-                    .rounded_lg()
-                    .child(FeatherWaterScene { phase: 0. }.with_animation(
-                        (ElementId::from("feather-water"), self.message.clone()),
-                        Animation::new(Duration::from_millis(2800)).repeat(),
-                        |mut scene, phase| {
-                            scene.phase = phase;
-                            scene
-                        },
-                    ))
+            .when(self.show_card, |overlay| {
+                overlay.bg(rgba(0x00000099))
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .text_color(rgb(TEXT))
-                            .text_align(TextAlign::Center)
-                            .child(self.message),
-                    ),
-            )
+                            .id("progress-card")
+                            .w(px(280.))
+                            .max_w_full()
+                            .max_h_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .p_4()
+                            .bg(rgb(PANEL))
+                            .border_1()
+                            .border_color(rgb(LINE))
+                            .rounded_lg()
+                            .child(FeatherWaterScene { phase: 0. }.with_animation(
+                                (ElementId::from("feather-water"), self.message.clone()),
+                                Animation::new(Duration::from_millis(2800)).repeat(),
+                                |mut scene, phase| {
+                                    scene.phase = phase;
+                                    scene
+                                },
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(TEXT))
+                                    .text_align(TextAlign::Center)
+                                    .child(self.message),
+                            ),
+                    )
+            })
     }
 }
 

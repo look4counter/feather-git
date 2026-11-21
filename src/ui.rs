@@ -4,7 +4,6 @@ use crate::diff_model::FileChange;
 use crate::diff_viewer::{DiffViewer, ViewerChanged, ViewerDiscardRequest, ViewerTarget};
 use crate::history::{HistoryState, PreparedHistory, PreparedHistoryRow};
 use crate::history_grid::{HistoryColumns, MESSAGE_MIN_WIDTH};
-#[cfg(test)]
 use crate::loading::LOADING_DELAY;
 use crate::path_display::display_path;
 use crate::progress::{ProgressOverlay, StartupLoadingScreen};
@@ -20,7 +19,7 @@ use crate::workspace_backend::{
     RestoredWorkspace, SessionWriter,
 };
 use gpui::{Context, Div, Window, div, prelude::*, px, relative, rgb};
-use std::{cell::Cell, collections::HashMap, rc::Rc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, time::Instant};
 struct ReferenceDeletePrompt {
     project: usize,
     path: std::path::PathBuf,
@@ -153,6 +152,7 @@ pub struct Workspace {
     settings_previous_focus: Option<gpui::FocusHandle>,
     search_panel: Option<gpui::Entity<crate::search_panel::SearchPanel>>,
     search_subscription: Option<gpui::Subscription>,
+    search_observer: Option<gpui::Subscription>,
     search_owner: Option<usize>,
     git_action_dialog: Option<gpui::Entity<crate::git_action_dialog::GitActionDialog>>,
     git_action_subscription: Option<gpui::Subscription>,
@@ -220,6 +220,7 @@ pub struct Workspace {
     removal_previous_focus: Option<gpui::FocusHandle>,
     deleting_recent: Option<RepositoryEntry>,
     progress_focus: Option<gpui::FocusHandle>,
+    delayed_progress: Option<(Instant, gpui::Task<()>)>,
     progress_previous_focus: Option<gpui::FocusHandle>,
     restoring: bool,
     panel_revision: u64,
@@ -291,6 +292,7 @@ impl Default for Workspace {
             settings_previous_focus: None,
             search_panel: None,
             search_subscription: None,
+            search_observer: None,
             search_owner: None,
             git_action_dialog: None,
             git_action_subscription: None,
@@ -358,6 +360,7 @@ impl Default for Workspace {
             removal_previous_focus: None,
             deleting_recent: None,
             progress_focus: None,
+            delayed_progress: None,
             progress_previous_focus: None,
             restoring: false,
             panel_revision: 0,
@@ -981,6 +984,53 @@ impl Workspace {
             || self.deleting_recent.is_some()
             || self.sync_busy
             || self.commit_busy
+    }
+
+    fn delayed_progress_pending(&self, cx: &gpui::App) -> bool {
+        self.file_stage_busy
+            || self.viewer.as_ref().is_some_and(|viewer| {
+                viewer.read(cx).worktree_write_pending(cx)
+            })
+            || (self.screen() == WorkspaceScreen::Project
+                && self.repository_tab == RepositoryTab::Search
+                && self.search_owner == Some(self.project)
+                && self.search_panel.as_ref().is_some_and(|panel| {
+                    let panel = panel.read(cx);
+                    panel.search_pending()
+                        && self.projects[self.project]
+                            .path
+                            .as_deref()
+                            .is_some_and(|root| panel.is_for(root))
+                }))
+    }
+
+    fn update_delayed_progress(&mut self, cx: &mut Context<Self>) {
+        self.track_delayed_progress(self.delayed_progress_pending(cx), Instant::now(), || {
+            let timer = cx.background_executor().timer(LOADING_DELAY);
+            cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+        });
+    }
+
+    fn track_delayed_progress(
+        &mut self,
+        pending: bool,
+        now: Instant,
+        schedule: impl FnOnce() -> gpui::Task<()>,
+    ) {
+        if !pending {
+            self.delayed_progress = None;
+        } else if self.delayed_progress.is_none() {
+            self.delayed_progress = Some((now, schedule()));
+        }
+    }
+
+    fn delayed_progress_visible(&self, now: Instant) -> bool {
+        self.delayed_progress
+            .as_ref()
+            .is_some_and(|(started, _)| now.saturating_duration_since(*started) >= LOADING_DELAY)
     }
 
     fn repository_busy(&self) -> bool {
@@ -4711,6 +4761,10 @@ impl Workspace {
             self.search_subscription = Some(cx.subscribe_in(&panel, window, move |this, source, event: &crate::search_panel::SearchEvent, window, cx| {
                 if this.project == owner && this.search_panel.as_ref().is_some_and(|panel| panel.entity_id() == source.entity_id()) { this.search_result(event.clone(), window, cx); }
             }));
+            self.search_observer = Some(cx.observe(&panel, |this, _, cx| {
+                this.update_delayed_progress(cx);
+                cx.notify();
+            }));
             self.search_owner = Some(owner); self.search_panel = Some(panel);
         }
         let panel = self.search_panel.as_ref().unwrap().clone(); let enabled = !self.footer_actions_blocked();
@@ -5834,6 +5888,7 @@ impl Workspace {
             return;
         };
         self.file_stage_busy = true;
+        self.update_delayed_progress(cx);
         let owner = root.clone();
         let task = crate::backend::spawn(cx.background_executor(), move || {
             workspace_backend::toggle_selected_files(&root, &files)
@@ -5842,6 +5897,7 @@ impl Workspace {
             let result = task.await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.file_stage_busy = false;
+                this.update_delayed_progress(cx);
                 this.viewer_changed(&ViewerChanged {
                     root: owner.clone(),
                 });
@@ -5894,6 +5950,7 @@ impl Workspace {
             return;
         };
         self.file_stage_busy = true;
+        self.update_delayed_progress(cx);
         let owner = root.clone();
         let task = crate::backend::spawn(cx.background_executor(), move || {
             diff_git::prepare_discard(&root, &files).map_err(|error| format!("{error:#}"))
@@ -5902,6 +5959,7 @@ impl Workspace {
             let result = task.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.file_stage_busy = false;
+                this.update_delayed_progress(cx);
                 if this.project != project
                     || this.panel_revision != revision
                     || this
@@ -5962,6 +6020,7 @@ impl Workspace {
             return;
         };
         self.file_stage_busy = true;
+        self.update_delayed_progress(cx);
         let owner = prompt.root.clone();
         let task = crate::backend::spawn(cx.background_executor(), move || {
             diff_git::discard_selected(&prompt.root, prompt.preview)
@@ -5970,6 +6029,7 @@ impl Workspace {
             let result = task.await;
             let _ = this.update_in(cx, |this, _, cx| {
                 this.file_stage_busy = false;
+                this.update_delayed_progress(cx);
                 this.viewer_changed(&ViewerChanged { root: owner });
                 this.notice = if result.errors.is_empty() {
                     format!("{}개 파일의 변경사항을 폐기했습니다.", result.succeeded)
@@ -6433,7 +6493,10 @@ impl Workspace {
                     cx.notify();
                 },
             ));
-            self.viewer_observer = Some(cx.observe(&viewer, |_, _, cx| cx.notify()));
+            self.viewer_observer = Some(cx.observe(&viewer, |this, _, cx| {
+                this.update_delayed_progress(cx);
+                cx.notify();
+            }));
             self.viewer = Some(viewer);
         }
         let target = self.viewer_target();
@@ -6458,8 +6521,15 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dispatch_pending(_window, cx);
-        let blocked =
-            self.repository_dialog.is_some() || self.alert.is_some() || self.repository_busy();
+        let screen = self.screen();
+        self.update_delayed_progress(cx);
+        let immediate_progress = self.global_progress_visible();
+        let progress_pending = immediate_progress || self.delayed_progress.is_some();
+        let show_progress = immediate_progress || self.delayed_progress_visible(Instant::now());
+        let blocked = progress_pending
+            || self.repository_dialog.is_some()
+            || self.alert.is_some()
+            || self.repository_busy();
         for scroll in self.panel_scrolls.values() {
             scroll.set_suspended(blocked);
         }
@@ -6469,7 +6539,6 @@ impl Render for Workspace {
         if blocked || !_window.is_window_active() || self.screen() != WorkspaceScreen::Project {
             self.panel_resize.set(None);
         }
-        let screen = self.screen();
         let popup_menu_allowed = self.file_history_overlay.is_some()
             && self.alert.is_none()
             && self.repository_dialog.is_none();
@@ -6732,9 +6801,11 @@ impl Render for Workspace {
             .when_some(crate::context_menu::active(cx), |root, menu| {
                 root.child(menu)
             })
-            .when(self.global_progress_visible(), |root| {
-                let overlay =
-                    ProgressOverlay::new("처리 중입니다…").top_inset(px(CUSTOM_TITLEBAR_HEIGHT));
+            .when(progress_pending, |root| {
+                let root = root.capture_key_down(|_, _, cx| cx.stop_propagation());
+                let overlay = ProgressOverlay::new("처리 중입니다…")
+                    .top_inset(px(CUSTOM_TITLEBAR_HEIGHT))
+                    .show_card(show_progress);
                 root.child(if let Some(focus) = &self.progress_focus {
                     overlay.track_focus(focus)
                 } else {
@@ -8577,6 +8648,30 @@ mod tab_tests {
     }
 
     #[test]
+    fn delayed_progress_waits_for_threshold_and_restarts_after_completion() {
+        let mut state = Workspace::default();
+        let start = Instant::now();
+        let before_delay = LOADING_DELAY - std::time::Duration::from_millis(1);
+        let schedule = || gpui::Task::ready(());
+
+        state.track_delayed_progress(true, start, schedule);
+        state.track_delayed_progress(true, start + before_delay, || panic!("timer restarted"));
+        assert!(!state.delayed_progress_visible(start + before_delay));
+        assert!(state.delayed_progress_visible(start + LOADING_DELAY));
+        state.track_delayed_progress(false, start + LOADING_DELAY, || panic!("timer scheduled"));
+        assert!(!state.delayed_progress_visible(start + LOADING_DELAY));
+
+        state.track_delayed_progress(true, start + LOADING_DELAY, schedule);
+        state.track_delayed_progress(false, start + LOADING_DELAY + before_delay, schedule);
+        assert!(!state.delayed_progress_visible(start + LOADING_DELAY * 2));
+
+        let next = start + LOADING_DELAY * 2;
+        state.track_delayed_progress(true, next, schedule);
+        assert!(!state.delayed_progress_visible(next));
+        assert!(state.delayed_progress_visible(next + LOADING_DELAY));
+    }
+
+    #[test]
     fn discard_shortcut_requires_only_control_d() {
         assert!(discard_shortcut(&gpui::Keystroke::parse("ctrl-d").unwrap()));
         for key in [
@@ -8612,6 +8707,7 @@ mod tab_tests {
             preview: prepare(),
         });
         assert!(state.repository_busy());
+        assert!(!state.global_progress_visible());
         assert!(state.selected_stage_requests().is_none());
         assert!(!state.select_history_row(project, 0));
         assert!(state.take_discard_choice(false).is_none());

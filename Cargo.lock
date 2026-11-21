@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "feather-git"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "embed-resource",
@@ -1762,6 +1762,8 @@ dependencies = [
  "gix",
  "gpui",
  "gpui_http_client",
+ "roxmltree",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -48,13 +48,21 @@ mod text_layout_cache;
 mod text_selection;
 mod theme;
 mod ui;
+#[cfg(windows)]
+mod update_dialog;
+#[cfg(windows)]
+mod updater;
 mod virtual_list;
 mod workspace_backend;
 use gpui::{
     App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 fn main() {
-    let options = match backend::Options::parse(std::env::args().skip(1)) {
+    #[cfg(windows)]
+    let Some(args) = updater::application_args() else { return };
+    #[cfg(not(windows))]
+    let args = std::env::args().skip(1);
+    let options = match backend::Options::parse(args) {
         Ok(options) => options,
         Err(error) => {
             eprintln!("{error}\n\n{}", backend::HELP);

@@ -159,6 +159,10 @@ pub struct Workspace {
     git_action_previous_focus: Option<gpui::FocusHandle>,
     git_action_prompt: Option<GitActionPrompt>,
     encoding_dialog: Option<gpui::Entity<crate::encoding_dialog::EncodingDialog>>,
+    #[cfg(windows)]
+    update_dialog: Option<gpui::Entity<crate::update_dialog::UpdateDialog>>,
+    #[cfg(windows)]
+    update_subscription: Option<gpui::Subscription>,
     encoding_subscription: Option<gpui::Subscription>,
     encoding_previous_focus: Option<gpui::FocusHandle>,
     branch_dialog: Option<gpui::Entity<crate::branch_dialog::BranchDialog>>,
@@ -299,6 +303,10 @@ impl Default for Workspace {
             git_action_previous_focus: None,
             git_action_prompt: None,
             encoding_dialog: None,
+            #[cfg(windows)]
+            update_dialog: None,
+            #[cfg(windows)]
+            update_subscription: None,
             encoding_subscription: None,
             encoding_previous_focus: None,
             branch_dialog: None,
@@ -1043,6 +1051,10 @@ impl Workspace {
     }
 
     fn repository_busy_except_file_edit(&self) -> bool {
+        #[cfg(windows)]
+        if self.update_dialog.is_some() {
+            return true;
+        }
         self.git_action_prompt.is_some() || self.checkout_branch_prompt.is_some()
             || self.merge_abort_confirmation.is_some()
             || self.reference_delete.is_some()
@@ -2376,6 +2388,35 @@ impl Workspace {
         }
         cx.notify();
     }
+    #[cfg(windows)]
+    fn open_update_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !window.is_window_active()
+            || self.footer_actions_blocked()
+            || self.viewer.as_ref().is_some_and(|viewer| viewer.read(cx).is_busy(cx))
+        {
+            return;
+        }
+        crate::context_menu::dismiss(window, cx);
+        self.cancel_list_drags();
+        let previous_focus = window.focused(cx);
+        let dialog = cx.new(crate::update_dialog::UpdateDialog::new);
+        self.update_subscription = Some(cx.subscribe_in(
+            &dialog, window, move |this, _, _: &crate::update_dialog::Dismiss, window, cx| {
+                this.update_dialog = None;
+                this.update_subscription = None;
+                if let Some(focus) = &previous_focus {
+                    focus.focus(window);
+                } else {
+                    window.blur();
+                }
+                cx.notify();
+            },
+        ));
+        dialog.update(cx, |dialog, cx| dialog.open(window, cx));
+        self.update_dialog = Some(dialog);
+        cx.notify();
+    }
+
     fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         let directory = self.footer_directory();
         let path = directory.as_ref().map(|path| display_path(path));
@@ -2461,7 +2502,15 @@ impl Workspace {
                         status_button("footer-settings", "환경설정", encoding_enabled).on_click(
                             cx.listener(|this, _, window, cx| this.open_settings(window, cx)),
                         ),
-                    ),
+                    )
+                    .map(|bar| {
+                        #[cfg(windows)]
+                        let bar = bar.child(
+                            status_button("footer-update", "업데이트 확인", encoding_enabled)
+                                .on_click(cx.listener(|this, _, window, cx| this.open_update_dialog(window, cx))),
+                        );
+                        bar
+                    }),
             )
     }
 
@@ -6754,6 +6803,11 @@ impl Render for Workspace {
             })
             .when_some(self.git_action_dialog.clone(), |el, dialog| el.child(dialog))
             .when_some(self.encoding_dialog.clone(), |el, dialog| el.child(dialog))
+            .map(|el| {
+                #[cfg(windows)]
+                let el = el.when_some(self.update_dialog.clone(), |el, dialog| el.child(dialog));
+                el
+            })
             .when_some(self.file_history_overlay.clone(), |el, dialog| {
                 el.child(dialog)
             })

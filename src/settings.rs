@@ -36,10 +36,17 @@ pub struct SettingsPanel {
     identity_focus: FocusHandle,
     #[cfg(windows)]
     update_focus: FocusHandle,
+    #[cfg(windows)]
+    update_certificates: Vec<crate::update_certificates::Entry>,
+    #[cfg(windows)]
+    update_certificates_busy: bool,
+    #[cfg(windows)]
+    update_certificates_error: Option<String>,
     remote_focus: FocusHandle,
     remote_delete_focus: BTreeMap<String, FocusHandle>,
     row_focus: BTreeMap<String, FocusHandle>,
     list_scroll: ScrollHandle,
+    list_scrollbar: crate::virtual_list::ListScrollHandle,
     remote_name: Entity<CommitEditor>,
     remote_url: Entity<CommitEditor>,
     remote_dialog: bool,
@@ -79,9 +86,18 @@ impl SettingsPanel {
             identity_focus: cx.focus_handle(),
             #[cfg(windows)]
             update_focus: cx.focus_handle(),
+            #[cfg(windows)]
+            update_certificates: Vec::new(),
+            #[cfg(windows)]
+            update_certificates_busy: false,
+            #[cfg(windows)]
+            update_certificates_error: None,
             remote_focus: cx.focus_handle(),
             remote_delete_focus: BTreeMap::new(),
             row_focus: BTreeMap::new(),
+            list_scrollbar: crate::virtual_list::ListScrollHandle::for_vertical_scroll(
+                list_scroll.clone(),
+            ),
             list_scroll,
             remote_name: cx.new(|cx| CommitEditor::single_line("", cx)),
             remote_url: cx.new(|cx| CommitEditor::single_line("", cx)),
@@ -96,10 +112,16 @@ impl SettingsPanel {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         panel.load(cx);
+        #[cfg(windows)]
+        panel.manage_update_certificates(crate::update_certificates::list, cx);
         panel
     }
 
     pub fn can_close(&self, cx: &App) -> bool {
+        #[cfg(windows)]
+        if self.update_certificates_busy {
+            return false;
+        }
         self.work != Some(Work::Saving) && self.auth.read(cx).can_close()
     }
 
@@ -501,6 +523,68 @@ impl SettingsPanel {
     }
 
     #[cfg(windows)]
+    fn manage_update_certificates(
+        &mut self,
+        operation: impl FnOnce() -> anyhow::Result<Vec<crate::update_certificates::Entry>>
+        + Send
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.update_certificates_busy = true;
+        self.update_certificates_error = None;
+        let task = cx.background_executor().spawn(async move { operation() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_certificates_busy = false;
+                match result {
+                    Ok(entries) => this.update_certificates = entries,
+                    Err(error) => this.update_certificates_error = Some(format!("{error:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    #[cfg(windows)]
+    fn select_update_certificates(&mut self, cx: &mut Context<Self>) {
+        if self.update_certificates_busy {
+            return;
+        }
+        self.update_certificates_busy = true;
+        cx.notify();
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("업데이트 CA 인증서 선택".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let result = selected.await;
+            let _ = this.update(cx, |this, cx| {
+                this.update_certificates_busy = false;
+                match result {
+                    Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                        this.manage_update_certificates(
+                            move || crate::update_certificates::import(&paths),
+                            cx,
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        this.update_certificates_error =
+                            Some("인증서 파일 선택 창을 열 수 없습니다.".into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(windows)]
     fn update_section(&self, cx: &Context<Self>) -> Div {
         let enabled = self.can_close(cx) && !self.child_popup_open(cx) && !self.is_composing(cx);
         div()
@@ -508,16 +592,76 @@ impl SettingsPanel {
             .flex_col()
             .gap_2()
             .child(section_heading("업데이트"))
-            .child(div().flex().child(
-                action("settings-check-update", "업데이트 확인", enabled)
-                    .track_focus(&self.update_focus)
-                    .on_click(cx.listener(move |this, event, window, cx| {
-                        if enabled && crate::form_controls::checkbox_click(event) {
-                            this.update_focus.focus(window);
-                            cx.emit(SettingsEvent::CheckForUpdates);
-                        }
-                    })),
-            ))
+            .child(div().text_sm().child("업데이트 인증서"))
+            .when(
+                self.update_certificates.is_empty() && !self.update_certificates_busy,
+                |section| {
+                    section.child(crate::form_controls::list_detail(
+                        "Windows 기본 인증서 사용",
+                    ))
+                },
+            )
+            .children(
+                self.update_certificates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let id = entry.id.clone();
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(crate::form_controls::list_title(entry.name.clone()))
+                            .child(
+                                crate::form_controls::list_delete(
+                                    ("remove-update-certificate", index),
+                                    enabled,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, event, _, cx| {
+                                        if enabled
+                                            && !this.update_certificates_busy
+                                            && crate::form_controls::checkbox_click(event)
+                                        {
+                                            let id = id.clone();
+                                            this.manage_update_certificates(
+                                                move || crate::update_certificates::remove(&id),
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                )),
+                            )
+                    }),
+            )
+            .when_some(self.update_certificates_error.clone(), |section, error| {
+                section.child(div().text_sm().text_color(rgb(theme::ERROR)).child(error))
+            })
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        action("settings-add-update-certificate", "인증서 추가", enabled).on_click(
+                            cx.listener(move |this, event, _, cx| {
+                                if enabled && crate::form_controls::checkbox_click(event) {
+                                    this.select_update_certificates(cx);
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
+                        action("settings-check-update", "업데이트 확인", enabled)
+                            .track_focus(&self.update_focus)
+                            .on_click(cx.listener(move |this, event, window, cx| {
+                                if enabled && crate::form_controls::checkbox_click(event) {
+                                    this.update_focus.focus(window);
+                                    cx.emit(SettingsEvent::CheckForUpdates);
+                                }
+                            })),
+                    ),
+            )
     }
 
     fn remote_section(&self, window: &Window, cx: &Context<Self>) -> Div {
@@ -626,14 +770,16 @@ impl Render for SettingsPanel {
             .max_h(window.viewport_size().height - px(180.))
             .min_h_0()
             .child(
-                div()
-                    .id("settings-body")
-                    .track_scroll(&self.list_scroll)
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .pr_2()
-                    .child(body),
+                self.list_scrollbar.vertical_scroll_view(
+                    div()
+                        .id("settings-body")
+                        .track_scroll(&self.list_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .pr_2()
+                        .child(body),
+                ),
             )
             .when_some(self.work.filter(|_| !self.remote_dialog), |panel, work| {
                 panel.child(match work {

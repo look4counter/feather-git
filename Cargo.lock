@@ -1755,6 +1755,7 @@ name = "feather-git"
 version = "1.0.3"
 dependencies = [
  "anyhow",
+ "embed-resource",
  "encoding_rs",
  "futures",
  "git2",

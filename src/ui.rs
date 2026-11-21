@@ -1241,6 +1241,15 @@ impl Workspace {
     #[cfg(target_os = "windows")]
     fn titlebar(&self, window: &Window) -> Div {
         use gpui::WindowControlArea;
+        use std::sync::{Arc, LazyLock};
+
+        static ICON: LazyLock<Arc<gpui::Image>> = LazyLock::new(|| {
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                include_bytes!("../design/favicon.png").to_vec(),
+            ))
+        });
+
         row()
             .h(px(CUSTOM_TITLEBAR_HEIGHT))
             .flex_shrink_0()
@@ -1249,8 +1258,11 @@ impl Workspace {
                 row()
                     .h_full()
                     .flex_1()
-                    .px_4()
+                    .pl_2()
+                    .pr_4()
+                    .gap_2()
                     .window_control_area(WindowControlArea::Drag)
+                    .child(gpui::img(Arc::clone(&ICON)).size(px(18.)).flex_shrink_0())
                     .child(label("Feather Git").text_size(px(11.))),
             )
             .children(

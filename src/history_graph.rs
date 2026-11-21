@@ -119,6 +119,30 @@ fn segment_points(
     [start, elbow, end]
 }
 
+fn snapped_segment_points(
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    origin: Point<Pixels>,
+    scale: f32,
+) -> [Point<Pixels>; 3] {
+    let boundary_at_start = start.y == px(0.);
+    let mut points = segment_points(start, end, boundary_at_start).map(|position| {
+        let position = position + origin;
+        point(
+            px(snap_graph_coordinate(position.x.into(), scale)),
+            px(snap_graph_coordinate(position.y.into(), scale)),
+        )
+    });
+    // 인접 행이 별도로 그려져도 경계에서 배경이 비치지 않도록 겹친다.
+    let overlap = px(1. / scale);
+    if boundary_at_start {
+        points[0].y -= overlap;
+    } else {
+        points[2].y += overlap;
+    }
+    points
+}
+
 fn segment_path(points: [Point<Pixels>; 3], stroke: Pixels) -> anyhow::Result<Path<Pixels>> {
     let [start, elbow, end] = points;
     let mut path = if start.x == end.x {
@@ -185,12 +209,6 @@ impl RowGraph {
             move |bounds, _, window, _| {
                 let scale = window.scale_factor();
                 let stroke = px(graph_stroke_width(scale));
-                let snap = |position: Point<Pixels>| {
-                    point(
-                        px(snap_graph_coordinate(position.x.into(), scale)),
-                        px(snap_graph_coordinate(position.y.into(), scale)),
-                    )
-                };
                 let key = (bounds.origin, bounds.size.width, lanes, scale);
                 let mut cache = graph.cache.borrow_mut();
                 if cache
@@ -199,21 +217,29 @@ impl RowGraph {
                 {
                     let mut paths = Vec::new();
                     for (start, end, color) in graph.segments.iter() {
-                        let points = segment_points(*start, *end, start.y == px(0.))
-                            .map(|position| snap(position + bounds.origin));
+                        let points = snapped_segment_points(*start, *end, bounds.origin, scale);
                         if let Ok(path) = segment_path(points, stroke) {
                             paths.push((path, *color));
                         }
                     }
                     *cache = Some((key, paths));
                 }
-                if let Some((_, paths)) = cache.as_ref() {
-                    for (path, color) in paths {
-                        window.paint_path(path.clone(), *color);
+                let overlap = px(1. / scale);
+                let mask = ContentMask {
+                    bounds: Bounds::new(
+                        bounds.origin - point(px(0.), overlap),
+                        bounds.size + size(px(0.), overlap * 2.),
+                    ),
+                };
+                window.with_content_mask(Some(mask), |window| {
+                    if let Some((_, paths)) = cache.as_ref() {
+                        for (path, color) in paths {
+                            window.paint_path(path.clone(), *color);
+                        }
                     }
-                }
-                let center = bounds.origin + point(px(lane_x(graph.lane)), px(ROW_HEIGHT / 2.));
-                paint_node(window, center, checked_out, color(graph.color));
+                    let center = bounds.origin + point(px(lane_x(graph.lane)), px(ROW_HEIGHT / 2.));
+                    paint_node(window, center, checked_out, color(graph.color));
+                });
             },
         )
         .size_full()
@@ -476,6 +502,42 @@ mod boundary_tests {
                         assert!(points[0].y < points[1].y && points[1].y < points[2].y);
                         assert!(segment_path(points, px(graph_stroke_width(scale))).is_ok());
                     }
+                }
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn rendered_edges_overlap_row_boundary_at_fractional_positions() {
+        for scale in [1., 1.25, 1.5, 1.75, 2.] {
+            for step in -32..=32 {
+                let origin = point(px(0.3), px(step as f32 / (16. * scale)));
+                let next_origin = origin + point(px(0.), px(ROW_HEIGHT));
+                for (from, seam, to) in [(0, 0, 0), (0, 1, 2), (7, 0, 7), (0, 0, 1)] {
+                    let before = snapped_segment_points(
+                        point(px(lane_x(from)), px(ROW_HEIGHT / 2.)),
+                        point(px(lane_x(seam)), px(ROW_HEIGHT)),
+                        origin,
+                        scale,
+                    );
+                    let after = snapped_segment_points(
+                        point(px(lane_x(seam)), px(0.)),
+                        point(px(lane_x(to)), px(ROW_HEIGHT / 2.)),
+                        next_origin,
+                        scale,
+                    );
+                    assert_eq!(before[2].x, after[0].x);
+                    let minimum = px(0.499 / scale);
+                    assert!(
+                        before[2].y >= next_origin.y + minimum,
+                        "outgoing dpi={scale}, step={step}",
+                    );
+                    assert!(
+                        after[0].y <= next_origin.y - minimum,
+                        "incoming dpi={scale}, step={step}",
+                    );
+                    assert!(segment_path(before, px(graph_stroke_width(scale))).is_ok());
+                    assert!(segment_path(after, px(graph_stroke_width(scale))).is_ok());
                 }
             }
         }

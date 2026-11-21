@@ -677,7 +677,6 @@ pub(crate) fn commit_grid_row(
             row.child(
                 div()
                     .w(px(columns[0]))
-                    .overflow_hidden()
                     .h_full()
                     .flex_shrink_0()
                     .child(graph.render(checked_out, lanes)),
